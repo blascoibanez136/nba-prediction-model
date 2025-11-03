@@ -1,0 +1,41 @@
+modules:
+  minutes_model:
+    enabled: false
+  usage_redistribution:
+    enabled: false
+  lineup_impact:
+    enabled: false
+  microstructure:
+    enabled: false
+  bivariate:
+    enabled: false
+  intervals:
+    enabled: false
+  simulator:
+    enabled: false
+  qa_suite:
+    enabled: false
+
+data_sources:
+  nba:
+    provider: rapidapi
+    env_key: RAPIDAPI_KEY
+  odds:
+    provider: theoddsapi
+    env_key: ODDS_API_KEY
+  weather:
+    provider: openweather
+    env_key: WEATHER_API_KEY
+
+backtest:
+  start_season: 2019
+  end_season: 2024
+  timezone: America/New_York
+
+bet_strategy:
+  spread_min_edge: 1.5
+  total_min_edge: 4.0
+  ml_min_ev: 0.02
+  unit_size: 1.0
+  kelly_fraction: 0.5
+  max_bets_per_day: 5
