@@ -7,7 +7,7 @@ BASE_URL = "https://v1.basketball.api-sports.io"
 
 def _headers():
     return {
-        "x-apisports-key": API_KEY,
+        "x-apisports-key": 85d6d09b8a3a8322136eae8c59aa0148,
     }
 
 
