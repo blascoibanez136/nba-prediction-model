@@ -1,23 +1,23 @@
 import os
 import requests
 
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
-
-BASE_URL = "https://api-nba-v1.p.rapidapi.com"
+API_KEY = os.getenv("RAPIDAPI_KEY")  # we keep the same env var name
+BASE_URL = "https://v1.basketball.api-sports.io"
 
 
 def _headers():
     return {
-        "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": "api-nba-v1.p.rapidapi.com",
+        "x-apisports-key": API_KEY,
     }
 
 
 def get_games_by_date(date_str: str):
     """
-    date_str example: '2024-10-25'
+    Fetch games for a given date from API-Sports Basketball
+    date_str example: '2025-11-10' or '2024-12-25'
     """
     url = f"{BASE_URL}/games"
-    resp = requests.get(url, headers=_headers(), params={"date": date_str})
+    params = {"date": date_str}
+    resp = requests.get(url, headers=_headers(), params=params)
     resp.raise_for_status()
     return resp.json()
