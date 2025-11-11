@@ -1,0 +1,93 @@
+name: Daily NBA run
+
+on:
+  workflow_dispatch: {}  # lets you run it manually
+  schedule:
+    - cron: "0 13 * * *"  # every day at 13:00 UTC
+
+jobs:
+  run-nba-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas pyyaml scikit-learn lightgbm
+
+      - name: Run QA
+        env:
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          PYTHONPATH=. python qa/validation.py
+
+      - name: Run prediction script
+        env:
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          PYTHONPATH=. python - << 'PY'
+          from datetime import date
+          import os, pandas as pd
+          from src.ingest.nba_ingest import get_nba_games_by_date
+          from src.ingest.odds_ingest import get_nba_odds
+          from src.features.build_features import merge_game_and_odds
+          from src.model.train_model import (
+              predict_win_prob,
+              implied_fair_spread,
+              implied_fair_total,
+          )
+          os.makedirs("outputs", exist_ok=True)
+          today_str = date.today().strftime("%Y-%m-%d")
+          games_resp = get_nba_games_by_date(today_str)
+          games = games_resp.get("response", [])
+          try:
+              odds = get_nba_odds()
+          except Exception:
+              odds = []
+          if not games:
+              games = [
+                  {
+                      "id": "DUMMY1",
+                      "teams": {
+                          "home": {"name": "Lakers"},
+                          "visitors": {"name": "Warriors"},
+                      },
+                      "date": {"start": today_str},
+                  }
+              ]
+          rows = merge_game_and_odds(games, odds)
+          preds = []
+          for r in rows:
+              wp = predict_win_prob(r)
+              preds.append({
+                  **r,
+                  "game_date": today_str,
+                  "home_win_prob": wp["home_win_prob"],
+                  "away_win_prob": wp["away_win_prob"],
+                  "fair_spread": implied_fair_spread(wp["home_win_prob"]),
+                  "fair_total": implied_fair_total(),
+              })
+          df = pd.DataFrame(preds)
+          out_path = f"outputs/predictions_{today_str}.csv"
+          df.to_csv(out_path, index=False)
+          with open("run_summary.md", "w") as f:
+              f.write(f"# NBA daily run\\nWrote {len(df)} rows for {today_str}\\n")
+          PY
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nba-run
+          path: |
+            outputs/
+            run_summary.md
