@@ -1,0 +1,38 @@
+name: Weekly NBA Rolling Report
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 12 * * 1"  # every Monday 12:00 UTC
+
+jobs:
+  rolling-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy pyyaml
+
+      - name: Run rolling evaluation
+        env:
+          PYTHONPATH: .
+          ROLLING_DAYS: 30
+        run: |
+          python src/eval/rolling_eval.py
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rolling-report
+          path: |
+            outputs/rolling_metrics.csv
+            rolling_report.html
