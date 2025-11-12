@@ -178,6 +178,84 @@ jobs:
               cr.write("<html><body><h1>Calibration Report</h1><p>Stub - not implemented.</p></body></html>")
           PY
 
+                - name: Apply market ensemble
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import date
+          import pandas as pd
+          from src.model.market_ensemble import apply_market_ensemble
+
+          os.makedirs("outputs", exist_ok=True)
+          today_str = date.today().strftime("%Y-%m-%d")
+          base_path = f"outputs/predictions_{today_str}.csv"
+          if not os.path.exists(base_path):
+              print("no base predictions file, skipping ensemble")
+              raise SystemExit(0)
+
+          preds = pd.read_csv(base_path)
+
+          # load odds dispersion if present
+          if os.path.exists("outputs/odds_dispersion_latest.csv"):
+              odds_disp = pd.read_csv("outputs/odds_dispersion_latest.csv")
+          else:
+              odds_disp = pd.DataFrame()
+
+          blended = apply_market_ensemble(preds, odds_disp)
+          out_path = f"outputs/predictions_{today_str}_market.csv"
+          blended.to_csv(out_path, index=False)
+          print("wrote", out_path)
+          PY
+
+      - name: Tidy market predictions
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import date
+          import pandas as pd
+
+          today_str = date.today().strftime("%Y-%m-%d")
+          market_path = f"outputs/predictions_{today_str}_market.csv"
+          if not os.path.exists(market_path):
+              print("no market file, skipping tidy")
+              raise SystemExit(0)
+
+          df = pd.read_csv(market_path)
+
+          preferred_order = [
+              "game_id",
+              "game_date",
+              "home_team",
+              "away_team",
+              "home_win_prob",
+              "away_win_prob",
+              "fair_spread",
+              "fair_total",
+              "home_off_ra10",
+              "home_def_ra10",
+              "home_off_adj_ra10",
+              "home_def_adj_ra10",
+              "away_off_ra10",
+              "away_def_ra10",
+              "away_off_adj_ra10",
+              "away_def_adj_ra10",
+              "consensus_close",
+              "book_dispersion",
+              "home_win_prob_market",
+              "fair_spread_market",
+              "fair_total_market",
+          ]
+
+          cols_in_df = [c for c in preferred_order if c in df.columns]
+          leftovers = [c for c in df.columns if c not in cols_in_df]
+          tidy = df[cols_in_df + leftovers]
+
+          tidy_path = f"outputs/predictions_{today_str}_market_tidy.csv"
+          tidy.to_csv(tidy_path, index=False)
+          print("wrote", tidy_path)
+          PY
+
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
