@@ -1,13 +1,19 @@
 name: Daily NBA run
 
 on:
-  workflow_dispatch: {}  # manual trigger
+  workflow_dispatch: {}     # allow manual runs
   schedule:
-    - cron: "0 13 * * *"  # runs daily at 13:00 UTC
+    - cron: "0 13 * * *"    # run every day at 13:00 UTC
 
 jobs:
   run-nba-pipeline:
     runs-on: ubuntu-latest
+    env:
+      # make src/ imports work everywhere
+      PYTHONPATH: .
+      # pass API keys to all steps
+      RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
 
     steps:
       - name: Checkout repo
@@ -23,37 +29,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pandas pyyaml scikit-learn lightgbm
 
-      # ---------- Day 5: odds snapshots (The Odds API, nested bookmakers) ----------
+      # ------------------------------------------------------------------
+      # Day 5: odds snapshots (The Odds API, nested `bookmakers`)
+      # ------------------------------------------------------------------
       - name: Save OPEN odds snapshot
-        env:
-          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          SNAPSHOT_KIND: open
-          PYTHONPATH: .
         run: |
           python src/ingest/odds_snapshots.py
 
       - name: Save MID odds snapshot
         env:
-          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           SNAPSHOT_KIND: mid
-          PYTHONPATH: .
         run: |
           python src/ingest/odds_snapshots.py
 
       - name: Save CLOSE odds snapshot
         env:
-          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           SNAPSHOT_KIND: close
-          PYTHONPATH: .
         run: |
           python src/ingest/odds_snapshots.py
 
       - name: Compute odds movement & dispersion
-        env:
-          PYTHONPATH: .
         run: |
           python - <<'PY'
           import glob, os
@@ -70,13 +65,20 @@ jobs:
 
           def ts_from_name(path: str) -> datetime:
               base = os.path.basename(path)
-              parts = base.split("_")
+              # expect: kind_YYYYMMDD_HHMM.csv OR kind_YYYYMMDD.csv
+              parts = base.split("_", 1)
               if len(parts) < 2:
                   return datetime.min
               dt_part = parts[1].split(".")[0]
-              return datetime.strptime(dt_part, "%Y%m%d_%H%M")
+              for fmt in ("%Y%m%d_%H%M", "%Y%m%d"):
+                  try:
+                      return datetime.strptime(dt_part, fmt)
+                  except ValueError:
+                      continue
+              return datetime.min
 
           snaps = sorted(snaps, key=ts_from_name)
+
           latest_open = None
           latest_close = None
           for p in snaps:
@@ -91,24 +93,19 @@ jobs:
               movement.to_csv("outputs/odds_movement_latest.csv", index=False)
               dispersion = compute_dispersion(latest_close)
               dispersion.to_csv("outputs/odds_dispersion_latest.csv", index=False)
-              print("wrote odds_movement_latest.csv and odds_dispersion_latest.csv")
+              print("✅ wrote odds_movement_latest.csv and odds_dispersion_latest.csv")
           else:
-              print("did not find both open_ and close_ snapshots; skipping feature build")
+              print("⚠️ did not find both open_ and close_ snapshots; skipping feature build")
           PY
-      # -----------------------------------------------------------------------------
 
-
+      # ------------------------------------------------------------------
+      # Your existing pipeline
+      # ------------------------------------------------------------------
       - name: Run QA
-        env:
-          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           PYTHONPATH=. python qa/validation.py
 
       - name: Run prediction script
-        env:
-          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           PYTHONPATH=. python - << 'PY'
           from datetime import date
@@ -124,20 +121,24 @@ jobs:
               implied_fair_spread,
               implied_fair_total,
           )
-          # Fail early if required secrets are missing
+
+          # fail early if missing secrets
           if not os.getenv("RAPIDAPI_KEY") or not os.getenv("ODDS_API_KEY"):
               print("Required API secrets missing. Exiting.")
               sys.exit(1)
+
           os.makedirs("outputs", exist_ok=True)
           today_str = date.today().strftime("%Y-%m-%d")
-          # Fetch NBA games for the date
+
           games_resp = get_nba_games_by_date(today_str)
           games = games_resp.get("response", [])
+
           try:
               odds = get_nba_odds()
           except Exception:
               odds = []
-          # Handle empty slate
+
+          # empty slate
           if not games:
               with open("outputs/empty-slate.txt", "w") as f:
                   f.write(f"No games scheduled for {today_str}.\n")
@@ -149,7 +150,7 @@ jobs:
               with open("calibration_report.html", "w") as cr:
                   cr.write("<html><body><h1>Calibration Report</h1><p>No games to evaluate.</p></body></html>")
               sys.exit(0)
-          # Build rows and model predictions
+
           rows = merge_game_and_odds(games, odds)
           preds = []
           for r in rows:
@@ -162,11 +163,14 @@ jobs:
                   "fair_spread": implied_fair_spread(wp["home_win_prob"]),
                   "fair_total": implied_fair_total(),
               })
+
           df = pd.DataFrame(preds)
           out_path = f"outputs/predictions_{today_str}.csv"
           df.to_csv(out_path, index=False)
+
           with open("run_summary.md", "w") as f:
               f.write(f"# NBA daily run\nWrote {len(df)} rows for {today_str}\n")
+
           pip_versions = subprocess.run(["pip", "freeze"], capture_output=True, text=True)
           with open("outputs/pip_versions.txt", "w") as pv:
               pv.write(pip_versions.stdout)
