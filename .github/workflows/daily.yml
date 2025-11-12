@@ -38,7 +38,7 @@ jobs:
           RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           SNAPSHOT_KIND: mid
-          PYTHONPATH: . 
+          PYTHONPATH: .
         run: |
           python src/ingest/odds_snapshots.py
 
@@ -52,8 +52,8 @@ jobs:
           python src/ingest/odds_snapshots.py
 
       - name: Compute odds movement & dispersion
-      env:
-      PYTHONPATH: .
+        env:
+          PYTHONPATH: .
         run: |
           python - <<'PY'
           import glob, os
@@ -65,35 +65,35 @@ jobs:
 
           snaps = glob.glob(os.path.join(snap_dir, "*.csv"))
           if not snaps:
-            print("No snapshots found, skipping.")
-            raise SystemExit(0)
+              print("No snapshots found, skipping.")
+              raise SystemExit(0)
 
           def ts_from_name(path: str) -> datetime:
-            base = os.path.basename(path)
-            parts = base.split("_")
-            if len(parts) < 2:
-              return datetime.min
-            dt_part = parts[1].split(".")[0]
-            return datetime.strptime(dt_part, "%Y%m%d_%H%M")
+              base = os.path.basename(path)
+              parts = base.split("_")
+              if len(parts) < 2:
+                  return datetime.min
+              dt_part = parts[1].split(".")[0]
+              return datetime.strptime(dt_part, "%Y%m%d_%H%M")
 
           snaps = sorted(snaps, key=ts_from_name)
           latest_open = None
           latest_close = None
           for p in snaps:
-            name = os.path.basename(p)
-            if name.startswith("open_"):
-              latest_open = p
-            elif name.startswith("close_"):
-              latest_close = p
+              name = os.path.basename(p)
+              if name.startswith("open_"):
+                  latest_open = p
+              elif name.startswith("close_"):
+                  latest_close = p
 
           if latest_open and latest_close:
-            movement = compute_movement(latest_open, latest_close)
-            movement.to_csv("outputs/odds_movement_latest.csv", index=False)
-            dispersion = compute_dispersion(latest_close)
-            dispersion.to_csv("outputs/odds_dispersion_latest.csv", index=False)
-            print("wrote odds_movement_latest.csv and odds_dispersion_latest.csv")
+              movement = compute_movement(latest_open, latest_close)
+              movement.to_csv("outputs/odds_movement_latest.csv", index=False)
+              dispersion = compute_dispersion(latest_close)
+              dispersion.to_csv("outputs/odds_dispersion_latest.csv", index=False)
+              print("wrote odds_movement_latest.csv and odds_dispersion_latest.csv")
           else:
-            print("did not find both open_ and close_ snapshots; skipping feature build")
+              print("did not find both open_ and close_ snapshots; skipping feature build")
           PY
       # -----------------------------------------------------------------------------
 
