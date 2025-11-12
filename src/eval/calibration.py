@@ -1,3 +1,14 @@
+"""
+Evaluation and calibration module for NBA predictions.
+"""
+
+import os
+import json
+import numpy as np
+import pandas as pd  # ✅ This line is missing in your file
+from datetime import date
+from typing import Tuple
+
 # --- Compute metrics ---
 def compute_metrics(preds: pd.DataFrame, results: pd.DataFrame):
     # Guard against missing/empty results
