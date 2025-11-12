@@ -179,7 +179,7 @@ jobs:
           PY
 
                 - name: Apply market ensemble
-        run: |
+      
           python - <<'PY'
           import os
           from datetime import date
