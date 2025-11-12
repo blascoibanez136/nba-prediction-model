@@ -1,19 +1,13 @@
 name: Daily NBA run
 
 on:
-  workflow_dispatch: {}     # allow manual runs
+  workflow_dispatch: {}
   schedule:
-    - cron: "0 13 * * *"    # run every day at 13:00 UTC
+    - cron: "0 13 * * *"  # daily at 13:00 UTC
 
 jobs:
   run-nba-pipeline:
     runs-on: ubuntu-latest
-    env:
-      # make src/ imports work everywhere
-      PYTHONPATH: .
-      # pass API keys to all steps
-      RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
 
     steps:
       - name: Checkout repo
@@ -27,92 +21,31 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas pyyaml scikit-learn lightgbm
+          pip install pandas numpy requests pyyaml scikit-learn lightgbm
 
-      # ------------------------------------------------------------------
-      # Day 5: odds snapshots (The Odds API, nested `bookmakers`)
-      # ------------------------------------------------------------------
-      - name: Save OPEN odds snapshot
-        run: |
-          python src/ingest/odds_snapshots.py
-
-      - name: Save MID odds snapshot
-        env:
-          SNAPSHOT_KIND: mid
-        run: |
-          python src/ingest/odds_snapshots.py
-
-      - name: Save CLOSE odds snapshot
-        env:
-          SNAPSHOT_KIND: close
-        run: |
-          python src/ingest/odds_snapshots.py
-
-      - name: Compute odds movement & dispersion
-        run: |
-          python - <<'PY'
-          import glob, os
-          from datetime import datetime
-          from src.ingest.odds_snapshots import compute_movement, compute_dispersion
-
-          snap_dir = "data/_snapshots"
-          os.makedirs("outputs", exist_ok=True)
-
-          snaps = glob.glob(os.path.join(snap_dir, "*.csv"))
-          if not snaps:
-              print("No snapshots found, skipping.")
-              raise SystemExit(0)
-
-          def ts_from_name(path: str) -> datetime:
-              base = os.path.basename(path)
-              # expect: kind_YYYYMMDD_HHMM.csv OR kind_YYYYMMDD.csv
-              parts = base.split("_", 1)
-              if len(parts) < 2:
-                  return datetime.min
-              dt_part = parts[1].split(".")[0]
-              for fmt in ("%Y%m%d_%H%M", "%Y%m%d"):
-                  try:
-                      return datetime.strptime(dt_part, fmt)
-                  except ValueError:
-                      continue
-              return datetime.min
-
-          snaps = sorted(snaps, key=ts_from_name)
-
-          latest_open = None
-          latest_close = None
-          for p in snaps:
-              name = os.path.basename(p)
-              if name.startswith("open_"):
-                  latest_open = p
-              elif name.startswith("close_"):
-                  latest_close = p
-
-          if latest_open and latest_close:
-              movement = compute_movement(latest_open, latest_close)
-              movement.to_csv("outputs/odds_movement_latest.csv", index=False)
-              dispersion = compute_dispersion(latest_close)
-              dispersion.to_csv("outputs/odds_dispersion_latest.csv", index=False)
-              print("✅ wrote odds_movement_latest.csv and odds_dispersion_latest.csv")
-          else:
-              print("⚠️ did not find both open_ and close_ snapshots; skipping feature build")
-          PY
-
-      # ------------------------------------------------------------------
-      # Your existing pipeline
-      # ------------------------------------------------------------------
+      # ---------------------------------------------------------
+      # 1) Run QA so we fail early if imports/config are broken
+      # ---------------------------------------------------------
       - name: Run QA
+        env:
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           PYTHONPATH=. python qa/validation.py
 
+      # ---------------------------------------------------------
+      # 2) Main prediction step (writes outputs/predictions_<date>.csv)
+      # ---------------------------------------------------------
       - name: Run prediction script
+        env:
+            RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+            ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           PYTHONPATH=. python - << 'PY'
           from datetime import date
-          import os
-          import sys
-          import subprocess
+          import os, sys, subprocess
           import pandas as pd
+
           from src.ingest.nba_ingest import get_nba_games_by_date
           from src.ingest.odds_ingest import get_nba_odds
           from src.features.build_features import merge_game_and_odds
@@ -122,7 +55,7 @@ jobs:
               implied_fair_total,
           )
 
-          # fail early if missing secrets
+          # fail early on missing secrets (don't print values)
           if not os.getenv("RAPIDAPI_KEY") or not os.getenv("ODDS_API_KEY"):
               print("Required API secrets missing. Exiting.")
               sys.exit(1)
@@ -130,27 +63,29 @@ jobs:
           os.makedirs("outputs", exist_ok=True)
           today_str = date.today().strftime("%Y-%m-%d")
 
+          # fetch games
           games_resp = get_nba_games_by_date(today_str)
           games = games_resp.get("response", [])
 
+          # fetch odds (safe)
           try:
               odds = get_nba_odds()
           except Exception:
               odds = []
 
-          # empty slate
           if not games:
-              with open("outputs/empty-slate.txt", "w") as f:
-                  f.write(f"No games scheduled for {today_str}.\n")
+              # empty slate but still succeed
+              with open(f"outputs/empty-slate.txt", "w") as f:
+                  f.write(f"No games scheduled for {today_str}\n")
               with open("run_summary.md", "w") as f:
-                  f.write(f"# NBA daily run\nNo games scheduled for {today_str}\n")
+                  f.write(f"# NBA daily run\nNo games for {today_str}\n")
+              # still write pip versions
               pip_versions = subprocess.run(["pip", "freeze"], capture_output=True, text=True)
               with open("outputs/pip_versions.txt", "w") as pv:
                   pv.write(pip_versions.stdout)
-              with open("calibration_report.html", "w") as cr:
-                  cr.write("<html><body><h1>Calibration Report</h1><p>No games to evaluate.</p></body></html>")
               sys.exit(0)
 
+          # build rows → preds
           rows = merge_game_and_odds(games, odds)
           preds = []
           for r in rows:
@@ -167,49 +102,60 @@ jobs:
           df = pd.DataFrame(preds)
           out_path = f"outputs/predictions_{today_str}.csv"
           df.to_csv(out_path, index=False)
+          print("wrote", out_path)
 
+          # write stub report + pip versions
           with open("run_summary.md", "w") as f:
               f.write(f"# NBA daily run\nWrote {len(df)} rows for {today_str}\n")
 
           pip_versions = subprocess.run(["pip", "freeze"], capture_output=True, text=True)
           with open("outputs/pip_versions.txt", "w") as pv:
               pv.write(pip_versions.stdout)
+
           with open("calibration_report.html", "w") as cr:
-              cr.write("<html><body><h1>Calibration Report</h1><p>Stub - not implemented.</p></body></html>")
+              cr.write("<html><body><h1>Calibration Report</h1><p>Stub.</p></body></html>")
           PY
 
-                - name: Apply market ensemble
-      
-          python - <<'PY'
+      # ---------------------------------------------------------
+      # 3) Day 6: apply market ensemble to today's predictions
+      # ---------------------------------------------------------
+      - name: Apply market ensemble
+        run: |
+          PYTHONPATH=. python - << 'PY'
           import os
           from datetime import date
           import pandas as pd
+
           from src.model.market_ensemble import apply_market_ensemble
 
           os.makedirs("outputs", exist_ok=True)
           today_str = date.today().strftime("%Y-%m-%d")
           base_path = f"outputs/predictions_{today_str}.csv"
+
           if not os.path.exists(base_path):
               print("no base predictions file, skipping ensemble")
               raise SystemExit(0)
 
           preds = pd.read_csv(base_path)
 
-          # load odds dispersion if present
+          # odds dispersion is optional
           if os.path.exists("outputs/odds_dispersion_latest.csv"):
               odds_disp = pd.read_csv("outputs/odds_dispersion_latest.csv")
           else:
               odds_disp = pd.DataFrame()
 
           blended = apply_market_ensemble(preds, odds_disp)
-          out_path = f"outputs/predictions_{today_str}_market.csv"
-          blended.to_csv(out_path, index=False)
-          print("wrote", out_path)
+          market_path = f"outputs/predictions_{today_str}_market.csv"
+          blended.to_csv(market_path, index=False)
+          print("wrote", market_path)
           PY
 
+      # ---------------------------------------------------------
+      # 4) Tidy the market file (put columns in sane order)
+      # ---------------------------------------------------------
       - name: Tidy market predictions
         run: |
-          python - <<'PY'
+          PYTHONPATH=. python - << 'PY'
           import os
           from datetime import date
           import pandas as pd
@@ -231,6 +177,7 @@ jobs:
               "away_win_prob",
               "fair_spread",
               "fair_total",
+              # opponent-adjusted if present
               "home_off_ra10",
               "home_def_ra10",
               "home_off_adj_ra10",
@@ -239,8 +186,10 @@ jobs:
               "away_def_ra10",
               "away_off_adj_ra10",
               "away_def_adj_ra10",
+              # market inputs
               "consensus_close",
               "book_dispersion",
+              # market outputs
               "home_win_prob_market",
               "fair_spread_market",
               "fair_total_market",
@@ -255,7 +204,9 @@ jobs:
           print("wrote", tidy_path)
           PY
 
-
+      # ---------------------------------------------------------
+      # 5) Upload everything useful
+      # ---------------------------------------------------------
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -264,4 +215,3 @@ jobs:
             outputs/
             run_summary.md
             calibration_report.html
-            data/_snapshots
