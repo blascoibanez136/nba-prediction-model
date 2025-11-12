@@ -1,0 +1,3 @@
+# Ignore daily auto-generated files
+data/_snapshots/
+outputs/odds_*.csv
