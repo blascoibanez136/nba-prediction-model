@@ -3,7 +3,7 @@ name: Daily NBA run
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 13 * * *"  # daily at 13:00 UTC
+    - cron: "0 13 * * *"  # 13:00 UTC every day
 
 jobs:
   run-nba-pipeline:
@@ -21,27 +21,85 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy requests pyyaml scikit-learn lightgbm
+          pip install pandas requests pyyaml scikit-learn lightgbm
 
-      # ---------------------------------------------------------
-      # 1) Run QA so we fail early if imports/config are broken
-      # ---------------------------------------------------------
+      - name: Ensure runtime folders
+        run: |
+          mkdir -p data/_snapshots
+          mkdir -p outputs
+
+      # ===================== Day 5: odds snapshots =====================
+      - name: Save OPEN odds snapshot
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          PYTHONPATH: .
+          SNAPSHOT_KIND: open
+        run: |
+          python src/ingest/odds_snapshots.py
+
+      - name: Save MID odds snapshot
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          PYTHONPATH: .
+          SNAPSHOT_KIND: mid
+        run: |
+          python src/ingest/odds_snapshots.py
+
+      - name: Save CLOSE odds snapshot
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          PYTHONPATH: .
+          SNAPSHOT_KIND: close
+        run: |
+          python src/ingest/odds_snapshots.py
+
+      - name: Build odds movement & dispersion
+        env:
+          PYTHONPATH: .
+        run: |
+          python - << 'PY'
+          import os, glob
+          from src.ingest.odds_snapshots import compute_movement, compute_dispersion
+
+          snap_dir = "data/_snapshots"
+          os.makedirs("outputs", exist_ok=True)
+
+          snaps = sorted(glob.glob(os.path.join(snap_dir, "*.csv")))
+          latest_open = None
+          latest_close = None
+          for p in snaps:
+              base = os.path.basename(p)
+              if base.startswith("open_"):
+                  latest_open = p
+              elif base.startswith("close_"):
+                  latest_close = p
+
+          if latest_open and latest_close:
+              movement = compute_movement(latest_open, latest_close)
+              movement.to_csv("outputs/odds_movement_latest.csv", index=False)
+              dispersion = compute_dispersion(latest_close)
+              dispersion.to_csv("outputs/odds_dispersion_latest.csv", index=False)
+              print("wrote odds_movement_latest.csv and odds_dispersion_latest.csv")
+          else:
+              print("No open/close pair found; skipping odds feature build.")
+          PY
+      # ================================================================
+
       - name: Run QA
         env:
           RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          PYTHONPATH: .
         run: |
-          PYTHONPATH=. python qa/validation.py
+          python qa/validation.py
 
-      # ---------------------------------------------------------
-      # 2) Main prediction step (writes outputs/predictions_<date>.csv)
-      # ---------------------------------------------------------
       - name: Run prediction script
         env:
-            RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-            ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          PYTHONPATH: .
         run: |
-          PYTHONPATH=. python - << 'PY'
+          python - << 'PY'
           from datetime import date
           import os, sys, subprocess
           import pandas as pd
@@ -55,7 +113,7 @@ jobs:
               implied_fair_total,
           )
 
-          # fail early on missing secrets (don't print values)
+          # fail fast on missing secrets
           if not os.getenv("RAPIDAPI_KEY") or not os.getenv("ODDS_API_KEY"):
               print("Required API secrets missing. Exiting.")
               sys.exit(1)
@@ -67,25 +125,28 @@ jobs:
           games_resp = get_nba_games_by_date(today_str)
           games = games_resp.get("response", [])
 
-          # fetch odds (safe)
+          # fetch odds (best effort)
           try:
               odds = get_nba_odds()
-          except Exception:
+          except Exception as e:
+              print("Could not fetch odds:", e)
               odds = []
 
+          # empty slate handling
           if not games:
-              # empty slate but still succeed
-              with open(f"outputs/empty-slate.txt", "w") as f:
-                  f.write(f"No games scheduled for {today_str}\n")
+              with open("outputs/empty-slate.txt", "w") as f:
+                  f.write(f"No games scheduled for {today_str}.\n")
               with open("run_summary.md", "w") as f:
-                  f.write(f"# NBA daily run\nNo games for {today_str}\n")
-              # still write pip versions
-              pip_versions = subprocess.run(["pip", "freeze"], capture_output=True, text=True)
+                  f.write(f"# NBA daily run\nNo games scheduled for {today_str}\n")
+              # pip freeze
+              res = subprocess.run(["pip", "freeze"], capture_output=True, text=True)
               with open("outputs/pip_versions.txt", "w") as pv:
-                  pv.write(pip_versions.stdout)
+                  pv.write(res.stdout)
+              # stub report
+              with open("calibration_report.html", "w") as cr:
+                  cr.write("<html><body><h1>Calibration Report</h1><p>No games.</p></body></html>")
               sys.exit(0)
 
-          # build rows → preds
           rows = merge_game_and_odds(games, odds)
           preds = []
           for r in rows:
@@ -102,111 +163,26 @@ jobs:
           df = pd.DataFrame(preds)
           out_path = f"outputs/predictions_{today_str}.csv"
           df.to_csv(out_path, index=False)
-          print("wrote", out_path)
 
-          # write stub report + pip versions
           with open("run_summary.md", "w") as f:
               f.write(f"# NBA daily run\nWrote {len(df)} rows for {today_str}\n")
 
-          pip_versions = subprocess.run(["pip", "freeze"], capture_output=True, text=True)
+          # save pip versions
+          res = subprocess.run(["pip", "freeze"], capture_output=True, text=True)
           with open("outputs/pip_versions.txt", "w") as pv:
-              pv.write(pip_versions.stdout)
+              pv.write(res.stdout)
 
+          # stub calibration report
           with open("calibration_report.html", "w") as cr:
               cr.write("<html><body><h1>Calibration Report</h1><p>Stub.</p></body></html>")
           PY
 
-      # ---------------------------------------------------------
-      # 3) Day 6: apply market ensemble to today's predictions
-      # ---------------------------------------------------------
       - name: Apply market ensemble
+        env:
+            PYTHONPATH: .
         run: |
-          PYTHONPATH=. python - << 'PY'
-          import os
-          from datetime import date
-          import pandas as pd
+          python src/model/market_ensemble.py
 
-          from src.model.market_ensemble import apply_market_ensemble
-
-          os.makedirs("outputs", exist_ok=True)
-          today_str = date.today().strftime("%Y-%m-%d")
-          base_path = f"outputs/predictions_{today_str}.csv"
-
-          if not os.path.exists(base_path):
-              print("no base predictions file, skipping ensemble")
-              raise SystemExit(0)
-
-          preds = pd.read_csv(base_path)
-
-          # odds dispersion is optional
-          if os.path.exists("outputs/odds_dispersion_latest.csv"):
-              odds_disp = pd.read_csv("outputs/odds_dispersion_latest.csv")
-          else:
-              odds_disp = pd.DataFrame()
-
-          blended = apply_market_ensemble(preds, odds_disp)
-          market_path = f"outputs/predictions_{today_str}_market.csv"
-          blended.to_csv(market_path, index=False)
-          print("wrote", market_path)
-          PY
-
-      # ---------------------------------------------------------
-      # 4) Tidy the market file (put columns in sane order)
-      # ---------------------------------------------------------
-      - name: Tidy market predictions
-        run: |
-          PYTHONPATH=. python - << 'PY'
-          import os
-          from datetime import date
-          import pandas as pd
-
-          today_str = date.today().strftime("%Y-%m-%d")
-          market_path = f"outputs/predictions_{today_str}_market.csv"
-          if not os.path.exists(market_path):
-              print("no market file, skipping tidy")
-              raise SystemExit(0)
-
-          df = pd.read_csv(market_path)
-
-          preferred_order = [
-              "game_id",
-              "game_date",
-              "home_team",
-              "away_team",
-              "home_win_prob",
-              "away_win_prob",
-              "fair_spread",
-              "fair_total",
-              # opponent-adjusted if present
-              "home_off_ra10",
-              "home_def_ra10",
-              "home_off_adj_ra10",
-              "home_def_adj_ra10",
-              "away_off_ra10",
-              "away_def_ra10",
-              "away_off_adj_ra10",
-              "away_def_adj_ra10",
-              # market inputs
-              "consensus_close",
-              "book_dispersion",
-              # market outputs
-              "home_win_prob_market",
-              "fair_spread_market",
-              "fair_total_market",
-          ]
-
-          cols_in_df = [c for c in preferred_order if c in df.columns]
-          leftovers = [c for c in df.columns if c not in cols_in_df]
-          tidy = df[cols_in_df + leftovers]
-
-          tidy_path = f"outputs/predictions_{today_str}_market_tidy.csv"
-          tidy.to_csv(tidy_path, index=False)
-          print("wrote", tidy_path)
-          PY
-
-      # ---------------------------------------------------------
-      # 5) Upload everything useful
-      # ---------------------------------------------------------
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
