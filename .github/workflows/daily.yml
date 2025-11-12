@@ -23,6 +23,76 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pandas pyyaml scikit-learn lightgbm
 
+      # ---------- Day 5: odds snapshots (The Odds API, nested bookmakers) ----------
+      - name: Save OPEN odds snapshot
+        env:
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          SNAPSHOT_KIND: open
+        run: |
+          python src/ingest/odds_snapshots.py
+
+      - name: Save MID odds snapshot
+        env:
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          SNAPSHOT_KIND: mid
+        run: |
+          python src/ingest/odds_snapshots.py
+
+      - name: Save CLOSE odds snapshot
+        env:
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          SNAPSHOT_KIND: close
+        run: |
+          python src/ingest/odds_snapshots.py
+
+      - name: Compute odds movement & dispersion
+        run: |
+          python - <<'PY'
+          import glob, os
+          from datetime import datetime
+          from src.ingest.odds_snapshots import compute_movement, compute_dispersion
+
+          snap_dir = "data/_snapshots"
+          os.makedirs("outputs", exist_ok=True)
+
+          snaps = glob.glob(os.path.join(snap_dir, "*.csv"))
+          if not snaps:
+            print("No snapshots found, skipping.")
+            raise SystemExit(0)
+
+          def ts_from_name(path: str) -> datetime:
+            base = os.path.basename(path)
+            parts = base.split("_")
+            if len(parts) < 2:
+              return datetime.min
+            dt_part = parts[1].split(".")[0]
+            return datetime.strptime(dt_part, "%Y%m%d_%H%M")
+
+          snaps = sorted(snaps, key=ts_from_name)
+          latest_open = None
+          latest_close = None
+          for p in snaps:
+            name = os.path.basename(p)
+            if name.startswith("open_"):
+              latest_open = p
+            elif name.startswith("close_"):
+              latest_close = p
+
+          if latest_open and latest_close:
+            movement = compute_movement(latest_open, latest_close)
+            movement.to_csv("outputs/odds_movement_latest.csv", index=False)
+            dispersion = compute_dispersion(latest_close)
+            dispersion.to_csv("outputs/odds_dispersion_latest.csv", index=False)
+            print("wrote odds_movement_latest.csv and odds_dispersion_latest.csv")
+          else:
+            print("did not find both open_ and close_ snapshots; skipping feature build")
+          PY
+      # -----------------------------------------------------------------------------
+
+
       - name: Run QA
         env:
           RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
@@ -49,15 +119,12 @@ jobs:
               implied_fair_spread,
               implied_fair_total,
           )
-
           # Fail early if required secrets are missing
           if not os.getenv("RAPIDAPI_KEY") or not os.getenv("ODDS_API_KEY"):
               print("Required API secrets missing. Exiting.")
               sys.exit(1)
-
           os.makedirs("outputs", exist_ok=True)
           today_str = date.today().strftime("%Y-%m-%d")
-
           # Fetch NBA games for the date
           games_resp = get_nba_games_by_date(today_str)
           games = games_resp.get("response", [])
@@ -65,20 +132,18 @@ jobs:
               odds = get_nba_odds()
           except Exception:
               odds = []
-
           # Handle empty slate
           if not games:
               with open("outputs/empty-slate.txt", "w") as f:
-                  f.write(f"No games scheduled for {today_str}.\\n")
+                  f.write(f"No games scheduled for {today_str}.\n")
               with open("run_summary.md", "w") as f:
-                  f.write(f"# NBA daily run\\nNo games scheduled for {today_str}\\n")
+                  f.write(f"# NBA daily run\nNo games scheduled for {today_str}\n")
               pip_versions = subprocess.run(["pip", "freeze"], capture_output=True, text=True)
               with open("outputs/pip_versions.txt", "w") as pv:
                   pv.write(pip_versions.stdout)
               with open("calibration_report.html", "w") as cr:
                   cr.write("<html><body><h1>Calibration Report</h1><p>No games to evaluate.</p></body></html>")
               sys.exit(0)
-
           # Build rows and model predictions
           rows = merge_game_and_odds(games, odds)
           preds = []
@@ -92,14 +157,11 @@ jobs:
                   "fair_spread": implied_fair_spread(wp["home_win_prob"]),
                   "fair_total": implied_fair_total(),
               })
-
           df = pd.DataFrame(preds)
           out_path = f"outputs/predictions_{today_str}.csv"
           df.to_csv(out_path, index=False)
-
           with open("run_summary.md", "w") as f:
-              f.write(f"# NBA daily run\\nWrote {len(df)} rows for {today_str}\\n")
-
+              f.write(f"# NBA daily run\nWrote {len(df)} rows for {today_str}\n")
           pip_versions = subprocess.run(["pip", "freeze"], capture_output=True, text=True)
           with open("outputs/pip_versions.txt", "w") as pv:
               pv.write(pip_versions.stdout)
@@ -115,124 +177,4 @@ jobs:
             outputs/
             run_summary.md
             calibration_report.html
-*** Begin Patch
-*** Add File: .github/workflows/daily.yml
-+name: Daily NBA odds snapshots
-+
-+# This workflow captures open, mid, and close odds snapshots from The Odds API,
-+# derives market movement and dispersion features, and uploads the resulting
-+# snapshots and feature files as artifacts.  It runs once daily at 13:00 UTC
-+# and may also be triggered manually via the GitHub UI.
-+
-+on:
-+  schedule:
-+    # run once per day at 13:00 UTC
-+    - cron: "0 13 * * *"
-+  workflow_dispatch:
-+    # allow manual triggering from the Actions tab
-+    inputs:
-+      run_reason:
-+        description: "Reason for manual run"
-+        default: "manual"
-+        required: false
-+
-+jobs:
-+  fetch-odds-and-derive-features:
-+    runs-on: ubuntu-latest
-+    steps:
-+      - name: Checkout repository
-+        uses: actions/checkout@v4
-+
-+      - name: Set up Python 3.10
-+        uses: actions/setup-python@v4
-+        with:
-+          python-version: "3.10"
-+
-+      - name: Install dependencies
-+        run: |
-+          python -m pip install --upgrade pip
-+          pip install pandas requests pyyaml
-+
-+      # Save three snapshots: open, mid, close.  These run sequentially in the
-+      # same workflow run.  In a future enhancement these could be scheduled
-+      # separately or run on different cron timings.
-+      - name: Save open odds snapshot
-+        env:
-+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-+          SNAPSHOT_KIND: open
-+        run: |
-+          python src/ingest/odds_snapshots.py
-+
-+      - name: Save mid odds snapshot
-+        env:
-+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-+          SNAPSHOT_KIND: mid
-+        run: |
-+          python src/ingest/odds_snapshots.py
-+
-+      - name: Save close odds snapshot
-+        env:
-+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-+          SNAPSHOT_KIND: close
-+        run: |
-+          python src/ingest/odds_snapshots.py
-+
-+      - name: Compute odds movement and dispersion
-+        env:
-+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-+        run: |
-+          python - <<'PY'
-+          import glob
-+          import os
-+          from datetime import datetime
-+          import pandas as pd
-+          from src.ingest.odds_snapshots import compute_movement, compute_dispersion
-+
-+          # Find the most recent open and close snapshot files
-+          snapshots = glob.glob('data/_snapshots/*.csv')
-+          # sort by timestamp in filename (YYYYMMDD_HHMM)
-+          def extract_dt(path: str) -> datetime:
-+              name = os.path.basename(path)
-+              # expected format kind_YYYYMMDD_HHMM.csv
-+              parts = name.split('_')
-+              if len(parts) < 2:
-+                  return datetime.min
-+              dt_part = parts[1].split('.')[0]
-+              return datetime.strptime(dt_part, "%Y%m%d_%H%M")
-+          snapshots_sorted = sorted(snapshots, key=extract_dt)
-+          # group by kind
-+          latest_open = None
-+          latest_close = None
-+          for path in snapshots_sorted:
-+              base = os.path.basename(path)
-+              if base.startswith('open_'):
-+                  latest_open = path
-+              if base.startswith('close_'):
-+                  latest_close = path
-+          # Compute movement and dispersion only if we have both
-+          os.makedirs('outputs', exist_ok=True)
-+          if latest_open and latest_close:
-+              movement_df = compute_movement(latest_open, latest_close)
-+              movement_df.to_csv('outputs/odds_movement_latest.csv', index=False)
-+              dispersion_df = compute_dispersion(latest_close)
-+              dispersion_df.to_csv('outputs/odds_dispersion_latest.csv', index=False)
-+              print(f"Computed movement and dispersion for {len(movement_df)} rows")
-+          else:
-+              # If not enough snapshots, skip gracefully
-+              print('Skipping odds movement/dispersion computation due to missing snapshots.')
-+          PY
-+
-+      - name: Upload odds artifacts
-+        uses: actions/upload-artifact@v4
-+        with:
-+          name: nba-odds-snapshots
-+          path: |
-+            data/_snapshots
-+            outputs/odds_movement_latest.csv
-+            outputs/odds_dispersion_latest.csv
-*** End Patch
-*** End Patch
+            data/_snapshots
