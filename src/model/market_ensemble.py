@@ -101,3 +101,31 @@ def apply_market_ensemble(
     df["fair_total_market"] = df["fair_total"]
 
     return df
+if __name__ == "__main__":
+    """
+    CLI use:
+    - expects outputs/predictions_<today>.csv (the one your pipeline already writes)
+    - optionally uses outputs/odds_dispersion_latest.csv from Day 5
+    - writes outputs/predictions_<today>_market.csv
+    """
+    import os
+    from datetime import date
+
+    os.makedirs("outputs", exist_ok=True)
+    today = date.today().strftime("%Y-%m-%d")
+
+    preds_path = f"outputs/predictions_{today}.csv"
+    import pandas as pd
+
+    preds = pd.read_csv(preds_path)
+
+    odds_path = "outputs/odds_dispersion_latest.csv"
+    if os.path.exists(odds_path):
+        odds = pd.read_csv(odds_path)
+    else:
+        odds = None
+
+    out = apply_market_ensemble(preds, odds)
+    out_path = f"outputs/predictions_{today}_market.csv"
+    out.to_csv(out_path, index=False)
+    print(f"✅ wrote {out_path}")
