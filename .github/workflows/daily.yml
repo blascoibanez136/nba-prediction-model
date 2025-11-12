@@ -190,6 +190,16 @@ jobs:
         run: |
          python src/eval/calibration.py
 
+      - name: Build pick sheet
+        env:
+          PYTHONPATH: .
+          KELLY_CAP: "0.25"          # cap Kelly at 25%
+          BANKROLL_UNITS: "100"      # optional bankroll sizing in units
+          RUN_DATE: ${{ env.RUN_DATE || '' }}
+        run: |
+          python src/eval/edge_picker.py
+
+
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -199,3 +209,6 @@ jobs:
             outputs/
             run_summary.md
             calibration_report.html
+            outputs/picks_*.csv
+            picks_report.html
+
