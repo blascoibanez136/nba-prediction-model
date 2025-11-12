@@ -60,18 +60,20 @@ def apply_market_ensemble(
     predictions: pd.DataFrame,
     odds_dispersion: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    """
-    predictions: DataFrame with at least game_id, fair_spread, fair_total, home_win_prob
-    odds_dispersion: DataFrame from Day 5 with game_id, book_dispersion, consensus_close
-    """
     df = predictions.copy()
 
     if odds_dispersion is not None and not odds_dispersion.empty:
-        df = df.merge(odds_dispersion, on="game_id", how="left")
+        # make copies and coerce key to the same type
+        df["game_id"] = df["game_id"].astype(str)
+        odds_disp = odds_dispersion.copy()
+        odds_disp["game_id"] = odds_disp["game_id"].astype(str)
+
+        df = df.merge(odds_disp, on="game_id", how="left")
     else:
         # add empty cols so code below doesn't break
         df["book_dispersion"] = None
         df["consensus_close"] = None
+
 
     # 1) shrink spreads
     df["fair_spread_market"] = shrink_toward_market(
