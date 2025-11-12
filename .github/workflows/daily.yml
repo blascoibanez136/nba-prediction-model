@@ -29,6 +29,7 @@ jobs:
           RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           SNAPSHOT_KIND: open
+          PYTHONPATH: .
         run: |
           python src/ingest/odds_snapshots.py
 
@@ -37,6 +38,7 @@ jobs:
           RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           SNAPSHOT_KIND: mid
+          PYTHONPATH: . 
         run: |
           python src/ingest/odds_snapshots.py
 
@@ -45,10 +47,13 @@ jobs:
           RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           SNAPSHOT_KIND: close
+          PYTHONPATH: .
         run: |
           python src/ingest/odds_snapshots.py
 
       - name: Compute odds movement & dispersion
+      env:
+      PYTHONPATH: .
         run: |
           python - <<'PY'
           import glob, os
