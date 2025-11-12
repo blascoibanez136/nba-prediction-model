@@ -183,6 +183,14 @@ jobs:
         run: |
           python src/model/market_ensemble.py
 
+      - name: Evaluate + Calibrate
+        env:
+            PYTHONPATH: .
+            RUN_DATE: ${{ env.RUN_DATE || '' }}
+        run: |
+         python src/eval/calibration.py
+
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
