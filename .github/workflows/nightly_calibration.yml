@@ -1,0 +1,40 @@
+name: Nightly NBA Calibration
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 9 * * *"   # 09:00 UTC daily (adjust later if needed)
+
+jobs:
+  nightly-calibration:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy pyyaml
+
+      - name: Run calibration for YESTERDAY
+        env:
+          PYTHONPATH: .
+        run: |
+          YESTERDAY=$(date -u -d "yesterday" +%F)
+          echo "Calibrating for $YESTERDAY"
+          RUN_DATE="$YESTERDAY" python src/eval/calibration.py
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-calibration
+          path: |
+            outputs/calibration_metrics.json
+            outputs/calibration_plot.csv
+            calibration_report.html
