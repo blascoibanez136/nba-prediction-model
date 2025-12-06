@@ -65,25 +65,49 @@ def apply_market_ensemble(
     df = predictions.copy()
 
     if odds_dispersion is not None and not odds_dispersion.empty:
-        # make copies and coerce key to the same type
-        df["game_id"] = df["game_id"].astype(str)
         odds_disp = odds_dispersion.copy()
 
-        # Ensure we have a 'game_id' column
-        if "game_id" not in odds_disp.columns:
-            # Sometimes game_id ends up as an index level instead of a column
-            if "game_id" in odds_disp.index.names:
+        # Decide what key to merge on
+        key_col: Optional[str] = None
+
+        # 1) Try game_id if present in both frames
+        if "game_id" in df.columns:
+            if "game_id" not in odds_disp.columns and "game_id" in odds_disp.index.names:
                 odds_disp = odds_disp.reset_index("game_id")
-            else:
-                raise KeyError(
-                    "'game_id' column missing from odds dataframe. "
-                    f"Available columns: {list(odds_disp.columns)}. "
-                    "Check the odds ingest step to ensure it creates a 'game_id' field."
-                )
+            if "game_id" in odds_disp.columns:
+                df["game_id"] = df["game_id"].astype(str)
+                odds_disp["game_id"] = odds_disp["game_id"].astype(str)
+                key_col = "game_id"
 
-        odds_disp["game_id"] = odds_disp["game_id"].astype(str)
+        # 2) Fall back to merge_key if available in both
+        if key_col is None and "merge_key" in df.columns and "merge_key" in odds_disp.columns:
+            df["merge_key"] = df["merge_key"].astype(str)
+            odds_disp["merge_key"] = odds_disp["merge_key"].astype(str)
+            key_col = "merge_key"
 
-        df = df.merge(odds_disp, on="game_id", how="left")
+        # 3) Last resort: build merge_key from teams + date
+        if key_col is None:
+            needed = ["home_team", "away_team", "game_date"]
+            if all(c in df.columns for c in needed) and all(c in odds_disp.columns for c in needed):
+                for frame in (df, odds_disp):
+                    frame["merge_key"] = (
+                        frame["home_team"].astype(str)
+                        + "_"
+                        + frame["away_team"].astype(str)
+                        + "_"
+                        + frame["game_date"].astype(str)
+                    )
+                key_col = "merge_key"
+
+        if key_col is None:
+            raise KeyError(
+                "Could not determine a key to merge predictions with odds. "
+                f"Pred columns: {list(df.columns)} | Odds columns: {list(odds_disp.columns)}"
+            )
+
+        # Merge in only the needed market columns
+        merge_cols = [col for col in ["book_dispersion", "consensus_close", key_col] if col in odds_disp.columns]
+        df = df.merge(odds_disp[merge_cols], on=key_col, how="left")
     else:
         # add empty cols so code below doesn't break
         df["book_dispersion"] = None
@@ -101,10 +125,8 @@ def apply_market_ensemble(
     # (for Pro-Lite we keep it simple)
     if "book_dispersion" in df.columns:
         tight = df["book_dispersion"].fillna(5.0)
-        # lower dispersion -> stronger pull
         adj_wp = []
         for wp, disp in zip(df["home_win_prob"], tight):
-            # calc weight like above
             inv = 1.0 / (1.0 + disp)
             w = 0.1 + 0.4 * inv  # between 0.1 and 0.5
             blended_wp = w * 0.5 + (1 - w) * wp
@@ -123,7 +145,7 @@ if __name__ == "__main__":
     """
     CLI use:
     - expects outputs/predictions_<today>.csv (the one your pipeline already writes)
-    - optionally uses outputs/odds_dispersion_latest.csv from Day 5
+    - optionally uses outputs/odds_dispersion_latest.csv
     - writes outputs/predictions_<today>_market.csv
     """
     import os
