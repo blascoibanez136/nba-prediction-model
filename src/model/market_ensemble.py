@@ -12,8 +12,10 @@ Returns:
 """
 
 from __future__ import annotations
+
 import math
 from typing import Optional
+
 import pandas as pd
 
 
@@ -47,12 +49,12 @@ def shrink_toward_market(
         # map dispersion to [min_weight, max_weight]
         # small dispersion -> weight near max_weight
         # big dispersion -> weight near min_weight
-        # simple smooth function
         inv = 1.0 / (1.0 + disp)
         w = min_weight + (max_weight - min_weight) * inv
 
         blended = w * market + (1.0 - w) * model
         out.append(blended)
+
     return pd.Series(out, index=df.index)
 
 
@@ -66,6 +68,19 @@ def apply_market_ensemble(
         # make copies and coerce key to the same type
         df["game_id"] = df["game_id"].astype(str)
         odds_disp = odds_dispersion.copy()
+
+        # Ensure we have a 'game_id' column
+        if "game_id" not in odds_disp.columns:
+            # Sometimes game_id ends up as an index level instead of a column
+            if "game_id" in odds_disp.index.names:
+                odds_disp = odds_disp.reset_index("game_id")
+            else:
+                raise KeyError(
+                    "'game_id' column missing from odds dataframe. "
+                    f"Available columns: {list(odds_disp.columns)}. "
+                    "Check the odds ingest step to ensure it creates a 'game_id' field."
+                )
+
         odds_disp["game_id"] = odds_disp["game_id"].astype(str)
 
         df = df.merge(odds_disp, on="game_id", how="left")
@@ -73,7 +88,6 @@ def apply_market_ensemble(
         # add empty cols so code below doesn't break
         df["book_dispersion"] = None
         df["consensus_close"] = None
-
 
     # 1) shrink spreads
     df["fair_spread_market"] = shrink_toward_market(
@@ -103,6 +117,8 @@ def apply_market_ensemble(
     df["fair_total_market"] = df["fair_total"]
 
     return df
+
+
 if __name__ == "__main__":
     """
     CLI use:
@@ -117,8 +133,6 @@ if __name__ == "__main__":
     today = date.today().strftime("%Y-%m-%d")
 
     preds_path = f"outputs/predictions_{today}.csv"
-    import pandas as pd
-
     preds = pd.read_csv(preds_path)
 
     odds_path = "outputs/odds_dispersion_latest.csv"
