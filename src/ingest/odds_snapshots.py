@@ -131,25 +131,89 @@ def compute_movement(open_csv_path: str, close_csv_path: str) -> pd.DataFrame:
     ]
 
 
-def compute_dispersion(
-    close_csv_path: str, allowed_books: Optional[List[str]] = None
-) -> pd.DataFrame:
-    """
-    for one snapshot, compute:
-    - book_dispersion = std of spreads across books
-    - consensus_close = median spread across books
-    """
-    close_df = pd.read_csv(close_csv_path)
-    flat = flatten_spreads(close_df)
+import pandas as pd
+import numpy as np
+from datetime import datetime, timezone
 
-    if allowed_books:
-        flat = flat[flat["book"].isin(allowed_books)].reset_index(drop=True)
+def _norm_team(s: str) -> str:
+    if not isinstance(s, str): return ""
+    s = s.lower().strip()
+    aliases = {
+        "la clippers": "los angeles clippers",
+        "la lakers": "los angeles lakers",
+        "ny knicks": "new york knicks",
+        # add more aliases as needed
+    }
+    return aliases.get(s, s)
 
-    disp = flat.groupby("game_id")["spread"].std().fillna(0).rename("book_dispersion")
-    consensus = flat.groupby("game_id")["spread"].median().rename("consensus_close")
+def _merge_key(home_team: str, away_team: str, game_date: str) -> str:
+    return f"{_norm_team(home_team)}__{_norm_team(away_team)}__{game_date}"
 
-    out = pd.concat([disp, consensus], axis=1).reset_index()
-    return out
+def _date_utc_from_commence(ts: str) -> str:
+    # The Odds API commence_time is ISO8601; we convert to UTC date (YYYY-MM-DD)
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%d")
+
+def compute_dispersion(close_csv_path: str, allowed_books: list[str] | None = None) -> pd.DataFrame:
+    raw = pd.read_csv(close_csv_path)
+
+    # Flatten 'bookmakers' (JSON) for spreads into tidy rows
+    # Expected columns: id, commence_time, home_team, away_team, bookmakers
+    rows = []
+    for _, r in raw.iterrows():
+        game_id = str(r.get("id") or r.get("game_id") or "")
+        home = r.get("home_team")
+        away = r.get("away_team")
+        commence = r.get("commence_time")
+        books = r.get("bookmakers")
+        if pd.isna(books) or not home or not away or not commence:
+            continue
+        try:
+            books = json.loads(books) if isinstance(books, str) else books
+        except Exception:
+            continue
+        if not isinstance(books, list): 
+            continue
+        game_date = _date_utc_from_commence(str(commence))
+        for bk in books:
+            book_key = bk.get("key") or bk.get("title") or "unknown"
+            if allowed_books and book_key not in allowed_books:
+                continue
+            for m in bk.get("markets", []):
+                if (m.get("key") or "").lower() != "spreads":
+                    continue
+                for outc in m.get("outcomes", []):
+                    team = outc.get("name")
+                    point = outc.get("point")
+                    # We keep spread values; we’ll compute dispersion across books
+                    rows.append({
+                        "game_id": game_id,
+                        "book": book_key,
+                        "home_team": home,
+                        "away_team": away,
+                        "game_date": game_date,
+                        "team": team,
+                        "spread": pd.to_numeric(point, errors="coerce"),
+                    })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["merge_key","book_dispersion","consensus_close","home_team","away_team","game_date"])
+
+    # Convert spreads to HOME perspective:
+    # For home rows: spread_home = spread
+    # For away rows: spread_home = -spread
+    is_home = df["team"].astype(str).str.lower() == df["home_team"].astype(str).str.lower()
+    df["spread_home"] = np.where(is_home, df["spread"], -df["spread"])
+
+    # Compute dispersion and consensus close across books per game
+    agg = (
+        df.groupby(["home_team","away_team","game_date"], as_index=False)
+          .agg(book_dispersion=("spread_home", "std"),
+               consensus_close=("spread_home", "median"))
+    )
+    agg["merge_key"] = agg.apply(lambda r: _merge_key(r["home_team"], r["away_team"], r["game_date"]), axis=1)
+    return agg[["merge_key","book_dispersion","consensus_close","home_team","away_team","game_date"]]
 
 
 if __name__ == "__main__":
