@@ -77,9 +77,21 @@ def _price_to_prob(price: float) -> float:
         p = float(price)
     except Exception:
         return np.nan
-    if -5000 <= p <= 5000:  # American odds
+
+    # Heuristics:
+    # - If |p| >= 10, treat as American
+    # - If 1.01 <= p <= 10, treat as decimal
+    # - Otherwise, default to American for safety
+    if abs(p) >= 10:
+        # American odds (e.g. -110, +150)
         return _american_to_prob(p)
-    return 1.0 / p  # decimal fallback
+    elif 1.01 <= p <= 10.0:
+        # Decimal odds (e.g. 1.90)
+        return 1.0 / p
+    else:
+        # Fallback
+        return _american_to_prob(p)
+
 
 
 def _kelly_fraction(p: float, odds_american: float) -> float:
