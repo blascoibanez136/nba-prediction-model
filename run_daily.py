@@ -3,27 +3,24 @@ run_daily.py
 
 End-to-end daily NBA Pro-Lite pipeline.
 
-Steps:
-1) Try to fetch today's NBA games from API-Sports (nba_ingest).
-2) If none are found, fall back to using odds_dispersion_latest.csv
-   to infer the slate (home_team, away_team, game_date).
-3) Use the trained balldontlie-based model (predict_games) to generate:
-       - home_win_prob
-       - away_win_prob
-       - fair_spread
-       - fair_total
-   and write outputs/predictions_<YYYY-MM-DD>.csv
-4) Apply market ensemble (if odds dispersion file available) to produce
-       outputs/predictions_<YYYY-MM-DD>_market.csv
-5) Run edge picker to generate:
-       - outputs/picks_<YYYY-MM-DD>.csv
-       - picks_report.html
-6) Write a simple run_summary.md.
+Schedule logic (in order of preference):
+1) Try to fetch today's NBA games from balldontlie.io.
+2) If none are found, fall back to a pre-loaded official schedule CSV:
+       data/schedules/nba_schedule.csv
+3) If still no games, fall back to inferring the slate from odds_dispersion_latest.csv.
+
+Then:
+- Use the trained models to generate predictions (predict_games).
+- Add merge_key for joining with odds.
+- Apply market_ensemble (if odds dispersion file available).
+- Run edge_picker to produce:
+      - outputs/picks_<YYYY-MM-DD>.csv
+      - picks_report.html
+- Write run_summary.md.
 
 Environment:
-- RAPIDAPI_KEY   : API-Sports key (for nba_ingest)
-- ODDS_API_KEY   : The Odds API key (used in odds_snapshots workflow)
-- RUN_DATE       : optional override (YYYY-MM-DD); default is today's date
+- RUN_DATE            : optional override (YYYY-MM-DD); default is today's date (UTC).
+- BALLDONTLIE_API_KEY : optional API key for balldontlie.io (Authorization: Bearer ...).
 """
 
 from __future__ import annotations
@@ -33,61 +30,131 @@ from datetime import date
 from typing import List, Dict, Any
 
 import pandas as pd
+import requests
 
-from src.ingest.nba_ingest import get_nba_games_by_date
 from src.model.predict import predict_games
 from src.model.market_ensemble import apply_market_ensemble
 from src.eval.edge_picker import main as run_edge_picker, _merge_key as _ep_merge_key
+
+
+BALD_BASE_URL = "https://api.balldontlie.io/v1"
+BALD_API_KEY = os.getenv("BALLDONTLIE_API_KEY")
 
 
 def _get_run_date() -> str:
     return os.getenv("RUN_DATE") or date.today().strftime("%Y-%m-%d")
 
 
-def fetch_today_games_from_api(run_date: str) -> pd.DataFrame:
+# -----------------------
+# Schedule fetchers
+# -----------------------
+def fetch_today_games_from_balldontlie(run_date: str) -> pd.DataFrame:
     """
-    Fetch today's NBA games from API-Sports via nba_ingest.get_nba_games_by_date.
+    Fetch today's NBA games from balldontlie.io /games endpoint.
+
+    Endpoint docs (v1):
+        GET /games?dates[]=YYYY-MM-DD&per_page=100
 
     Returns DataFrame with:
         game_id, game_date, home_team, away_team
-    (May be empty if API-Sports has no games for that date.)
+    (May be empty if the API has no games for that date.)
     """
-    raw = get_nba_games_by_date(run_date)
-    games: List[Dict[str, Any]] = raw.get("response", [])
+    params = {
+        "dates[]": run_date,
+        "per_page": 100,
+    }
+    headers: Dict[str, str] = {}
+    if BALD_API_KEY:
+        headers["Authorization"] = f"Bearer {BALD_API_KEY}"
 
+    url = f"{BALD_BASE_URL}/games"
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[run_daily] balldontlie schedule fetch failed for {run_date}: {e}")
+        return pd.DataFrame(columns=["game_id", "game_date", "home_team", "away_team"])
+
+    data = resp.json().get("data", [])
     rows: List[Dict[str, Any]] = []
-    for g in games:
-        gid = g.get("id")
-        teams = g.get("teams", {}) or {}
-        home = teams.get("home", {}) or {}
-        away = teams.get("visitors", {}) or {}
 
-        home_name = home.get("name")
-        away_name = away.get("name")
+    for g in data:
+        gid = g.get("id")
+        home = g.get("home_team", {}) or {}
+        away = g.get("visitor_team", {}) or {}
+
+        home_name = home.get("full_name") or home.get("name")
+        away_name = away.get("full_name") or away.get("name")
 
         if not home_name or not away_name:
             continue
 
+        d = g.get("date") or ""
+        # Typically ISO like "2025-12-07T00:00:00.000Z"
+        game_date = d[:10] if d else run_date
+
         rows.append(
             {
                 "game_id": gid,
-                "game_date": run_date,
+                "game_date": game_date,
                 "home_team": home_name,
                 "away_team": away_name,
             }
         )
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=["game_id", "game_date", "home_team", "away_team"])
     if df.empty:
-        print(f"[run_daily] API-Sports returned no games for {run_date}.")
+        print(f"[run_daily] balldontlie returned no games for {run_date}.")
     else:
-        print(f"[run_daily] Fetched {len(df)} games from API-Sports for {run_date}.")
+        print(f"[run_daily] Fetched {len(df)} games from balldontlie for {run_date}.")
     return df
+
+
+def fetch_today_games_from_schedule_csv(
+    run_date: str,
+    csv_path: str = "data/schedules/nba_schedule.csv",
+) -> pd.DataFrame:
+    """
+    Fallback: use a pre-loaded official schedule CSV.
+
+    CSV is expected to have at least:
+        game_date, home_team, away_team
+    Optional:
+        game_id
+
+    Returns DataFrame with:
+        game_id, game_date, home_team, away_team
+    """
+    if not os.path.exists(csv_path):
+        print(f"[run_daily] No schedule CSV found at {csv_path}.")
+        return pd.DataFrame(columns=["game_id", "game_date", "home_team", "away_team"])
+
+    sched = pd.read_csv(csv_path)
+    required = {"game_date", "home_team", "away_team"}
+    missing = required - set(sched.columns)
+    if missing:
+        print(f"[run_daily] schedule CSV missing columns: {missing}")
+        return pd.DataFrame(columns=["game_id", "game_date", "home_team", "away_team"])
+
+    day = sched[sched["game_date"] == run_date].copy()
+    if day.empty:
+        print(f"[run_daily] schedule CSV has no rows for {run_date}.")
+        return pd.DataFrame(columns=["game_id", "game_date", "home_team", "away_team"])
+
+    if "game_id" not in day.columns:
+        # Synthetic ID if not provided
+        day["game_id"] = day.apply(
+            lambda r: f"{r['home_team']} vs {r['away_team']} {r['game_date']}", axis=1
+        )
+
+    out = day[["game_id", "game_date", "home_team", "away_team"]].copy()
+    print(f"[run_daily] Loaded {len(out)} games from schedule CSV for {run_date}.")
+    return out
 
 
 def fetch_today_games_from_dispersion(run_date: str) -> pd.DataFrame:
     """
-    Fallback: infer today's slate from outputs/odds_dispersion_latest.csv.
+    Last-resort fallback: infer today's slate from outputs/odds_dispersion_latest.csv.
 
     Returns DataFrame with:
         game_id, game_date, home_team, away_team
@@ -113,14 +180,26 @@ def fetch_today_games_from_dispersion(run_date: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["game_id", "game_date", "home_team", "away_team"])
 
     # One row per unique matchup on that date
-    day = day.sort_values("merge_key").drop_duplicates("merge_key")
+    if "merge_key" in day.columns:
+        day = day.sort_values("merge_key").drop_duplicates("merge_key")
+        games_df = day[["home_team", "away_team", "game_date", "merge_key"]].copy()
+        games_df.rename(columns={"merge_key": "game_id"}, inplace=True)
+    else:
+        day = day.sort_values(["home_team", "away_team"]).drop_duplicates(
+            ["home_team", "away_team"]
+        )
+        games_df = day[["home_team", "away_team", "game_date"]].copy()
+        games_df["game_id"] = games_df.apply(
+            lambda r: f"{r['home_team']} vs {r['away_team']} {r['game_date']}", axis=1
+        )
 
-    games_df = day[["home_team", "away_team", "game_date", "merge_key"]].copy()
-    games_df.rename(columns={"merge_key": "game_id"}, inplace=True)
     print(f"[run_daily] Inferred {len(games_df)} games from dispersion for {run_date}.")
-    return games_df
+    return games_df[["game_id", "game_date", "home_team", "away_team"]]
 
 
+# -----------------------
+# Predictions + ensemble
+# -----------------------
 def build_model_predictions(games_df: pd.DataFrame, run_date: str) -> str:
     """
     Use the trained models to generate predictions for today's games and
@@ -181,6 +260,8 @@ def run_picks_pipeline(run_date: str) -> None:
     market-adjusted file outputs/predictions_<run_date>_market.csv if it exists.
     """
     print("[run_daily] Running edge picker to generate pick sheet and HTML report...")
+    # Ensure downstream code sees the same RUN_DATE
+    os.environ["RUN_DATE"] = run_date
     run_edge_picker()
     print("[run_daily] Edge picker completed.")
 
@@ -192,33 +273,44 @@ def write_run_summary(run_date: str, n_games: int) -> None:
     print("[run_daily] Wrote run_summary.md")
 
 
+# -----------------------
+# main
+# -----------------------
 def main():
     run_date = _get_run_date()
     print(f"[run_daily] Starting daily pipeline for {run_date}")
 
-    # 1) Try API-Sports schedule
-    games_df = fetch_today_games_from_api(run_date)
+    # Keep RUN_DATE consistent for any module that reads it
+    os.environ["RUN_DATE"] = run_date
 
-    # 2) Fallback to dispersion if API returns no games
+    # 1) Try balldontlie schedule
+    games_df = fetch_today_games_from_balldontlie(run_date)
+
+    # 2) Fallback to CSV schedule
+    if games_df.empty:
+        print("[run_daily] Falling back to schedule CSV.")
+        games_df = fetch_today_games_from_schedule_csv(run_date)
+
+    # 3) Fallback to dispersion-based slate inference
     if games_df.empty:
         print("[run_daily] Falling back to dispersion-based schedule inference.")
         games_df = fetch_today_games_from_dispersion(run_date)
 
     if games_df.empty:
-        print("[run_daily] No games found even after dispersion fallback; exiting gracefully.")
+        print("[run_daily] No games found after all schedule methods; exiting gracefully.")
         write_run_summary(run_date, 0)
         return
 
-    # 3) Build model predictions
+    # 4) Build model predictions
     base_preds_path = build_model_predictions(games_df, run_date)
 
-    # 4) Apply market ensemble adjustment (if odds dispersion is present)
-    market_preds_path = apply_market_adjustment(base_preds_path, run_date)
+    # 5) Apply market ensemble adjustment (if odds dispersion is present)
+    _ = apply_market_adjustment(base_preds_path, run_date)
 
-    # 5) Run edge picker to produce picks CSV + HTML
+    # 6) Run edge picker to produce picks CSV + HTML
     run_picks_pipeline(run_date)
 
-    # 6) Write a simple run summary
+    # 7) Write a simple run summary
     write_run_summary(run_date, len(games_df))
 
     print("[run_daily] Pipeline completed successfully.")
