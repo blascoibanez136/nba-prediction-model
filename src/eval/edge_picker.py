@@ -12,6 +12,11 @@ Outputs:
 - outputs/picks_<YYYY-MM-DD>.csv
 - picks_report.html
 
+Filtering (priced picks only):
+- EDGE_THRESHOLD  : minimum absolute edge in points (float, default 0.0)
+- KELLY_THRESHOLD : minimum Kelly fraction (float, default 0.0)
+- BOOK_WHITELIST  : optional comma-separated list of book keys (e.g. "draftkings,fanduel")
+
 Run locally:
     PYTHONPATH=. python src/eval/edge_picker.py
 """
@@ -267,7 +272,7 @@ def build_side_table(spreads_df: pd.DataFrame) -> pd.DataFrame:
     if spreads_df.empty:
         return pd.DataFrame(columns=[
             "merge_key", "game_id", "book", "home_team", "away_team",
-            "market_side", "book_spread_home", "market_price", "game_date"
+            "game_date", "market_side", "book_spread_home", "market_price"
         ])
 
     home_rows = spreads_df[spreads_df["team"] == spreads_df["home_team"]].copy()
@@ -306,34 +311,25 @@ def make_picks_with_prices(preds: pd.DataFrame, side_table: pd.DataFrame) -> pd.
         ])
 
     # Merge odds with predictions via merge_key
+    base_cols = [
+        "merge_key",
+        "game_id",
+        "game_date",
+        "home_team",
+        "away_team",
+        "fair_spread",
+        "consensus_close",
+        "book_dispersion",
+    ]
+    if "fair_spread_market" in preds.columns:
+        base_cols.append("fair_spread_market")
+    if "home_win_prob_market" in preds.columns:
+        base_cols.append("home_win_prob_market")
+    if "home_win_prob" in preds.columns:
+        base_cols.append("home_win_prob")
+
     df = side_table.merge(
-        preds[
-            [
-                "merge_key",
-                "game_id",
-                "game_date",
-                "home_team",
-                "away_team",
-                "fair_spread",
-                "fair_spread_market",
-                "home_win_prob",
-                "home_win_prob_market",
-                "consensus_close",
-                "book_dispersion",
-            ]
-            if set(["fair_spread_market", "home_win_prob_market"]).issubset(preds.columns)
-            else [
-                "merge_key",
-                "game_id",
-                "game_date",
-                "home_team",
-                "away_team",
-                "fair_spread",
-                "home_win_prob",
-                "consensus_close",
-                "book_dispersion",
-            ]
-        ].drop_duplicates("merge_key"),
+        preds[base_cols].drop_duplicates("merge_key"),
         on="merge_key",
         how="left",
         suffixes=("", "_pred"),
@@ -382,6 +378,23 @@ def make_picks_with_prices(preds: pd.DataFrame, side_table: pd.DataFrame) -> pd.
         df["model_fair_spread"].notna() &
         df["model_side_prob"].notna()
     ].copy()
+
+    # Optional book whitelist
+    book_whitelist = os.getenv("BOOK_WHITELIST")
+    if book_whitelist:
+        wl = [b.strip().lower() for b in book_whitelist.split(",") if b.strip()]
+        if wl:
+            df = df[df["book"].str.lower().isin(wl)].copy()
+
+    # Edge / Kelly thresholds
+    edge_thresh = float(os.getenv("EDGE_THRESHOLD", "0.0"))
+    kelly_thresh = float(os.getenv("KELLY_THRESHOLD", "0.0"))
+
+    if edge_thresh > 0.0 or kelly_thresh > 0.0:
+        df = df[
+            (df["model_edge_pts"].abs() >= edge_thresh) &
+            (df["suggested_kelly"] >= kelly_thresh)
+        ].copy()
 
     keep = [
         "game_id",
