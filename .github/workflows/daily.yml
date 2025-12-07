@@ -9,15 +9,6 @@ jobs:
   run-nba-pipeline:
     runs-on: ubuntu-latest
 
-    env:
-      # API keys from GitHub Actions secrets
-      RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}           # API-Sports
-      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}           # The Odds API
-      BALLDONTLIE_API_KEY: ${{ secrets.BALLDONTLIE_API_KEY }}  # balldontlie (for training if ever needed)
-      PYTHONPATH: .
-      # Optional: set RUN_DATE="YYYY-MM-DD" to backfill a specific date
-      # RUN_DATE: "2025-12-06"
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -30,7 +21,7 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests pyyaml scikit-learn lightgbm joblib
+          pip install pandas requests pyyaml scikit-learn lightgbm
 
       - name: Ensure runtime folders
         run: |
@@ -92,22 +83,38 @@ jobs:
           else:
               print("No open/close pair found; skipping odds feature build.")
           PY
-      # =====================================================================
+      # ======================================================================
 
+      # (Optional) QA step – keep if you still want validation to run
       - name: Run QA
+        env:
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          PYTHONPATH: .
         run: |
           python qa/validation.py
 
-      # ===================== NEW: End-to-end daily pipeline ==================
-      - name: Run daily NBA Pro-Lite pipeline
+      # ===================== Main daily pipeline =====================
+      - name: Run daily pipeline (schedule + predictions + picks)
+        env:
+          PYTHONPATH: .
+          BALLDONTLIE_API_KEY: ${{ secrets.BALLDONTLIE_API_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          # Leave RUN_DATE empty to use today's date; or set to "YYYY-MM-DD" manually if needed
+          RUN_DATE: ""
+          # Pick sheet filters (optional; adjust as you like)
+          EDGE_THRESHOLD: "1.5"          # only edges >= 1.5 pts (abs)
+          KELLY_THRESHOLD: "0.01"        # only Kelly >= 1% of bankroll
+          BOOK_WHITELIST: "draftkings,fanduel"
         run: |
           python run_daily.py
-      # ======================================================================
+      # ===============================================================
 
+      # (Optional) Calibration – currently a stub, but harmless to keep
       - name: Evaluate + Calibrate
         env:
           PYTHONPATH: .
-          # RUN_DATE (if set at job-level) will be inherited automatically
+          RUN_DATE: ${{ env.RUN_DATE || '' }}
         run: |
           python src/eval/calibration.py
 
