@@ -1,29 +1,34 @@
 """
-Basic training pipeline for NBA Pro-Lite model.
+Training pipeline for NBA Pro-Lite model using balldontlie historical data.
 
-This module:
-- Pulls historical NBA games from API-Sports (via src.ingest.nba_ingest).
-- Builds simple team-strength features.
-- Trains:
-    * LogisticRegression for home win probability
+Workflow:
+- Read config/config.yaml for backtest.start_season / backtest.end_season
+- Use src.ingest.balldontlie_ingest.fetch_games_for_seasons to pull historical games
+- Build simple team-strength features:
+    * +1 for home team
+    * -1 for away team
+    * +1 bias term for home court
+- Train:
+    * LogisticRegression for home win prob
     * LinearRegression for margin (home - away)
     * LinearRegression for total points
-- Saves models + team index under models/
+- Save:
+    * models/team_index.json
+    * models/win_model.pkl
+    * models/spread_model.pkl
+    * models/total_model.pkl
 
-You can run it as a script:
+Run from repo root:
 
     PYTHONPATH=. python src/model/train_model.py
 
-Note: This will make MANY API calls over the 2019–2024 window
-configured in config/config.yaml. Consider starting with a smaller
-date range for your first test run.
+Requires:
+- BALLDONTLIE_API_KEY set in environment (for paid plan) or empty for free (v1).
 """
 
 from __future__ import annotations
 
 import json
-import os
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -33,11 +38,7 @@ import yaml
 from joblib import dump
 from sklearn.linear_model import LogisticRegression, LinearRegression
 
-from src.ingest.nba_ingest import get_nba_games_by_date
-
-# ---------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------
+from src.ingest.balldontlie_ingest import fetch_games_for_seasons
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 MODELS_DIR = ROOT_DIR / "models"
@@ -50,114 +51,33 @@ TOTAL_MODEL_PATH = MODELS_DIR / "total_model.pkl"
 
 
 # ---------------------------------------------------------------------
-# Helpers
+# Config & utilities
 # ---------------------------------------------------------------------
 
 def _load_config() -> dict:
     cfg_path = ROOT_DIR / "config" / "config.yaml"
-    with open(cfg_path) as f:
+    with open(cfg_path, "r") as f:
         return yaml.safe_load(f)
-
-
-def _date_range(start: datetime, end: datetime):
-    cur = start
-    while cur <= end:
-        yield cur
-        cur += timedelta(days=1)
-
-
-def _extract_games_for_date(date_str: str) -> List[Dict]:
-    """
-    Fetch NBA games for a given date via API-Sports and
-    return a list of dicts with teams and final scores.
-    """
-    raw = get_nba_games_by_date(date_str)
-    # API-Sports format: raw["response"] is a list of games
-    games = raw.get("response", raw.get("games", []))
-
-    rows = []
-    for g in games:
-        teams = g.get("teams", {})
-        home = teams.get("home", {}) or {}
-        away = teams.get("visitors", {}) or {}
-
-        home_name = home.get("name")
-        away_name = away.get("name")
-
-        scores = g.get("scores", {})
-        home_score = scores.get("home")
-        away_score = scores.get("visitors")
-
-        # Some API variants nest scores; handle both patterns
-        if isinstance(home_score, dict):
-            home_score = home_score.get("points")
-        if isinstance(away_score, dict):
-            away_score = away_score.get("points")
-
-        if (
-            home_name is None
-            or away_name is None
-            or home_score is None
-            or away_score is None
-        ):
-            # skip games that are not finished or malformed
-            continue
-
-        rows.append(
-            {
-                "game_date": date_str,
-                "home_team": home_name,
-                "away_team": away_name,
-                "home_score": int(home_score),
-                "away_score": int(away_score),
-            }
-        )
-
-    return rows
 
 
 def fetch_historical_games() -> pd.DataFrame:
     """
-    Pull historical NBA games over the backtest window defined in config.yaml.
-    Returns a DataFrame with columns:
-        game_date, home_team, away_team, home_score, away_score
+    Fetch historical NBA games for the backtest window using balldontlie.
     """
     cfg = _load_config()
     bt_cfg = cfg.get("backtest", {})
     start_season = int(bt_cfg.get("start_season", 2019))
     end_season = int(bt_cfg.get("end_season", 2024))
 
-    # Rough NBA calendar: Oct 1 of start_season to July 1 of end_season+1
-    start_date = datetime(start_season, 10, 1)
-    end_date = datetime(end_season + 1, 7, 1)
+    print(f"[train_model] Fetching games via balldontlie for seasons {start_season}–{end_season}")
+    df = fetch_games_for_seasons(start_season, end_season)
 
-    all_rows: List[Dict] = []
+    if df.empty:
+        raise RuntimeError(
+            "No historical games fetched from balldontlie. "
+            "Check BALLDONTLIE_API_KEY and backtest seasons in config/config.yaml."
+        )
 
-    print(f"[train_model] Fetching games from {start_date.date()} to {end_date.date()}")
-
-    max_days = int(os.getenv("TRAIN_MAX_DAYS", "0"))  # 0 means no cap
-    day_counter = 0
-
-    for d in _date_range(start_date, end_date):
-        if max_days and day_counter >= max_days:
-            print(f"[train_model] TRAIN_MAX_DAYS={max_days} reached, stopping early.")
-            break
-
-        ds = d.strftime("%Y-%m-%d")
-        try:
-            day_rows = _extract_games_for_date(ds)
-            if day_rows:
-                all_rows.extend(day_rows)
-                print(f"[train_model] {ds}: {len(day_rows)} games")
-        except Exception as e:
-            print(f"[train_model] Warning: failed to fetch {ds}: {e}")
-
-        day_counter += 1
-
-    if not all_rows:
-        raise RuntimeError("No historical games fetched. Check API keys and config.")
-
-    df = pd.DataFrame(all_rows)
     print(f"[train_model] Collected {len(df)} games total.")
     return df
 
@@ -167,15 +87,17 @@ def build_team_index(df: pd.DataFrame) -> Dict[str, int]:
     teams = [t for t in teams if isinstance(t, str)]
     teams = sorted(set(teams))
     index = {team: i for i, team in enumerate(teams)}
+    print(f"[train_model] Built team index with {len(index)} teams.")
     return index
 
 
-def make_team_diff_features(
-    df: pd.DataFrame, team_index: Dict[str, int]
-) -> np.ndarray:
+def make_team_diff_features(df: pd.DataFrame, team_index: Dict[str, int]) -> np.ndarray:
     """
-    Create a feature matrix where each row encodes:
-        +1 for home team, -1 for away team, and a bias term for home court.
+    Feature encoding:
+      - +1 in the column of the home team
+      - -1 in the column of the away team
+      - +1 in the last column for home court bias
+
     Shape: (n_games, n_teams + 1)
     """
     n_teams = len(team_index)
@@ -185,10 +107,11 @@ def make_team_diff_features(
         hi = team_index.get(home)
         ai = team_index.get(away)
         if hi is None or ai is None:
+            # unseen team; leave row zeros aside from bias
+            X[i, -1] = 1.0
             continue
         X[i, hi] = 1.0
         X[i, ai] = -1.0
-        # last column: home-court bias
         X[i, -1] = 1.0
 
     return X
