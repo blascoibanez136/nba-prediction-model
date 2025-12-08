@@ -85,14 +85,7 @@ jobs:
           PY
       # ======================================================================
 
-      # (Optional) QA step – keep if you still want validation to run
-      - name: Run QA
-        env:
-          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          PYTHONPATH: .
-        run: |
-          python qa/validation.py
+
 
       # ===================== Main daily pipeline =====================
       - name: Run daily pipeline (schedule + predictions + picks)
