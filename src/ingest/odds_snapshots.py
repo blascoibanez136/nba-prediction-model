@@ -1,188 +1,208 @@
 """
-Odds snapshot system for NBA Pro-Lite model.
+Odds snapshot and dispersion utilities for NBA Pro-Lite.
 
-This module:
-    • Pulls raw odds from The Odds API via get_nba_odds()
-    • Saves timestamped snapshots (open/mid/close)
-    • Loads latest snapshots
-    • Flattens nested bookmaker → market → outcome structures
-    • Computes dispersion + consensus lines
+- save_snapshot(kind): fetch current odds and write
+  <repo_root>/data/_snapshots/<kind>_<timestamp>.csv
+- load_latest_snapshot(kind): load the most recent snapshot of that kind.
+- flatten_spreads(df): turn nested bookmaker/market/outcome data into tidy rows.
+- compute_dispersion(df): compute consensus close + dispersion per game.
+- compute_movement(open_path, close_path): compute line movement between open and close.
 
-Snapshots are ALWAYS saved relative to the repository root:
-    <repo_root>/data/_snapshots/
-
-This avoids incorrect relative paths when running in Colab,
-GitHub Actions, Docker, or any external environment.
+If run as a script, this reads SNAPSHOT_KIND from the environment and saves a snapshot.
 """
 
 from __future__ import annotations
 
-import json
+import os
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Any
 
 import pandas as pd
 
 from src.ingest.odds_ingest import get_nba_odds  # type: ignore
 
-
-# -------------------------------------------------------------------
-# 🔥 PATCH: Determine repo root dynamically for consistent save paths
-# -------------------------------------------------------------------
-# This file lives at: <repo>/src/ingest/odds_snapshots.py
-# repo root = two directories above this file
+# Repository root (…/nba-prediction-model)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Final absolute snapshot location
+# Snapshot directory; alias SNAPSHOT_DIR for backward compatibility
 OUT_DIR = REPO_ROOT / "data" / "_snapshots"
+SNAPSHOT_DIR = OUT_DIR
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# -------------------------------------------------------------------
-# Snapshot creation
-# -------------------------------------------------------------------
 def save_snapshot(kind: str) -> Path:
-    """
-    Fetch current NBA odds and save a snapshot CSV under data/_snapshots.
-
-    `kind` is a label like "open", "mid", or "close".
-    """
-    # Ensure the snapshot directory exists
-    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-
+    """Fetch current odds and save a snapshot CSV under data/_snapshots."""
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    fn = SNAPSHOT_DIR / f"{kind}_{stamp}.csv"
+    fn = OUT_DIR / f"{kind}_{stamp}.csv"
 
     odds = get_nba_odds()
     df = pd.DataFrame(odds)
-
     df.to_csv(fn, index=False)
+
     print(f"✅ saved {len(df)} rows to {fn.relative_to(REPO_ROOT)}")
     return fn
 
 
-
-# -------------------------------------------------------------------
-# Load most recent snapshot
-# -------------------------------------------------------------------
 def load_latest_snapshot(kind: str) -> pd.DataFrame:
-    """
-    Load the newest snapshot for the given kind.
-
-    Parameters
-    ----------
-    kind : str
-        e.g., "open", "mid", "close"
-
-    Returns
-    -------
-    pd.DataFrame
-    """
+    """Load the newest snapshot for the given kind (open/mid/close)."""
     files = sorted(OUT_DIR.glob(f"{kind}_*.csv"))
     if not files:
         raise FileNotFoundError(f"No snapshots found for '{kind}'.")
     return pd.read_csv(files[-1])
 
 
-# -------------------------------------------------------------------
-# Flatten spreads + totals from nested JSON
-# -------------------------------------------------------------------
 def flatten_spreads(raw_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert nested bookmaker/market/outcome structures into rows like:
-
-    game_id | book | market | team | price | point
-
-    Returns
-    -------
-    pd.DataFrame
-    """
-    rows = []
+    """Flatten nested bookmaker/market/outcome structures into tidy rows."""
+    rows: list[dict[str, Any]] = []
 
     for _, row in raw_df.iterrows():
         game_id = row.get("id")
         home = row.get("home_team")
         away = row.get("away_team")
         start = row.get("commence_time")
-
-        bookmakers = row.get("bookmakers", [])
-        if not isinstance(bookmakers, list):
+        books = row.get("bookmakers", [])
+        if not isinstance(books, list):
             continue
 
-        for book in bookmakers:
+        for book in books:
             book_key = book.get("key")
             markets = book.get("markets", [])
 
             for m in markets:
-                market_key = m.get("key")  # spreads, totals, h2h
+                mkey = m.get("key")
                 outcomes = m.get("outcomes", [])
 
                 for o in outcomes:
-                    rows.append({
-                        "game_id": game_id,
-                        "home_team": home,
-                        "away_team": away,
-                        "commence_time": start,
-                        "book": book_key,
-                        "market": market_key,
-                        "team": o.get("name"),
-                        "price": o.get("price"),
-                        "point": o.get("point"),
-                    })
+                    rows.append(
+                        {
+                            "game_id": game_id,
+                            "home_team": home,
+                            "away_team": away,
+                            "commence_time": start,
+                            "book": book_key,
+                            "market": mkey,
+                            "team": o.get("name"),
+                            "price": o.get("price"),
+                            "point": o.get("point"),
+                        }
+                    )
 
     return pd.DataFrame(rows)
 
 
-# -------------------------------------------------------------------
-# Compute dispersion + consensus
-# -------------------------------------------------------------------
 def compute_dispersion(raw_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute:
-        • spread dispersion
-        • consensus close
-        • merge keys for joining into prediction DataFrames
+    Compute consensus close and book dispersion for spread markets.
 
-    Parameters
-    ----------
-    raw_df : pd.DataFrame
-        Output of load_latest_snapshot()
-
-    Returns
-    -------
-    pd.DataFrame
+    Returns columns:
+      merge_key, consensus_close, book_dispersion,
+      home_team, away_team, game_date
     """
     flat = flatten_spreads(raw_df)
-
-    # Filter to spread market only
     spreads = flat[flat["market"] == "spreads"].copy()
-    if spreads.empty:
-        return pd.DataFrame(columns=[
-            "merge_key", "consensus_close", "book_dispersion",
-            "home_team", "away_team", "game_date"
-        ])
 
-    # Pivot: each book → point value
+    if spreads.empty:
+        return pd.DataFrame(
+            columns=[
+                "merge_key",
+                "consensus_close",
+                "book_dispersion",
+                "home_team",
+                "away_team",
+                "game_date",
+            ]
+        )
+
     piv = spreads.pivot_table(
         index=["game_id", "home_team", "away_team", "commence_time"],
         columns="book",
         values="point",
-        aggfunc="mean"
+        aggfunc="mean",
     )
 
     piv["book_dispersion"] = piv.std(axis=1, skipna=True)
     piv["consensus_close"] = piv.mean(axis=1, skipna=True)
-
     piv = piv.reset_index()
 
-    # Merge key for predictions: HomeTeam@AwayTeam_YYYYMMDD
-    piv["game_date"] = piv["commence_time"].str[:10]
+    piv["game_date"] = piv["commence_time"].astype(str).str[:10]
     piv["merge_key"] = (
         piv["home_team"] + "@" + piv["away_team"] + "_" + piv["game_date"]
     )
 
-    return piv[[
-        "merge_key", "consensus_close", "book_dispersion",
-        "home_team", "away_team", "game_date"
-    ]]
+    return piv[
+        [
+            "merge_key",
+            "consensus_close",
+            "book_dispersion",
+            "home_team",
+            "away_team",
+            "game_date",
+        ]
+    ]
+
+
+def _consensus_spread(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute the average spread across books for each game."""
+    flat = flatten_spreads(raw_df)
+    spreads = flat[flat["market"] == "spreads"].copy()
+
+    if spreads.empty:
+        return pd.DataFrame(columns=["merge_key", "consensus_spread"])
+
+    piv = spreads.pivot_table(
+        index=["game_id", "home_team", "away_team", "commence_time"],
+        columns="book",
+        values="point",
+        aggfunc="mean",
+    )
+
+    piv["consensus_spread"] = piv.mean(axis=1, skipna=True)
+    piv = piv.reset_index()
+
+    piv["game_date"] = piv["commence_time"].astype(str).str[:10]
+    piv["merge_key"] = (
+        piv["home_team"] + "@" + piv["away_team"] + "_" + piv["game_date"]
+    )
+
+    return piv[["merge_key", "consensus_spread"]]
+
+
+def compute_movement(open_path: str | Path, close_path: str | Path) -> pd.DataFrame:
+    """
+    Compute line movement (close – open consensus) for each game.
+
+    Returns:
+      merge_key, open_consensus, close_consensus, line_move
+    """
+    open_raw = pd.read_csv(open_path)
+    close_raw = pd.read_csv(close_path)
+
+    open_cons = _consensus_spread(open_raw).rename(
+        columns={"consensus_spread": "open_consensus"}
+    )
+    close_cons = _consensus_spread(close_raw).rename(
+        columns={"consensus_spread": "close_consensus"}
+    )
+
+    df = open_cons.merge(close_cons, on="merge_key", how="inner")
+    df["line_move"] = df["close_consensus"] - df["open_consensus"]
+
+    return df[["merge_key", "open_consensus", "close_consensus", "line_move"]]
+
+
+if __name__ == "__main__":
+    # Simple CLI for GitHub Actions:
+    #   SNAPSHOT_KIND=open|mid|close
+    kind = os.getenv("SNAPSHOT_KIND")
+    if kind:
+        try:
+            save_snapshot(kind)
+        except Exception as e:
+            print(f"[odds_snapshots] Failed to save snapshot for kind '{kind}': {e}")
+    else:
+        print(
+            "[odds_snapshots] No SNAPSHOT_KIND provided. "
+            "Set SNAPSHOT_KIND to 'open', 'mid' or 'close' to save a snapshot."
+        )
