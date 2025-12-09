@@ -22,9 +22,14 @@ Public API (backwards compatible):
 - If `odds` is provided and has merge_key, it will be LEFT-JOINed into preds.
 - If `odds` is None, we just use preds as-is (model-only ensemble).
 
-This version includes an improved spread -> win probability mapping using
-a calibrated lookup table + interpolation, which is more realistic for NBA
-favorites/underdogs than a single logistic slope.
+This version includes:
+- A calibrated spread -> win probability mapping using a lookup table.
+- Auto-calibrated movement sensitivity:
+    * Ignores tiny moves (neutral zone).
+    * Scales with move size.
+    * Scales with book dispersion (low dispersion = stronger effect).
+    * Correctly treats negative line_move (more negative spread) as
+      steam TOWARD the home team.
 """
 
 from __future__ import annotations
@@ -154,21 +159,60 @@ def _dispersion_to_weight(disp: Optional[float]) -> float:
     return max(lo, min(hi, w))
 
 
-def _movement_to_logit_shift(line_move: Optional[float], coeff: float = 0.10) -> float:
+def _movement_to_logit_shift(
+    line_move: Optional[float],
+    dispersion: Optional[float],
+    base_coeff: float = 0.12,
+    neutral_zone: float = 0.5,
+    max_points: float = 3.0,
+) -> float:
     """
-    Convert line movement into a small logit shift.
+    Auto-calibrated movement sensitivity.
 
-    A movement of 1 point in the spread is meaningful but not massive.
-    We use a small coefficient so that e.g. 1 point of steam nudges
-    probability by a few percentage points.
+    Inputs:
+      - line_move: close_consensus - open_consensus (home spread)
+          * Negative: spread became MORE NEGATIVE (steam TOWARD home favorite)
+          * Positive: spread became LESS NEGATIVE / MORE POSITIVE (steam AWAY from home)
+      - dispersion: book spread dispersion (lower = more trust)
 
-    Positive line_move means the consensus spread moved TOWARD the home team
-    (spread became more negative or less positive for home), so we increase
-    home win probability; negative line_move does the opposite.
+    Behavior:
+      - Ignore tiny moves |line_move| <= neutral_zone.
+      - Scale effect by |line_move| up to max_points.
+      - Scale effect stronger when dispersion is low, weaker when high.
+      - Negative line_move (steam toward home) => positive shift in home logit.
     """
     if line_move is None or pd.isna(line_move):
         return 0.0
-    return float(line_move) * coeff
+
+    try:
+        move = float(line_move)
+    except Exception:
+        return 0.0
+
+    # Neutral zone: ignore noise-level moves
+    if abs(move) <= neutral_zone:
+        return 0.0
+
+    # Magnitude factor: 0 to 1 based on |move| capped at max_points
+    mag = min(abs(move), max_points) / max_points
+
+    # Dispersion factor: when books agree (disp~0), factor ~1.0
+    # When books disagree heavily (disp>=3), factor ~0.3 (weaker trust in move)
+    if dispersion is None or pd.isna(dispersion):
+        disp_factor = 0.5
+    else:
+        d = max(0.0, min(3.0, float(dispersion)))
+        disp_factor = 1.0 - 0.7 * (d / 3.0)  # d=0 -> 1.0, d=3 -> 0.3
+
+    # Base logit shift magnitude
+    base_shift = base_coeff * mag * disp_factor
+
+    # Direction:
+    # - Negative line_move: spread became more negative (home stronger) -> increase home prob
+    # - Positive line_move: spread became less negative/more positive (home weaker) -> decrease home prob
+    direction = -1.0 if move > 0 else 1.0
+
+    return direction * base_shift
 
 
 # -------------------------------------------------------------------------
@@ -242,8 +286,8 @@ def _apply_market_ensemble_core(df: pd.DataFrame) -> pd.DataFrame:
         logit_model = _logit(float(p_model))
         logit_market = _logit(float(p_market))
 
-        # Movement-based logit adjustment (steam)
-        logit_shift = _movement_to_logit_shift(line_move)
+        # Movement-based logit adjustment (steam), auto-calibrated
+        logit_shift = _movement_to_logit_shift(line_move, dispersion)
 
         # Blend in logit space, then apply movement shift
         logit_blend = _blend(logit_model, logit_market, w_market) + logit_shift
