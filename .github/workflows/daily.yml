@@ -9,6 +9,14 @@ jobs:
   run-nba-pipeline:
     runs-on: ubuntu-latest
 
+    env:
+      # Leave RUN_DATE empty to use today's date. Set to YYYY-MM-DD to backfill.
+      RUN_DATE: ""
+      # Edge-picker thresholds (tune as desired)
+      EDGE_THRESHOLD: "1.5"
+      KELLY_THRESHOLD: "0.01"
+      BOOK_WHITELIST: "draftkings,fanduel"
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -16,42 +24,43 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests pyyaml scikit-learn lightgbm
+          pip install pandas numpy joblib requests pyyaml scikit-learn lightgbm
 
       - name: Ensure runtime folders
         run: |
           mkdir -p data/_snapshots
           mkdir -p outputs
 
-      # ===================== Odds snapshots + dispersion =====================
+      # ===================== Odds snapshots =====================
       - name: Save OPEN odds snapshot
         env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           PYTHONPATH: .
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           SNAPSHOT_KIND: open
         run: |
           python src/ingest/odds_snapshots.py
 
       - name: Save MID odds snapshot
         env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           PYTHONPATH: .
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           SNAPSHOT_KIND: mid
         run: |
           python src/ingest/odds_snapshots.py
 
       - name: Save CLOSE odds snapshot
         env:
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           PYTHONPATH: .
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           SNAPSHOT_KIND: close
         run: |
           python src/ingest/odds_snapshots.py
+      # ==========================================================
 
       - name: Build odds movement & dispersion
         env:
@@ -59,6 +68,7 @@ jobs:
         run: |
           python - << 'PY'
           import os, glob
+          import pandas as pd
           from src.ingest.odds_snapshots import compute_movement, compute_dispersion
 
           snap_dir = "data/_snapshots"
@@ -67,47 +77,44 @@ jobs:
           snaps = sorted(glob.glob(os.path.join(snap_dir, "*.csv")))
           latest_open = None
           latest_close = None
+
           for p in snaps:
-              base = os.path.basename(p)
-              if base.startswith("open_"):
-                  latest_open = p
-              elif base.startswith("close_"):
-                  latest_close = p
+            base = os.path.basename(p)
+            if base.startswith("open_"):
+              latest_open = p
+            elif base.startswith("close_"):
+              latest_close = p
 
           if latest_open and latest_close:
-              movement = compute_movement(latest_open, latest_close)
-              movement.to_csv("outputs/odds_movement_latest.csv", index=False)
-              dispersion = compute_dispersion(latest_close)
-              dispersion.to_csv("outputs/odds_dispersion_latest.csv", index=False)
-              print("wrote odds_movement_latest.csv and odds_dispersion_latest.csv")
+            movement = compute_movement(latest_open, latest_close)
+            movement.to_csv("outputs/odds_movement_latest.csv", index=False)
+
+            close_df = pd.read_csv(latest_close)
+            disp = compute_dispersion(close_df)
+            disp.to_csv("outputs/odds_dispersion_latest.csv", index=False)
+
+            print("wrote odds_movement_latest.csv and odds_dispersion_latest.csv")
           else:
-              print("No open/close pair found; skipping odds feature build.")
+            print("No open/close pair found; skipping odds feature build.")
           PY
-      # ======================================================================
 
-
-
-      # ===================== Main daily pipeline =====================
       - name: Run daily pipeline (schedule + predictions + picks)
         env:
           PYTHONPATH: .
           BALLDONTLIE_API_KEY: ${{ secrets.BALLDONTLIE_API_KEY }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          # Leave RUN_DATE empty to use today's date; or set to "YYYY-MM-DD" manually if needed
-          RUN_DATE: ""
-          # Pick sheet filters (optional; adjust as you like)
-          EDGE_THRESHOLD: "1.5"          # only edges >= 1.5 pts (abs)
-          KELLY_THRESHOLD: "0.01"        # only Kelly >= 1% of bankroll
-          BOOK_WHITELIST: "draftkings,fanduel"
+          RUN_DATE: ${{ env.RUN_DATE }}
+          EDGE_THRESHOLD: ${{ env.EDGE_THRESHOLD }}
+          KELLY_THRESHOLD: ${{ env.KELLY_THRESHOLD }}
+          BOOK_WHITELIST: ${{ env.BOOK_WHITELIST }}
         run: |
           python run_daily.py
-      # ===============================================================
 
-      # (Optional) Calibration – currently a stub, but harmless to keep
       - name: Evaluate + Calibrate
         env:
           PYTHONPATH: .
-          RUN_DATE: ${{ env.RUN_DATE || '' }}
+          RUN_DATE: ${{ env.RUN_DATE }}
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
         run: |
           python src/eval/calibration.py
 
@@ -119,5 +126,5 @@ jobs:
             outputs/
             run_summary.md
             calibration_report.html
-            outputs/picks_*.csv
             picks_report.html
+            outputs/picks_*.csv
