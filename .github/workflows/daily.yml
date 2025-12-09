@@ -124,6 +124,7 @@ jobs:
           name: nba-run
           path: |
             outputs/
+            data/_snapshots/
             run_summary.md
             calibration_report.html
             picks_report.html
