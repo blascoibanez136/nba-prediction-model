@@ -8,7 +8,10 @@ Odds snapshot and dispersion utilities for NBA Pro-Lite.
 - compute_dispersion(df): compute consensus close + dispersion per game.
 - compute_movement(open_path, close_path): compute line movement between open and close.
 
-If run as a script, this reads SNAPSHOT_KIND from the environment and saves a snapshot.
+IMPORTANT:
+- merge_key is standardized to match the prediction pipeline:
+    "<home_team_lower>__<away_team_lower>__<YYYY-MM-DD>"
+  so we can join odds features onto predictions cleanly.
 """
 
 from __future__ import annotations
@@ -33,6 +36,61 @@ SNAPSHOT_DIR = OUT_DIR
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_team_name(name: Any) -> str:
+    """
+    Normalize team names so they match prediction merge_key format.
+
+    Assumes the prediction side uses:
+        "<home_team_lower>__<away_team_lower>__<YYYY-MM-DD>"
+    e.g. "orlando magic__miami heat__2025-12-09"
+    """
+    if not isinstance(name, str):
+        return ""
+    return name.strip().lower()
+
+
+def _parse_bookmakers_field(val: Any) -> list[dict[str, Any]]:
+    """
+    Convert the CSV 'bookmakers' field back into a Python list of dicts.
+
+    - If it's already a list, return it.
+    - If it's a JSON string or repr of a list/dict, parse it.
+    - Otherwise return an empty list.
+    """
+    if isinstance(val, list):
+        return val
+
+    if isinstance(val, str) and val.strip():
+        s = val.strip()
+        # Try JSON first
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict):
+                return [parsed]
+        except Exception:
+            # Fall back to Python literal eval (what pandas may use)
+            try:
+                parsed = ast.literal_eval(s)
+                if isinstance(parsed, list):
+                    return parsed
+                if isinstance(parsed, dict):
+                    return [parsed]
+            except Exception:
+                return []
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Snapshot I/O
+# ---------------------------------------------------------------------------
+
 def save_snapshot(kind: str) -> Path:
     """Fetch current odds and save a snapshot CSV under data/_snapshots."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -55,39 +113,9 @@ def load_latest_snapshot(kind: str) -> pd.DataFrame:
     return pd.read_csv(files[-1])
 
 
-def _parse_bookmakers_field(val: Any) -> list[dict[str, Any]]:
-    """
-    Convert the CSV 'bookmakers' field back into a Python list of dicts.
-
-    - If it's already a list, return it.
-    - If it's a JSON string or repr of a list/dict, parse it.
-    - Otherwise return an empty list.
-    """
-    if isinstance(val, list):
-        return val
-
-    if isinstance(val, str) and val.strip():
-        s = val.strip()
-        try:
-            # Try JSON first
-            parsed = json.loads(s)
-            if isinstance(parsed, list):
-                return parsed
-            if isinstance(parsed, dict):
-                return [parsed]
-        except Exception:
-            # Try Python literal (what pandas may use when serializing lists)
-            try:
-                parsed = ast.literal_eval(s)
-                if isinstance(parsed, list):
-                    return parsed
-                if isinstance(parsed, dict):
-                    return [parsed]
-            except Exception:
-                return []
-
-    return []
-
+# ---------------------------------------------------------------------------
+# Odds flattening + feature builders
+# ---------------------------------------------------------------------------
 
 def flatten_spreads(raw_df: pd.DataFrame) -> pd.DataFrame:
     """Flatten nested bookmaker/market/outcome structures into tidy rows."""
@@ -130,6 +158,31 @@ def flatten_spreads(raw_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _add_merge_key_from_flat(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add the standardized merge_key to a flattened odds dataframe.
+
+    Uses normalized team names (lowercase, stripped) and YYYY-MM-DD date.
+    """
+    if df.empty:
+        df["merge_key"] = []
+        return df
+
+    df = df.copy()
+    df["home_team_norm"] = df["home_team"].apply(_normalize_team_name)
+    df["away_team_norm"] = df["away_team"].apply(_normalize_team_name)
+    df["game_date"] = df["commence_time"].astype(str).str[:10]
+
+    df["merge_key"] = (
+        df["home_team_norm"]
+        + "__"
+        + df["away_team_norm"]
+        + "__"
+        + df["game_date"]
+    )
+    return df
+
+
 def compute_dispersion(raw_df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute consensus close and book dispersion for spread markets.
@@ -139,6 +192,7 @@ def compute_dispersion(raw_df: pd.DataFrame) -> pd.DataFrame:
       home_team, away_team, game_date
     """
     flat = flatten_spreads(raw_df)
+    flat = _add_merge_key_from_flat(flat)
 
     # If we couldn't recover markets, bail out gracefully
     if flat.empty or "market" not in flat.columns:
@@ -154,7 +208,6 @@ def compute_dispersion(raw_df: pd.DataFrame) -> pd.DataFrame:
         )
 
     spreads = flat[flat["market"] == "spreads"].copy()
-
     if spreads.empty:
         return pd.DataFrame(
             columns=[
@@ -168,7 +221,7 @@ def compute_dispersion(raw_df: pd.DataFrame) -> pd.DataFrame:
         )
 
     piv = spreads.pivot_table(
-        index=["game_id", "home_team", "away_team", "commence_time"],
+        index=["merge_key", "home_team", "away_team", "game_date"],
         columns="book",
         values="point",
         aggfunc="mean",
@@ -177,11 +230,6 @@ def compute_dispersion(raw_df: pd.DataFrame) -> pd.DataFrame:
     piv["book_dispersion"] = piv.std(axis=1, skipna=True)
     piv["consensus_close"] = piv.mean(axis=1, skipna=True)
     piv = piv.reset_index()
-
-    piv["game_date"] = piv["commence_time"].astype(str).str[:10]
-    piv["merge_key"] = (
-        piv["home_team"] + "@" + piv["away_team"] + "_" + piv["game_date"]
-    )
 
     return piv[
         [
@@ -198,6 +246,7 @@ def compute_dispersion(raw_df: pd.DataFrame) -> pd.DataFrame:
 def _consensus_spread(raw_df: pd.DataFrame) -> pd.DataFrame:
     """Compute the average spread across books for each game."""
     flat = flatten_spreads(raw_df)
+    flat = _add_merge_key_from_flat(flat)
 
     # If 'market' column never materializes, just return empty
     if flat.empty or "market" not in flat.columns:
@@ -207,8 +256,11 @@ def _consensus_spread(raw_df: pd.DataFrame) -> pd.DataFrame:
     if spreads.empty:
         return pd.DataFrame(columns=["merge_key", "consensus_spread"])
 
+    # Optional: filter obviously bogus points once you've inspected raw data.
+    # spreads = spreads[spreads["point"].notna()]
+
     piv = spreads.pivot_table(
-        index=["game_id", "home_team", "away_team", "commence_time"],
+        index=["merge_key"],
         columns="book",
         values="point",
         aggfunc="mean",
@@ -216,11 +268,6 @@ def _consensus_spread(raw_df: pd.DataFrame) -> pd.DataFrame:
 
     piv["consensus_spread"] = piv.mean(axis=1, skipna=True)
     piv = piv.reset_index()
-
-    piv["game_date"] = piv["commence_time"].astype(str).str[:10]
-    piv["merge_key"] = (
-        piv["home_team"] + "@" + piv["away_team"] + "_" + piv["game_date"]
-    )
 
     return piv[["merge_key", "consensus_spread"]]
 
@@ -254,6 +301,10 @@ def compute_movement(open_path: str | Path, close_path: str | Path) -> pd.DataFr
     return df[["merge_key", "open_consensus", "close_consensus", "line_move"]]
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     # Simple CLI for GitHub Actions:
     #   SNAPSHOT_KIND=open|mid|close
@@ -268,4 +319,3 @@ if __name__ == "__main__":
             "[odds_snapshots] No SNAPSHOT_KIND provided. "
             "Set SNAPSHOT_KIND to 'open', 'mid' or 'close' to save a snapshot."
         )
-
