@@ -42,30 +42,25 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # -------------------------------------------------------------------
 # Snapshot creation
 # -------------------------------------------------------------------
-def save_snapshot(kind: str = "open") -> Path:
+def save_snapshot(kind: str) -> Path:
     """
-    Save a raw odds snapshot to disk.
+    Fetch current NBA odds and save a snapshot CSV under data/_snapshots.
 
-    Parameters
-    ----------
-    kind : str
-        Label for the snapshot (e.g., "open", "mid", "close").
-
-    Returns
-    -------
-    Path
-        Full path to the saved CSV file.
+    `kind` is a label like "open", "mid", or "close".
     """
-    dt = datetime.now().strftime("%Y%m%d_%H%M")
-    fn = OUT_DIR / f"{kind}_{dt}.csv"
+    # Ensure the snapshot directory exists
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Fetch data from The Odds API
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    fn = SNAPSHOT_DIR / f"{kind}_{stamp}.csv"
+
     odds = get_nba_odds()
     df = pd.DataFrame(odds)
 
     df.to_csv(fn, index=False)
     print(f"✅ saved {len(df)} rows to {fn.relative_to(REPO_ROOT)}")
     return fn
+
 
 
 # -------------------------------------------------------------------
