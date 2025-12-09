@@ -13,16 +13,14 @@ Takes:
     - close_consensus    (optional, used for movement)
     - line_move          (optional, close_consensus - open_consensus)
 
-Returns:
-- fair_spread_market
-- home_win_prob_market
-- fair_total_market
+Core function:
+    _apply_market_ensemble_core(df)
 
-Design notes:
-- We blend in logit space: logit(p) = ln(p / (1 - p)).
-- Market-implied win prob is derived from the consensus spread with a logistic map.
-- Dispersion controls how much weight we put on the market vs the model.
-- Line movement acts as a small logit shift in the direction of steam.
+Public API (backwards compatible):
+    apply_market_ensemble(preds, odds=None)
+
+- If `odds` is provided and has merge_key, it will be LEFT-JOINed into preds.
+- If `odds` is None, we just use preds as-is (model-only ensemble).
 """
 
 from __future__ import annotations
@@ -53,7 +51,7 @@ def _blend(a: float, b: float, w: float) -> float:
 
 
 # -------------------------------------------------------------------------
-# Core logic
+# Core market logic
 # -------------------------------------------------------------------------
 
 def _market_spread_to_prob(spread: float, scale: float = 0.12) -> float:
@@ -65,7 +63,6 @@ def _market_spread_to_prob(spread: float, scale: float = 0.12) -> float:
       - -3.5 favorite ~ 60–65%
       - -7.0 favorite ~ 70–75%
     """
-    # If spread is NaN or None, caller should handle upstream.
     return _sigmoid(-spread * scale)
 
 
@@ -102,9 +99,10 @@ def _movement_to_logit_shift(line_move: Optional[float], coeff: float = 0.10) ->
     return float(line_move) * coeff
 
 
-def apply_market_ensemble(df: pd.DataFrame) -> pd.DataFrame:
+def _apply_market_ensemble_core(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Apply market-aware blending to a predictions dataframe.
+    Core implementation working on a single dataframe that already includes
+    both model and market columns.
 
     Expected input columns (as available):
       - home_win_prob        [REQUIRED]
@@ -123,13 +121,11 @@ def apply_market_ensemble(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
 
-    # Ensure required model columns exist
     if "home_win_prob" not in df.columns:
-        raise ValueError("apply_market_ensemble: 'home_win_prob' column is required.")
+        raise ValueError("_apply_market_ensemble_core: 'home_win_prob' is required.")
     if "fair_spread" not in df.columns:
-        raise ValueError("apply_market_ensemble: 'fair_spread' column is required.")
+        raise ValueError("_apply_market_ensemble_core: 'fair_spread' is required.")
 
-    # Prepare placeholders
     fair_spread_mkt = []
     home_prob_mkt = []
     fair_total_mkt = []
@@ -143,60 +139,47 @@ def apply_market_ensemble(df: pd.DataFrame) -> pd.DataFrame:
         dispersion = row.get("book_dispersion", None)
         line_move = row.get("line_move", None)
 
-        # Fallbacks if model prob is missing or invalid
+        # If model prob is missing, fall back to market or 0.5
         if pd.isna(p_model):
-            # If model is missing, fall back purely to market if available.
             if consensus is None or pd.isna(consensus):
-                # Last resort: 50/50
                 p_model = 0.5
             else:
                 p_model = _market_spread_to_prob(float(consensus))
 
         # If no market info at all, just copy model values through.
         if consensus is None or pd.isna(consensus):
-            # Straight pass-through
             fair_spread_mkt.append(fair_spread)
             home_prob_mkt.append(p_model)
             fair_total_mkt.append(fair_total if fair_total is not None else None)
             continue
 
-        # ------------------------------------------------------------------
-        # Compute market-implied win prob from spread
-        # ------------------------------------------------------------------
+        # Market-implied win probability
         try:
             p_market = _market_spread_to_prob(float(consensus))
         except Exception:
-            # If something goes wrong, fallback to model only
             fair_spread_mkt.append(fair_spread)
             home_prob_mkt.append(p_model)
             fair_total_mkt.append(fair_total if fair_total is not None else None)
             continue
 
-        # ------------------------------------------------------------------
-        # Compute weights and movement adjustments
-        # ------------------------------------------------------------------
         w_market = _dispersion_to_weight(dispersion)
         logit_model = _logit(float(p_model))
         logit_market = _logit(float(p_market))
 
         # Movement-based logit adjustment (steam)
-        # If the line has moved toward the home team (more negative consensus),
-        # we push the blended logit slightly in that direction.
         logit_shift = _movement_to_logit_shift(line_move)
 
-        # Blend logit space
+        # Blend in logit space, then apply movement shift
         logit_blend = _blend(logit_model, logit_market, w_market) + logit_shift
         p_final = _sigmoid(logit_blend)
 
-        # ------------------------------------------------------------------
         # Blend spreads as well
-        # ------------------------------------------------------------------
         try:
             fair_spread_blend = _blend(float(fair_spread), float(consensus), w_market)
         except Exception:
             fair_spread_blend = fair_spread
 
-        # Totals: until we add market totals, just pass through model fair_total
+        # Totals: pass through model fair_total for now
         fair_total_blend = fair_total if fair_total is not None else None
 
         fair_spread_mkt.append(fair_spread_blend)
@@ -208,3 +191,34 @@ def apply_market_ensemble(df: pd.DataFrame) -> pd.DataFrame:
     df["fair_total_market"] = fair_total_mkt
 
     return df
+
+
+# -------------------------------------------------------------------------
+# Public API (backwards compatible)
+# -------------------------------------------------------------------------
+
+def apply_market_ensemble(preds: pd.DataFrame,
+                          odds: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """
+    Backwards-compatible wrapper.
+
+    Old signature (still supported):
+        apply_market_ensemble(preds, odds)
+
+    New recommended usage:
+        merged = preds.merge(odds_features, on="merge_key", how="left")
+        out = apply_market_ensemble(merged)
+
+    Behavior:
+      - If `odds` is provided and non-empty, and both dataframes
+        have a 'merge_key' column, we LEFT-JOIN odds into preds.
+      - If `odds` is None or empty, we use preds as-is and the core
+        ensemble will effectively be model-only when market columns
+        are missing.
+    """
+    if odds is not None and not odds.empty and "merge_key" in preds.columns and "merge_key" in odds.columns:
+        merged = preds.merge(odds, on="merge_key", how="left")
+    else:
+        merged = preds
+
+    return _apply_market_ensemble_core(merged)
