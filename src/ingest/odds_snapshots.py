@@ -14,6 +14,8 @@ If run as a script, this reads SNAPSHOT_KIND from the environment and saves a sn
 from __future__ import annotations
 
 import os
+import json
+import ast
 from pathlib import Path
 from datetime import datetime
 from typing import Any
@@ -53,6 +55,40 @@ def load_latest_snapshot(kind: str) -> pd.DataFrame:
     return pd.read_csv(files[-1])
 
 
+def _parse_bookmakers_field(val: Any) -> list[dict[str, Any]]:
+    """
+    Convert the CSV 'bookmakers' field back into a Python list of dicts.
+
+    - If it's already a list, return it.
+    - If it's a JSON string or repr of a list/dict, parse it.
+    - Otherwise return an empty list.
+    """
+    if isinstance(val, list):
+        return val
+
+    if isinstance(val, str) and val.strip():
+        s = val.strip()
+        try:
+            # Try JSON first
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict):
+                return [parsed]
+        except Exception:
+            # Try Python literal (what pandas may use when serializing lists)
+            try:
+                parsed = ast.literal_eval(s)
+                if isinstance(parsed, list):
+                    return parsed
+                if isinstance(parsed, dict):
+                    return [parsed]
+            except Exception:
+                return []
+
+    return []
+
+
 def flatten_spreads(raw_df: pd.DataFrame) -> pd.DataFrame:
     """Flatten nested bookmaker/market/outcome structures into tidy rows."""
     rows: list[dict[str, Any]] = []
@@ -62,17 +98,19 @@ def flatten_spreads(raw_df: pd.DataFrame) -> pd.DataFrame:
         home = row.get("home_team")
         away = row.get("away_team")
         start = row.get("commence_time")
-        books = row.get("bookmakers", [])
-        if not isinstance(books, list):
+
+        raw_books = row.get("bookmakers", [])
+        books = _parse_bookmakers_field(raw_books)
+        if not books:
             continue
 
         for book in books:
             book_key = book.get("key")
-            markets = book.get("markets", [])
+            markets = book.get("markets", []) or []
 
             for m in markets:
                 mkey = m.get("key")
-                outcomes = m.get("outcomes", [])
+                outcomes = m.get("outcomes", []) or []
 
                 for o in outcomes:
                     rows.append(
@@ -101,6 +139,20 @@ def compute_dispersion(raw_df: pd.DataFrame) -> pd.DataFrame:
       home_team, away_team, game_date
     """
     flat = flatten_spreads(raw_df)
+
+    # If we couldn't recover markets, bail out gracefully
+    if flat.empty or "market" not in flat.columns:
+        return pd.DataFrame(
+            columns=[
+                "merge_key",
+                "consensus_close",
+                "book_dispersion",
+                "home_team",
+                "away_team",
+                "game_date",
+            ]
+        )
+
     spreads = flat[flat["market"] == "spreads"].copy()
 
     if spreads.empty:
@@ -146,8 +198,12 @@ def compute_dispersion(raw_df: pd.DataFrame) -> pd.DataFrame:
 def _consensus_spread(raw_df: pd.DataFrame) -> pd.DataFrame:
     """Compute the average spread across books for each game."""
     flat = flatten_spreads(raw_df)
-    spreads = flat[flat["market"] == "spreads"].copy()
 
+    # If 'market' column never materializes, just return empty
+    if flat.empty or "market" not in flat.columns:
+        return pd.DataFrame(columns=["merge_key", "consensus_spread"])
+
+    spreads = flat[flat["market"] == "spreads"].copy()
     if spreads.empty:
         return pd.DataFrame(columns=["merge_key", "consensus_spread"])
 
@@ -186,6 +242,12 @@ def compute_movement(open_path: str | Path, close_path: str | Path) -> pd.DataFr
         columns={"consensus_spread": "close_consensus"}
     )
 
+    if open_cons.empty or close_cons.empty:
+        # Nothing to merge; return empty movement frame
+        return pd.DataFrame(
+            columns=["merge_key", "open_consensus", "close_consensus", "line_move"]
+        )
+
     df = open_cons.merge(close_cons, on="merge_key", how="inner")
     df["line_move"] = df["close_consensus"] - df["open_consensus"]
 
@@ -206,3 +268,4 @@ if __name__ == "__main__":
             "[odds_snapshots] No SNAPSHOT_KIND provided. "
             "Set SNAPSHOT_KIND to 'open', 'mid' or 'close' to save a snapshot."
         )
+
