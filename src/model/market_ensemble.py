@@ -21,6 +21,10 @@ Public API (backwards compatible):
 
 - If `odds` is provided and has merge_key, it will be LEFT-JOINed into preds.
 - If `odds` is None, we just use preds as-is (model-only ensemble).
+
+This version includes an improved spread -> win probability mapping using
+a calibrated lookup table + interpolation, which is more realistic for NBA
+favorites/underdogs than a single logistic slope.
 """
 
 from __future__ import annotations
@@ -51,20 +55,84 @@ def _blend(a: float, b: float, w: float) -> float:
 
 
 # -------------------------------------------------------------------------
-# Core market logic
+# Spread -> win probability mapping
 # -------------------------------------------------------------------------
 
-def _market_spread_to_prob(spread: float, scale: float = 0.12) -> float:
-    """
-    Rough mapping from spread (home side) to home win probability.
+# Approximate historical NBA mapping for favorite spread (absolute value):
+#   spread:  0    1    2    3    4    5    6    7    8    9    10   11   12
+#   prob:  0.50 0.54 0.58 0.61 0.64 0.67 0.70 0.73 0.75 0.77 0.79 0.81 0.83
+# Home favorite with spread -s uses these probs; home dog with +s uses 1 - prob.
+_FAVORITE_SPREAD_PROB_TABLE = [
+    (0.0, 0.50),
+    (1.0, 0.54),
+    (2.0, 0.58),
+    (3.0, 0.61),
+    (4.0, 0.64),
+    (5.0, 0.67),
+    (6.0, 0.70),
+    (7.0, 0.73),
+    (8.0, 0.75),
+    (9.0, 0.77),
+    (10.0, 0.79),
+    (11.0, 0.81),
+    (12.0, 0.83),
+]
 
-    We don't need perfection here; just a reasonable monotonic relationship:
-      - 0 spread ~ 50%
-      - -3.5 favorite ~ 60–65%
-      - -7.0 favorite ~ 70–75%
-    """
-    return _sigmoid(-spread * scale)
 
+def _favorite_win_prob_from_spread(abs_spread: float) -> float:
+    """
+    Given the absolute spread for the favorite (>=0), return the favorite's
+    win probability using a piecewise linear interpolation over the table.
+    """
+    s = float(abs_spread)
+    if s <= _FAVORITE_SPREAD_PROB_TABLE[0][0]:
+        return _FAVORITE_SPREAD_PROB_TABLE[0][1]
+
+    for i in range(1, len(_FAVORITE_SPREAD_PROB_TABLE)):
+        s1, p1 = _FAVORITE_SPREAD_PROB_TABLE[i]
+        s0, p0 = _FAVORITE_SPREAD_PROB_TABLE[i - 1]
+        if s <= s1:
+            # Linear interpolation between (s0, p0) and (s1, p1)
+            t = (s - s0) / (s1 - s0)
+            return p0 + t * (p1 - p0)
+
+    # Beyond the largest table entry, just clamp to the last prob.
+    return _FAVORITE_SPREAD_PROB_TABLE[-1][1]
+
+
+def _market_spread_to_prob(spread: float) -> float:
+    """
+    Map home spread to home win probability.
+
+    - spread < 0: home is the favorite by |spread| points
+    - spread > 0: home is the underdog by spread points
+    - spread ~= 0: 50/50
+
+    We use a calibrated favorite table and symmetry:
+      P(home | spread>0) = 1 - P(favorite | abs(spread))
+    """
+    try:
+        s = float(spread)
+    except Exception:
+        return 0.5
+
+    if abs(s) < 1e-6:
+        return 0.5
+
+    abs_s = abs(s)
+    fav_prob = _favorite_win_prob_from_spread(abs_s)
+
+    if s < 0:
+        # Home favorite
+        return fav_prob
+    else:
+        # Home underdog: home win prob is 1 - favorite win prob
+        return 1.0 - fav_prob
+
+
+# -------------------------------------------------------------------------
+# Market weighting + movement
+# -------------------------------------------------------------------------
 
 def _dispersion_to_weight(disp: Optional[float]) -> float:
     """
@@ -93,11 +161,19 @@ def _movement_to_logit_shift(line_move: Optional[float], coeff: float = 0.10) ->
     A movement of 1 point in the spread is meaningful but not massive.
     We use a small coefficient so that e.g. 1 point of steam nudges
     probability by a few percentage points.
+
+    Positive line_move means the consensus spread moved TOWARD the home team
+    (spread became more negative or less positive for home), so we increase
+    home win probability; negative line_move does the opposite.
     """
     if line_move is None or pd.isna(line_move):
         return 0.0
     return float(line_move) * coeff
 
+
+# -------------------------------------------------------------------------
+# Core ensemble implementation
+# -------------------------------------------------------------------------
 
 def _apply_market_ensemble_core(df: pd.DataFrame) -> pd.DataFrame:
     """
