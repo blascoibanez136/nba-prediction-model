@@ -15,44 +15,20 @@ Responsibilities
     * fair_total_market
     * home_win_prob_market
 
-Assumed inputs
---------------
-1) Model predictions CSV (from src/model/predict.py), with at least:
-    - game_id            (string or int; unique per game)
-    - home_team
-    - away_team
-    - game_date          (YYYY-MM-DD)
-    - fair_spread        (model-derived fair spread; negative = home favorite)
-    - fair_total         (model-derived fair total points)
-    - home_win_prob      (model-derived home win probability in [0, 1])
+Join key
+--------
+We join model predictions to market features using:
 
-2) Normalized odds CSV (CLOSE snapshot), with a *book-level* schema, e.g.:
-    - snapshot_type
-    - game_id
-    - game_date
-    - commence_time
-    - home_team
-    - away_team
-    - book
-    - book_title
-    - last_update
-    - ml_home, ml_away
-    - spread_home_point, spread_home_price
-    - spread_away_point, spread_away_price
-    - total_point, total_over_price, total_under_price
+    merge_key = "{home_team}__{away_team}__{game_date}"
 
-Usage (imported)
-----------------
-    from src.model.market_ensemble import apply_market_ensemble
+where:
+    - home_team / away_team are lowercased, stripped
+    - game_date is the NBA schedule date (matching America/New_York conversion
+      in odds_normalizer.py)
 
-    blended_df = apply_market_ensemble(preds_df, odds_close_df)
-
-Usage (CLI)
------------
-    python -m src.model.market_ensemble \
-        --predictions-csv outputs/predictions_2024-02-05.csv \
-        --odds-close-csv data/_snapshots/close_20240205_235500.csv \
-        --out-csv outputs/predictions_2024-02-05_market.csv
+This avoids the mismatch between:
+    - balldontlie numeric game_id
+    - The Odds API opaque hash game_id
 """
 
 from __future__ import annotations
@@ -74,6 +50,7 @@ import pandas as pd
 class PredictionsCols:
     game_id: str = "game_id"
     game_date: str = "game_date"
+    merge_key: str = "merge_key"
     fair_spread: str = "fair_spread"
     fair_total: str = "fair_total"
     home_win_prob: str = "home_win_prob"
@@ -82,6 +59,7 @@ class PredictionsCols:
 @dataclass
 class OddsCols:
     game_id: str = "game_id"
+    merge_key: str = "merge_key"
     book: str = "book"
     snapshot_type: str = "snapshot_type"
     game_date: str = "game_date"
@@ -100,6 +78,22 @@ class OddsCols:
 
 PRED_COLS = PredictionsCols()
 ODDS_COLS = OddsCols()
+
+
+def _norm_key(name: str) -> str:
+    return name.strip().lower() if isinstance(name, str) else ""
+
+
+def _make_merge_key(
+    df: pd.DataFrame,
+    home_col: str,
+    away_col: str,
+    date_col: str,
+    out_col: str = "merge_key",
+) -> pd.Series:
+    def mk(row):
+        return f"{_norm_key(row[home_col])}__{_norm_key(row[away_col])}__{row[date_col]}"
+    return df.apply(mk, axis=1)
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +144,7 @@ def compute_market_features(odds_df: pd.DataFrame) -> pd.DataFrame:
     -------
     market_features : pd.DataFrame
         Columns:
-            - game_id
+            - merge_key
             - consensus_close_spread_home
             - spread_dispersion
             - consensus_close_total
@@ -161,24 +155,21 @@ def compute_market_features(odds_df: pd.DataFrame) -> pd.DataFrame:
 
     df = odds_df.copy()
 
-    # Ensure required columns exist
-    required_cols = [
-        g.game_id,
-        g.book,
-        g.game_date,
-        g.home_team,
-        g.away_team,
-    ]
-    missing_req = [c for c in required_cols if c not in df.columns]
-    if missing_req:
-        raise ValueError(f"Odds DataFrame is missing required columns: {missing_req}")
+    # Ensure a merge_key exists on odds side
+    if g.merge_key not in df.columns:
+        if g.home_team not in df.columns or g.away_team not in df.columns or g.game_date not in df.columns:
+            raise ValueError(
+                "Odds DataFrame missing merge_key and "
+                "cannot recompute it (need home_team, away_team, game_date)."
+            )
+        df[g.merge_key] = _make_merge_key(df, g.home_team, g.away_team, g.game_date, g.merge_key)
 
     # --- Spreads (home perspective) ---
     if g.spread_home_point not in df.columns:
         df[g.spread_home_point] = np.nan
 
     spread_agg = (
-        df.groupby(g.game_id)[g.spread_home_point]
+        df.groupby(g.merge_key)[g.spread_home_point]
         .agg(["mean", "std"])
         .rename(
             columns={
@@ -193,7 +184,7 @@ def compute_market_features(odds_df: pd.DataFrame) -> pd.DataFrame:
         df[g.total_point] = np.nan
 
     total_agg = (
-        df.groupby(g.game_id)[g.total_point]
+        df.groupby(g.merge_key)[g.total_point]
         .agg(["mean", "std"])
         .rename(
             columns={
@@ -213,7 +204,7 @@ def compute_market_features(odds_df: pd.DataFrame) -> pd.DataFrame:
     df["home_ml_implied_prob"] = ml_probs
 
     ml_agg = (
-        df.groupby(g.game_id)["home_ml_implied_prob"]
+        df.groupby(g.merge_key)["home_ml_implied_prob"]
         .mean()
         .to_frame("market_implied_home_win_prob")
     )
@@ -224,7 +215,7 @@ def compute_market_features(odds_df: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
 
-    return market_features
+    return market_features  # has merge_key as a column
 
 
 # ---------------------------------------------------------------------------
@@ -244,11 +235,6 @@ def _compute_dispersion_weight(
     Intuition:
         - Low dispersion -> market in strong agreement -> trust market more
         - High dispersion -> market disagrees -> trust model more
-
-    Implementation:
-        - logistic on dispersion around `pivot`:
-            dispersion << pivot  -> weight ~ min_weight (market-heavy)
-            dispersion >> pivot  -> weight ~ max_weight (model-heavy)
     """
     if dispersion is None or np.isnan(dispersion):
         # If we don't have dispersion info, fallback to a neutral weight.
@@ -258,7 +244,8 @@ def _compute_dispersion_weight(
     base = _sigmoid(z)  # increases with dispersion
 
     # Map base in [0,1] -> [min_weight, max_weight]
-    return min_weight + base * (max_weight - min_weight)
+    return min_weight + base * (max_weight - max_weight * 0 + base * 0) - base * min_weight if False else \
+        min_weight + base * (max_weight - min_weight)
 
 
 def blend_lines(
@@ -331,55 +318,35 @@ def apply_market_ensemble(
         Model predictions with columns:
             - game_id
             - game_date
+            - merge_key
             - fair_spread
             - fair_total
             - home_win_prob
     odds_close_df : pd.DataFrame
         Normalized CLOSE odds snapshot, book-level.
-    spread_dispersion_pivot : float
-        Pivot for dispersion -> weight mapping for spreads.
-    total_dispersion_pivot : float
-        Same for totals.
-
-    Returns
-    -------
-    blended_df : pd.DataFrame
-        Original preds_df plus:
-            - consensus_close_spread_home
-            - spread_dispersion
-            - consensus_close_total
-            - total_dispersion
-            - market_implied_home_win_prob
-            - fair_spread_market
-            - fair_total_market
-            - home_win_prob_market
-            - consensus_close        (alias for spreads, for edge_picker)
-            - book_dispersion        (alias for spreads, for edge_picker)
     """
     p = PRED_COLS
     g = ODDS_COLS
 
-    for col in (p.game_id, p.fair_spread, p.fair_total, p.home_win_prob):
+    for col in (p.game_id, p.game_date, p.fair_spread, p.fair_total, p.home_win_prob):
         if col not in preds_df.columns:
             raise ValueError(f"Predictions DataFrame missing '{col}' column.")
 
     preds = preds_df.copy()
     odds = odds_close_df.copy()
 
-    # 🔑 IMPORTANT: ensure game_id types match (string on both sides)
-    if p.game_id in preds.columns:
-        preds[p.game_id] = preds[p.game_id].astype(str)
-    if g.game_id in odds.columns:
-        odds[g.game_id] = odds[g.game_id].astype(str)
+    # Ensure merge_key exists on preds side (it should already be there from feature_builder)
+    if p.merge_key not in preds.columns:
+        preds[p.merge_key] = _make_merge_key(preds, "home_team", "away_team", p.game_date, p.merge_key)
 
-    # Compute per-game market features from odds
+    # Compute per-game market features from odds (keyed by merge_key)
     market_features = compute_market_features(odds)
 
-    # Merge on game_id (now both string)
+    # Merge on merge_key (shared across model + odds)
     merged = preds.merge(
         market_features,
-        left_on=p.game_id,
-        right_on=g.game_id,
+        left_on=p.merge_key,
+        right_on=g.merge_key,
         how="left",
         validate="one_to_one",
     )
