@@ -42,7 +42,7 @@ def _ensure_games_list(obj: Union[str, Path, List[dict]]) -> List[dict]:
       - str / Path path      (JSON file path)
       - str JSON             (raw JSON string)
 
-    Return list[dict] or raise TypeError/ValueError.
+    Return list[dict] or [] if the file is not valid JSON.
     """
     # Already a list of dicts
     if isinstance(obj, list):
@@ -57,7 +57,17 @@ def _ensure_games_list(obj: Union[str, Path, List[dict]]) -> List[dict]:
         p = Path(obj)
         if p.exists():
             with p.open() as f:
-                data = json.load(f)
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError:
+                    # This happens if the path is actually a CSV or empty file.
+                    # Rather than crashing the whole workflow, treat it as
+                    # "no games" and let dispersion/movement return empty frames.
+                    print(
+                        f"[odds_snapshots] Warning: {p} is not valid JSON; "
+                        f"treating as empty odds payload for compute_*."
+                    )
+                    return []
         else:
             # Assume it's a raw JSON string
             data = json.loads(str(obj))
@@ -150,7 +160,6 @@ def flatten_spreads(data: List[dict]) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
 
     for g in data:
-        # g is a single game dict from Odds API
         home = g.get("home_team")
         away = g.get("away_team")
         commence = g.get("commence_time") or ""
@@ -304,3 +313,4 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     save_snapshot(kind)
+
