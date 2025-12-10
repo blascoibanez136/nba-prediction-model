@@ -41,8 +41,9 @@ def _ensure_games_list(obj: Union[str, Path, List[dict]]) -> List[dict]:
       - list[dict]           (already parsed Odds API payload)
       - str / Path path      (JSON file path)
       - str JSON             (raw JSON string)
+      - pandas.DataFrame     (treated as 'no games' for compute_*)
 
-    Return list[dict] or [] if the file is not valid JSON.
+    Return list[dict] or [] if we can't sensibly parse odds from the input.
     """
     # Already a list of dicts
     if isinstance(obj, list):
@@ -51,6 +52,16 @@ def _ensure_games_list(obj: Union[str, Path, List[dict]]) -> List[dict]:
                 f"_ensure_games_list expected list[dict], got list[{type(obj[0])}]"
             )
         return obj
+
+    # If someone passes a DataFrame (e.g. a CSV they've already read),
+    # we don't try to reverse-engineer it back into Odds API JSON.
+    # For dispersion/movement, it's safe to treat this as "no games".
+    if isinstance(obj, pd.DataFrame):
+        print(
+            "[odds_snapshots] Warning: _ensure_games_list received a DataFrame; "
+            "treating as empty odds payload for compute_*."
+        )
+        return []
 
     # Path-like or path string
     if isinstance(obj, (str, Path)):
@@ -313,4 +324,3 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     save_snapshot(kind)
-
