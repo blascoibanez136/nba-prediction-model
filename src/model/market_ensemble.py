@@ -45,10 +45,7 @@ Usage (imported)
 ----------------
     from src.model.market_ensemble import apply_market_ensemble
 
-    blended_df = apply_market_ensemble(
-        preds_df,
-        odds_close_df,
-    )
+    blended_df = apply_market_ensemble(preds_df, odds_close_df)
 
 Usage (CLI)
 -----------
@@ -360,20 +357,29 @@ def apply_market_ensemble(
             - book_dispersion        (alias for spreads, for edge_picker)
     """
     p = PRED_COLS
+    g = ODDS_COLS
 
     for col in (p.game_id, p.fair_spread, p.fair_total, p.home_win_prob):
         if col not in preds_df.columns:
             raise ValueError(f"Predictions DataFrame missing '{col}' column.")
 
     preds = preds_df.copy()
+    odds = odds_close_df.copy()
+
+    # 🔑 IMPORTANT: ensure game_id types match (string on both sides)
+    if p.game_id in preds.columns:
+        preds[p.game_id] = preds[p.game_id].astype(str)
+    if g.game_id in odds.columns:
+        odds[g.game_id] = odds[g.game_id].astype(str)
 
     # Compute per-game market features from odds
-    market_features = compute_market_features(odds_close_df)
+    market_features = compute_market_features(odds)
 
-    # Merge on game_id
+    # Merge on game_id (now both string)
     merged = preds.merge(
         market_features,
-        on=p.game_id,
+        left_on=p.game_id,
+        right_on=g.game_id,
         how="left",
         validate="one_to_one",
     )
