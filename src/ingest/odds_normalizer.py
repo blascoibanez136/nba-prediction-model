@@ -11,7 +11,8 @@ Each CSV row = one (game, bookmaker) with columns:
     snapshot_type          open | mid | close
     game_id                Odds API game id
     commence_time          ISO8601 string
-    game_date              YYYY-MM-DD (UTC, from commence_time)
+    game_date              YYYY-MM-DD (America/New_York)
+    merge_key              normalized "home__away__YYYY-MM-DD" (for joining)
     home_team
     away_team
     book                   bookmaker key
@@ -23,7 +24,7 @@ Each CSV row = one (game, bookmaker) with columns:
 
     spread_home_point      home spread (home perspective)
     spread_home_price
-    spread_away_point      away spread
+    spread_away_point
     spread_away_price
 
     total_point            total line
@@ -41,6 +42,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+from zoneinfo import ZoneInfo
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -54,6 +56,7 @@ class NormalizedRow:
     game_id: str
     commence_time: str
     game_date: str
+    merge_key: str
     home_team: str
     away_team: str
     book: str
@@ -76,15 +79,31 @@ def _norm_team(name: Any) -> str:
     return name.strip()
 
 
+def _norm_key(name: Any) -> str:
+    if not isinstance(name, str):
+        return ""
+    return name.strip().lower()
+
+
 def _date_from_commence(commence: Optional[str]) -> str:
+    """
+    Convert Odds API commence_time (UTC) into America/New_York date (YYYY-MM-DD).
+
+    This ensures that:
+      - A late game like 2025-12-11T01:00:00Z becomes 2025-12-10 (US/Eastern),
+        matching the schedule/game_date used by the model.
+    """
     if not commence:
         return ""
     ts = str(commence)
     if ts.endswith("Z"):
         ts = ts.replace("Z", "+00:00")
     try:
-        dt = datetime.fromisoformat(ts).astimezone(timezone.utc)
-        return dt.strftime("%Y-%m-%d")
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt_local = dt.astimezone(ZoneInfo("America/New_York"))
+        return dt_local.strftime("%Y-%m-%d")
     except Exception:
         # fallback: just take first 10 chars if it looks like a date
         return ts[:10]
@@ -107,6 +126,7 @@ def normalize_odds_list(
         away_team = _norm_team(g.get("away_team"))
         commence_time = g.get("commence_time") or ""
         game_date = _date_from_commence(commence_time)
+        merge_key = f"{_norm_key(home_team)}__{_norm_key(away_team)}__{game_date}"
 
         bookmakers = g.get("bookmakers") or []
         for book in bookmakers:
@@ -156,12 +176,10 @@ def normalize_odds_list(
                         name = str(o.get("name") or "").lower()
                         price = o.get("price")
                         point = o.get("point")
-                        # Some books use "Over" / "Under"; some "Over 210.5"
                         if name.startswith("over"):
                             total_point = point
                             total_over_price = price
                         elif name.startswith("under"):
-                            # assume same total line; don't overwrite point if already set
                             if np.isnan(total_point):
                                 total_point = point
                             total_under_price = price
@@ -172,6 +190,7 @@ def normalize_odds_list(
                     "game_id": game_id,
                     "commence_time": commence_time,
                     "game_date": game_date,
+                    "merge_key": merge_key,
                     "home_team": home_team,
                     "away_team": away_team,
                     "book": book_key,
@@ -196,6 +215,7 @@ def normalize_odds_list(
         "game_id",
         "commence_time",
         "game_date",
+        "merge_key",
         "home_team",
         "away_team",
         "book",
@@ -268,4 +288,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     normalize_odds_json_file(Path(args.json_path), snapshot_type=args.snapshot_type)
-
