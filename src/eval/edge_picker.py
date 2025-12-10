@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import os
 import glob
-import json
 from datetime import date, datetime, timezone
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -201,62 +200,84 @@ def _latest_close_snapshot() -> Optional[str]:
 # -----------------------
 # flatten spreads (snapshot path)
 # -----------------------
-def _to_list(obj):
-    if isinstance(obj, list):
-        return obj
-    if isinstance(obj, str):
-        # try JSON, fallback to literal_eval for old CSVs
-        try:
-            return json.loads(obj)
-        except Exception:
-            try:
-                import ast
-                return ast.literal_eval(obj)
-            except Exception:
-                return []
-    return []
-
-
 def flatten_spreads_from_snapshot(csv_path: str) -> pd.DataFrame:
     """
-    Input: raw snapshot CSV with nested 'bookmakers'
-    Output: tidy spreads with teams, prices, and derived game_date + merge_key
+    Input: normalized snapshot CSV produced by src.ingest.odds_normalizer
+           with one row per (game, bookmaker).
+
+    Output: tidy spreads with teams, prices, and derived game_date + merge_key:
+        columns = [game_id, book, team, spread, price,
+                   home_team, away_team, game_date, merge_key]
     """
     raw = pd.read_csv(csv_path)
     rows: List[Dict[str, Any]] = []
 
+    if raw.empty:
+        return pd.DataFrame(
+            columns=[
+                "game_id",
+                "book",
+                "team",
+                "spread",
+                "price",
+                "home_team",
+                "away_team",
+                "game_date",
+                "merge_key",
+            ]
+        )
+
     for _, row in raw.iterrows():
-        game_id = str(row.get("id") or row.get("game_id") or "")
-        if not game_id:
-            continue
+        game_id = str(row.get("game_id") or "")
         home = row.get("home_team")
         away = row.get("away_team")
+        book = row.get("book")
+        game_date = row.get("game_date")
         commence = row.get("commence_time")
-        books = _to_list(row.get("bookmakers", []))
-        if not home or not away:
-            continue
-        game_date = _date_utc_from_commence(commence) if pd.notna(commence) else ""
 
-        for bk in books:
-            book_key = bk.get("key") or bk.get("title") or "unknown"
-            for m in bk.get("markets", []):
-                if (m.get("key") or "").lower() != "spreads":
-                    continue
-                for outc in m.get("outcomes", []):
-                    team = outc.get("name")
-                    spread = pd.to_numeric(outc.get("point"), errors="coerce")
-                    price = pd.to_numeric(outc.get("price"), errors="coerce")
-                    rows.append({
-                        "game_id": game_id,
-                        "book": str(book_key),
-                        "team": team,
-                        "spread": spread,
-                        "price": price,
-                        "home_team": home,
-                        "away_team": away,
-                        "game_date": game_date,
-                        "merge_key": _merge_key(home, away, game_date),
-                    })
+        if pd.isna(game_date) and pd.notna(commence):
+            game_date = _date_utc_from_commence(str(commence))
+
+        if not home or not away or not game_date:
+            continue
+
+        mk = _merge_key(home, away, str(game_date))
+
+        # Home side
+        sp_home = row.get("spread_home_point")
+        pr_home = row.get("spread_home_price")
+        if not pd.isna(sp_home):
+            rows.append(
+                {
+                    "game_id": game_id,
+                    "book": str(book),
+                    "team": home,
+                    "spread": float(sp_home),
+                    "price": float(pr_home) if not pd.isna(pr_home) else np.nan,
+                    "home_team": home,
+                    "away_team": away,
+                    "game_date": str(game_date),
+                    "merge_key": mk,
+                }
+            )
+
+        # Away side
+        sp_away = row.get("spread_away_point")
+        pr_away = row.get("spread_away_price")
+        if not pd.isna(sp_away):
+            rows.append(
+                {
+                    "game_id": game_id,
+                    "book": str(book),
+                    "team": away,
+                    "spread": float(sp_away),
+                    "price": float(pr_away) if not pd.isna(pr_away) else np.nan,
+                    "home_team": home,
+                    "away_team": away,
+                    "game_date": str(game_date),
+                    "merge_key": mk,
+                }
+            )
 
     df = pd.DataFrame(rows)
     if not df.empty:
@@ -270,10 +291,19 @@ def build_side_table(spreads_df: pd.DataFrame) -> pd.DataFrame:
     carrying merge_key for a reliable join with predictions.
     """
     if spreads_df.empty:
-        return pd.DataFrame(columns=[
-            "merge_key", "game_id", "book", "home_team", "away_team",
-            "game_date", "market_side", "book_spread_home", "market_price"
-        ])
+        return pd.DataFrame(
+            columns=[
+                "merge_key",
+                "game_id",
+                "book",
+                "home_team",
+                "away_team",
+                "game_date",
+                "market_side",
+                "book_spread_home",
+                "market_price",
+            ]
+        )
 
     home_rows = spreads_df[spreads_df["team"] == spreads_df["home_team"]].copy()
     away_rows = spreads_df[spreads_df["team"] == spreads_df["away_team"]].copy()
@@ -288,8 +318,15 @@ def build_side_table(spreads_df: pd.DataFrame) -> pd.DataFrame:
 
     merged = pd.concat([home_rows, away_rows], ignore_index=True, sort=False)
     keep = [
-        "merge_key", "game_id", "book", "home_team", "away_team",
-        "game_date", "market_side", "book_spread_home", "market_price"
+        "merge_key",
+        "game_id",
+        "book",
+        "home_team",
+        "away_team",
+        "game_date",
+        "market_side",
+        "book_spread_home",
+        "market_price",
     ]
     return merged[keep].dropna(subset=["book_spread_home"])
 
@@ -303,12 +340,24 @@ def make_picks_with_prices(preds: pd.DataFrame, side_table: pd.DataFrame) -> pd.
     Join on merge_key to avoid cross-provider ID mismatches.
     """
     if side_table.empty:
-        return pd.DataFrame(columns=[
-            "game_id", "game_date", "book", "market_side", "market_price",
-            "book_spread_home", "model_fair_spread", "model_edge_pts",
-            "book_implied_prob", "model_side_prob", "suggested_kelly",
-            "suggested_stake_units", "consensus_close", "book_dispersion"
-        ])
+        return pd.DataFrame(
+            columns=[
+                "game_id",
+                "game_date",
+                "book",
+                "market_side",
+                "market_price",
+                "book_spread_home",
+                "model_fair_spread",
+                "model_edge_pts",
+                "book_implied_prob",
+                "model_side_prob",
+                "suggested_kelly",
+                "suggested_stake_units",
+                "consensus_close",
+                "book_dispersion",
+            ]
+        )
 
     # Merge odds with predictions via merge_key
     base_cols = [
@@ -364,7 +413,8 @@ def make_picks_with_prices(preds: pd.DataFrame, side_table: pd.DataFrame) -> pd.
     # Kelly (capped)
     k_raw = [
         _kelly_fraction(p, price if not pd.isna(price) else np.nan)
-        if not pd.isna(price) and not pd.isna(p) else 0.0
+        if not pd.isna(price) and not pd.isna(p)
+        else 0.0
         for p, price in zip(df["model_side_prob"], df["market_price"])
     ]
     df["kelly_raw"] = k_raw
@@ -375,8 +425,8 @@ def make_picks_with_prices(preds: pd.DataFrame, side_table: pd.DataFrame) -> pd.
 
     # Drop rows where we have no model opinion
     df = df[
-        df["model_fair_spread"].notna() &
-        df["model_side_prob"].notna()
+        df["model_fair_spread"].notna()
+        & df["model_side_prob"].notna()
     ].copy()
 
     # Optional book whitelist
@@ -392,8 +442,8 @@ def make_picks_with_prices(preds: pd.DataFrame, side_table: pd.DataFrame) -> pd.
 
     if edge_thresh > 0.0 or kelly_thresh > 0.0:
         df = df[
-            (df["model_edge_pts"].abs() >= edge_thresh) &
-            (df["suggested_kelly"] >= kelly_thresh)
+            (df["model_edge_pts"].abs() >= edge_thresh)
+            & (df["suggested_kelly"] >= kelly_thresh)
         ].copy()
 
     keep = [
@@ -438,10 +488,17 @@ def make_picks_reduced(preds: pd.DataFrame, dispersion: pd.DataFrame) -> pd.Data
     Reduced pick sheet (no prices/stakes). Uses consensus close and dispersion.
     """
     if dispersion is None or dispersion.empty:
-        return pd.DataFrame(columns=[
-            "game_id", "home_team", "away_team",
-            "model_fair_spread", "consensus_close", "model_edge_pts", "book_dispersion"
-        ])
+        return pd.DataFrame(
+            columns=[
+                "game_id",
+                "home_team",
+                "away_team",
+                "model_fair_spread",
+                "consensus_close",
+                "model_edge_pts",
+                "book_dispersion",
+            ]
+        )
 
     # Ensure merge_key in dispersion
     if "merge_key" not in dispersion.columns:
@@ -451,10 +508,17 @@ def make_picks_reduced(preds: pd.DataFrame, dispersion: pd.DataFrame) -> pd.Data
                 lambda r: _merge_key(r["home_team"], r["away_team"], r["game_date"]), axis=1
             )
         else:
-            return pd.DataFrame(columns=[
-                "game_id", "home_team", "away_team",
-                "model_fair_spread", "consensus_close", "model_edge_pts", "book_dispersion"
-            ])
+            return pd.DataFrame(
+                columns=[
+                    "game_id",
+                    "home_team",
+                    "away_team",
+                    "model_fair_spread",
+                    "consensus_close",
+                    "model_edge_pts",
+                    "book_dispersion",
+                ]
+            )
 
     # Ensure merge_key in preds
     if "merge_key" not in preds.columns:
@@ -465,7 +529,8 @@ def make_picks_reduced(preds: pd.DataFrame, dispersion: pd.DataFrame) -> pd.Data
 
     df = preds.merge(
         dispersion[["merge_key", "consensus_close", "book_dispersion"]],
-        on="merge_key", how="left"
+        on="merge_key",
+        how="left",
     )
 
     # Use market-adjusted spread if present, else model fair_spread
@@ -477,11 +542,18 @@ def make_picks_reduced(preds: pd.DataFrame, dispersion: pd.DataFrame) -> pd.Data
     df["model_edge_pts"] = df["model_fair_spread"] - df["consensus_close"]
 
     keep = [
-        "game_id", "home_team", "away_team",
-        "model_fair_spread", "consensus_close", "model_edge_pts", "book_dispersion"
+        "game_id",
+        "home_team",
+        "away_team",
+        "model_fair_spread",
+        "consensus_close",
+        "model_edge_pts",
+        "book_dispersion",
     ]
     out = df[keep].dropna(subset=["consensus_close"]).copy()
-    out = out.sort_values(["model_edge_pts", "book_dispersion"], ascending=[False, True])
+    out = out.sort_values(
+        ["model_edge_pts", "book_dispersion"], ascending=[False, True]
+    )
     return out
 
 
@@ -490,7 +562,10 @@ def make_picks_reduced(preds: pd.DataFrame, dispersion: pd.DataFrame) -> pd.Data
 # -----------------------
 def render_html(picks: pd.DataFrame, out_html: str, today: str):
     if picks.empty:
-        html = f"<html><body><h1>Picks for {today}</h1><p>No edges today.</p></body></html>"
+        html = (
+            f"<html><body><h1>Picks for {today}</h1>"
+            f"<p>No edges today.</p></body></html>"
+        )
         open(out_html, "w").write(html)
         return
     floats = {col: "{:.4f}".format for col in picks.select_dtypes(include=[float]).columns}
