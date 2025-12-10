@@ -1,10 +1,9 @@
 """
 Odds snapshot + dispersion utilities for NBA Pro-Lite.
 
-UPDATED VERSION:
 - Snapshots are stored as JSON (raw Odds API response)
 - AND immediately normalized to CSV using odds_normalizer.py
-- JSON is still used for dispersion/movement; CSV is used by:
+- JSON is used for dispersion/movement; CSV is used by:
     - market_ensemble.apply_market_ensemble
     - edge_picker.flatten_spreads_from_snapshot
 """
@@ -15,7 +14,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
 
 import pandas as pd
 
@@ -29,11 +28,47 @@ SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------
-# UTILITIES
+# BASIC HELPERS
 # ---------------------------------------------------------
 
 def _norm(name: str) -> str:
     return name.strip().lower() if isinstance(name, str) else ""
+
+
+def _ensure_games_list(obj: Union[str, Path, List[dict]]) -> List[dict]:
+    """
+    Accept:
+      - list[dict]           (already parsed Odds API payload)
+      - str / Path path      (JSON file path)
+      - str JSON             (raw JSON string)
+
+    Return list[dict] or raise TypeError/ValueError.
+    """
+    # Already a list of dicts
+    if isinstance(obj, list):
+        if obj and not isinstance(obj[0], dict):
+            raise TypeError(
+                f"_ensure_games_list expected list[dict], got list[{type(obj[0])}]"
+            )
+        return obj
+
+    # Path-like or path string
+    if isinstance(obj, (str, Path)):
+        p = Path(obj)
+        if p.exists():
+            with p.open() as f:
+                data = json.load(f)
+        else:
+            # Assume it's a raw JSON string
+            data = json.loads(str(obj))
+
+        if not isinstance(data, list):
+            raise TypeError(
+                f"_ensure_games_list expected list from JSON, got {type(data)}"
+            )
+        return data
+
+    raise TypeError(f"_ensure_games_list cannot handle type {type(obj)}")
 
 
 # ---------------------------------------------------------
@@ -56,7 +91,7 @@ def save_snapshot(kind: str) -> Dict[str, Path]:
     if kind not in {"open", "mid", "close"}:
         raise ValueError(f"Invalid snapshot kind: {kind} (expected open|mid|close)")
 
-    odds = get_nba_odds()  # raw list[dict]
+    odds = get_nba_odds()  # list[dict]
     SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -112,14 +147,16 @@ def flatten_spreads(data: List[dict]) -> pd.DataFrame:
         merge_key, home_team, away_team, game_date,
         book, team, price, point
     """
-    rows = []
+    rows: List[Dict[str, Any]] = []
 
     for g in data:
-        game_id = g.get("id")
+        # g is a single game dict from Odds API
         home = g.get("home_team")
         away = g.get("away_team")
         commence = g.get("commence_time") or ""
         game_date = commence[:10] if commence else ""
+
+        merge_key = f"{_norm(home)}__{_norm(away)}__{game_date}"
 
         for book in g.get("bookmakers", []):
             book_key = book.get("key")
@@ -132,7 +169,7 @@ def flatten_spreads(data: List[dict]) -> pd.DataFrame:
                 for o in m.get("outcomes", []):
                     rows.append(
                         {
-                            "merge_key": f"{_norm(home)}__{_norm(away)}__{game_date}",
+                            "merge_key": merge_key,
                             "home_team": home,
                             "away_team": away,
                             "game_date": game_date,
@@ -150,10 +187,14 @@ def flatten_spreads(data: List[dict]) -> pd.DataFrame:
 # DISPERSION + CONSENSUS
 # ---------------------------------------------------------
 
-def compute_dispersion(data: List[dict]) -> pd.DataFrame:
+def compute_dispersion(data: Union[str, Path, List[dict]]) -> pd.DataFrame:
     """
     Compute consensus spread and dispersion (std dev across books)
     from a raw odds JSON payload.
+
+    `data` can be:
+      - list[dict]      (already parsed)
+      - path / str      (JSON file path or raw JSON string)
 
     Returns:
         columns = [
@@ -161,7 +202,8 @@ def compute_dispersion(data: List[dict]) -> pd.DataFrame:
           "home_team", "away_team", "game_date",
         ]
     """
-    df = flatten_spreads(data)
+    games = _ensure_games_list(data)
+    df = flatten_spreads(games)
 
     if df.empty:
         return pd.DataFrame(
@@ -201,17 +243,27 @@ def compute_dispersion(data: List[dict]) -> pd.DataFrame:
 # MOVEMENT
 # ---------------------------------------------------------
 
-def compute_movement(open_data: List[dict], close_data: List[dict]) -> pd.DataFrame:
+def compute_movement(
+    open_data: Union[str, Path, List[dict]],
+    close_data: Union[str, Path, List[dict]],
+) -> pd.DataFrame:
     """
     Compare consensus spread at open vs close and compute line_move.
+
+    open_data / close_data can be:
+      - list[dict]      (already parsed)
+      - path / str      (JSON file path or raw JSON string)
 
     Returns:
         columns = [
           "merge_key", "open_consensus", "close_consensus", "line_move"
         ]
     """
-    df_open = flatten_spreads(open_data)
-    df_close = flatten_spreads(close_data)
+    open_games = _ensure_games_list(open_data)
+    close_games = _ensure_games_list(close_data)
+
+    df_open = flatten_spreads(open_games)
+    df_close = flatten_spreads(close_games)
 
     if df_open.empty or df_close.empty:
         return pd.DataFrame(
