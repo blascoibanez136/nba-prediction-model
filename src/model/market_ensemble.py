@@ -17,23 +17,29 @@ Responsibilities
 
 Assumed inputs
 --------------
-1) Model predictions CSV (from model.predict), with at least:
+1) Model predictions CSV (from src/model/predict.py), with at least:
     - game_id            (string or int; unique per game)
+    - home_team
+    - away_team
+    - game_date          (YYYY-MM-DD)
     - fair_spread        (model-derived fair spread; negative = home favorite)
     - fair_total         (model-derived fair total points)
     - home_win_prob      (model-derived home win probability in [0, 1])
 
-2) Normalized odds CSV (CLOSE snapshot), with a *line-level* schema, e.g.:
-    - game_id            (matches predictions)
-    - book               (e.g. 'dk', 'fd', 'mgm', ...)
-    - market             ('spreads', 'totals', 'h2h')
-    - outcome            (for spreads/h2h: 'home' or 'away';
-                          for totals: 'over' or 'under')
-    - price              (American odds, e.g. -110, +105)
-    - point              (spread / total line as float)
-
-If your odds_normalizer produced slightly different column names,
-modify the column mappings at the top accordingly.
+2) Normalized odds CSV (CLOSE snapshot), with a *book-level* schema, e.g.:
+    - snapshot_type
+    - game_id
+    - game_date
+    - commence_time
+    - home_team
+    - away_team
+    - book
+    - book_title
+    - last_update
+    - ml_home, ml_away
+    - spread_home_point, spread_home_price
+    - spread_away_point, spread_away_price
+    - total_point, total_over_price, total_under_price
 
 Usage (imported)
 ----------------
@@ -48,7 +54,7 @@ Usage (CLI)
 -----------
     python -m src.model.market_ensemble \
         --predictions-csv outputs/predictions_2024-02-05.csv \
-        --odds-close-csv data/_snapshots/odds_close_2024-02-05_normalized.csv \
+        --odds-close-csv data/_snapshots/close_20240205_235500.csv \
         --out-csv outputs/predictions_2024-02-05_market.csv
 """
 
@@ -57,7 +63,7 @@ from __future__ import annotations
 import argparse
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, List
 
 import numpy as np
 import pandas as pd
@@ -70,6 +76,7 @@ import pandas as pd
 @dataclass
 class PredictionsCols:
     game_id: str = "game_id"
+    game_date: str = "game_date"
     fair_spread: str = "fair_spread"
     fair_total: str = "fair_total"
     home_win_prob: str = "home_win_prob"
@@ -79,10 +86,19 @@ class PredictionsCols:
 class OddsCols:
     game_id: str = "game_id"
     book: str = "book"
-    market: str = "market"
-    outcome: str = "outcome"
-    price: str = "price"   # American odds
-    point: str = "point"   # spread / total point
+    snapshot_type: str = "snapshot_type"
+    game_date: str = "game_date"
+    home_team: str = "home_team"
+    away_team: str = "away_team"
+    ml_home: str = "ml_home"
+    ml_away: str = "ml_away"
+    spread_home_point: str = "spread_home_point"
+    spread_home_price: str = "spread_home_price"
+    spread_away_point: str = "spread_away_point"
+    spread_away_price: str = "spread_away_price"
+    total_point: str = "total_point"
+    total_over_price: str = "total_over_price"
+    total_under_price: str = "total_under_price"
 
 
 PRED_COLS = PredictionsCols()
@@ -131,7 +147,7 @@ def compute_market_features(odds_df: pd.DataFrame) -> pd.DataFrame:
     ----------
     odds_df : pd.DataFrame
         Normalized odds for a *single* snapshot (typically CLOSE),
-        containing spreads, totals, and moneylines (h2h).
+        containing spreads, totals, and moneylines per (game, book).
 
     Returns
     -------
@@ -146,23 +162,26 @@ def compute_market_features(odds_df: pd.DataFrame) -> pd.DataFrame:
     """
     g = ODDS_COLS
 
-    # Defensive copy
     df = odds_df.copy()
 
     # Ensure required columns exist
-    required_cols = [g.game_id, g.book, g.market, g.outcome, g.price, g.point]
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"Odds DataFrame is missing required columns: {missing}")
+    required_cols = [
+        g.game_id,
+        g.book,
+        g.game_date,
+        g.home_team,
+        g.away_team,
+    ]
+    missing_req = [c for c in required_cols if c not in df.columns]
+    if missing_req:
+        raise ValueError(f"Odds DataFrame is missing required columns: {missing_req}")
 
-    # ----- SPREADS -----
-    spreads = df[df[g.market] == "spreads"].copy()
-    # We'll treat 'home' outcome as "home spread" (point usually negative if fav)
-    home_spreads = spreads[spreads[g.outcome] == "home"]
+    # --- Spreads (home perspective) ---
+    if g.spread_home_point not in df.columns:
+        df[g.spread_home_point] = np.nan
 
     spread_agg = (
-        home_spreads
-        .groupby(g.game_id)[g.point]
+        df.groupby(g.game_id)[g.spread_home_point]
         .agg(["mean", "std"])
         .rename(
             columns={
@@ -172,14 +191,12 @@ def compute_market_features(odds_df: pd.DataFrame) -> pd.DataFrame:
         )
     )
 
-    # ----- TOTALS -----
-    totals = df[df[g.market] == "totals"].copy()
-    # Use 'over' lines for consensus total
-    overs = totals[totals[g.outcome] == "over"]
+    # --- Totals (Over side) ---
+    if g.total_point not in df.columns:
+        df[g.total_point] = np.nan
 
     total_agg = (
-        overs
-        .groupby(g.game_id)[g.point]
+        df.groupby(g.game_id)[g.total_point]
         .agg(["mean", "std"])
         .rename(
             columns={
@@ -189,25 +206,25 @@ def compute_market_features(odds_df: pd.DataFrame) -> pd.DataFrame:
         )
     )
 
-    # ----- MONEYLINES (H2H) -----
-    h2h = df[df[g.market] == "h2h"].copy()
-    home_ml = h2h[h2h[g.outcome] == "home"].copy()
-
-    home_ml["implied_prob"] = home_ml[g.price].astype(float).apply(_american_to_implied_prob)
+    # --- Moneylines (home side implied probability) ---
+    ml_probs = []
+    for val in df.get(g.ml_home, []):
+        if pd.isna(val):
+            ml_probs.append(np.nan)
+        else:
+            ml_probs.append(_american_to_implied_prob(float(val)))
+    df["home_ml_implied_prob"] = ml_probs
 
     ml_agg = (
-        home_ml
-        .groupby(g.game_id)["implied_prob"]
+        df.groupby(g.game_id)["home_ml_implied_prob"]
         .mean()
         .to_frame("market_implied_home_win_prob")
     )
 
-    # Combine
     market_features = (
         spread_agg.join(total_agg, how="outer")
         .join(ml_agg, how="outer")
         .reset_index()
-        .rename(columns={g.game_id: PRED_COLS.game_id})
     )
 
     return market_features
@@ -232,19 +249,16 @@ def _compute_dispersion_weight(
         - High dispersion -> market disagrees -> trust model more
 
     Implementation:
-        - We compute a logistic function of (dispersion - pivot) so that:
-            dispersion << pivot  -> model_weight ~ min_weight (market heavy)
-            dispersion >> pivot  -> model_weight ~ max_weight (model heavy)
+        - logistic on dispersion around `pivot`:
+            dispersion << pivot  -> weight ~ min_weight (market-heavy)
+            dispersion >> pivot  -> weight ~ max_weight (model-heavy)
     """
     if dispersion is None or np.isnan(dispersion):
         # If we don't have dispersion info, fallback to a neutral weight.
         return 0.50
 
-    # logistic on (dispersion - pivot) then flipped
     z = sharpness * (dispersion - pivot)
     base = _sigmoid(z)  # increases with dispersion
-    # base ~ 0 when dispersion << pivot
-    # base ~ 1 when dispersion >> pivot
 
     # Map base in [0,1] -> [min_weight, max_weight]
     return min_weight + base * (max_weight - min_weight)
@@ -293,8 +307,8 @@ def blend_probs(
     try:
         z_model = _logit(float(model_prob))
         z_market = _logit(float(market_prob))
-    except ValueError:
-        # if either prob is 0 or 1 etc., fall back to simple convex combo
+    except Exception:
+        # If either prob is pathological, fall back to simple convex combo
         return w * model_prob + (1 - w) * market_prob
 
     z_blend = w * z_model + (1.0 - w) * z_market
@@ -319,14 +333,14 @@ def apply_market_ensemble(
     preds_df : pd.DataFrame
         Model predictions with columns:
             - game_id
+            - game_date
             - fair_spread
             - fair_total
             - home_win_prob
     odds_close_df : pd.DataFrame
-        Normalized CLOSE odds snapshot, line-level (spreads, totals, h2h).
+        Normalized CLOSE odds snapshot, book-level.
     spread_dispersion_pivot : float
-        Pivot for dispersion -> weight mapping for spreads. Smaller pivot
-        means we treat even small disagreements as "high dispersion".
+        Pivot for dispersion -> weight mapping for spreads.
     total_dispersion_pivot : float
         Same for totals.
 
@@ -342,24 +356,21 @@ def apply_market_ensemble(
             - fair_spread_market
             - fair_total_market
             - home_win_prob_market
+            - consensus_close        (alias for spreads, for edge_picker)
+            - book_dispersion        (alias for spreads, for edge_picker)
     """
     p = PRED_COLS
 
-    if p.game_id not in preds_df.columns:
-        raise ValueError(f"Predictions DataFrame missing '{p.game_id}' column.")
-    if p.fair_spread not in preds_df.columns:
-        raise ValueError(f"Predictions DataFrame missing '{p.fair_spread}' column.")
-    if p.fair_total not in preds_df.columns:
-        raise ValueError(f"Predictions DataFrame missing '{p.fair_total}' column.")
-    if p.home_win_prob not in preds_df.columns:
-        raise ValueError(f"Predictions DataFrame missing '{p.home_win_prob}' column.")
+    for col in (p.game_id, p.fair_spread, p.fair_total, p.home_win_prob):
+        if col not in preds_df.columns:
+            raise ValueError(f"Predictions DataFrame missing '{col}' column.")
 
     preds = preds_df.copy()
 
     # Compute per-game market features from odds
     market_features = compute_market_features(odds_close_df)
 
-    # Merge
+    # Merge on game_id
     merged = preds.merge(
         market_features,
         on=p.game_id,
@@ -388,13 +399,12 @@ def apply_market_ensemble(
         )
     )
 
-    # For win probability, we can reuse spread_weights or a neutral 0.5 if desired.
+    # For win probability, we can reuse spread_weights
     prob_weights = spread_weights
 
-    # Line blending
-    blended_spreads = []
-    blended_totals = []
-    blended_probs = []
+    blended_spreads: List[float] = []
+    blended_totals: List[float] = []
+    blended_probs: List[float] = []
 
     for i, row in merged.iterrows():
         # Spread
@@ -425,6 +435,12 @@ def apply_market_ensemble(
     merged["fair_total_market"] = blended_totals
     merged["home_win_prob_market"] = blended_probs
 
+    # Aliases for existing downstream code (edge_picker, etc.)
+    if "consensus_close_spread_home" in merged.columns and "consensus_close" not in merged.columns:
+        merged["consensus_close"] = merged["consensus_close_spread_home"]
+    if "spread_dispersion" in merged.columns and "book_dispersion" not in merged.columns:
+        merged["book_dispersion"] = merged["spread_dispersion"]
+
     return merged
 
 
@@ -439,7 +455,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--predictions-csv",
         required=True,
-        help="Path to model predictions CSV (from model.predict).",
+        help="Path to model predictions CSV (from model/predict.py).",
     )
     parser.add_argument(
         "--odds-close-csv",
