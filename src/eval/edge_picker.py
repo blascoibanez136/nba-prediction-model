@@ -42,6 +42,8 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
+from src.ingest.team_normalizer import normalize_team_name
+
 logger = logging.getLogger(__name__)
 
 
@@ -78,16 +80,12 @@ def _merge_key(home_team: str, away_team: str, game_date: str) -> str:
     """
     Build a canonical merge_key from home_team, away_team, and game_date.
 
-    This mirrors the convention used elsewhere in the codebase:
-        merge_key = lower(home_team) + "__" + lower(away_team) + "__" + game_date
+    Uses normalize_team_name() so that aliases like "LA Clippers" and
+    "Los Angeles Clippers" resolve to the same key.
     """
-    return (
-        str(home_team).strip().lower()
-        + "__"
-        + str(away_team).strip().lower()
-        + "__"
-        + str(game_date)
-    )
+    home_norm = normalize_team_name(home_team)
+    away_norm = normalize_team_name(away_team)
+    return f"{home_norm}__{away_norm}__{game_date}"
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +209,8 @@ def generate_spread_picks(
     Generate spread picks by comparing our fair spread to each book's line.
 
     For each game/book, we:
+        - normalize team names for both preds and odds
+        - build a canonical merge_key using normalize_team_name
         - compute home_edge_pts = book_spread_home - fair_spread
         - compute away_edge_pts = -home_edge_pts
         - choose the side (home/away) with the larger positive edge
@@ -240,21 +240,37 @@ def generate_spread_picks(
             ]
         )
 
-    # Merge predictions with CLOSE snapshot odds on merge_key + teams + date
-    merge_cols = ["merge_key", "game_date", "home_team", "away_team"]
-    missing_cols = [c for c in merge_cols if c not in preds_df.columns or c not in odds_df.columns]
-    if missing_cols:
-        raise ValueError(f"Missing merge columns in preds/odds: {missing_cols}")
+    # Work on copies so we don't mutate callers
+    preds = preds_df.copy()
+    odds = odds_df.copy()
 
-    merged = odds_df.merge(
-        preds_df,
-        on=merge_cols,
+    required_cols = {"home_team", "away_team", "game_date"}
+    if not required_cols <= set(preds.columns):
+        missing = required_cols - set(preds.columns)
+        raise ValueError(f"preds_df missing required columns: {missing}")
+    if not required_cols <= set(odds.columns):
+        missing = required_cols - set(odds.columns)
+        raise ValueError(f"odds_df missing required columns: {missing}")
+
+    # Normalize team names and build canonical merge_key for both preds and odds
+    for df in (preds, odds):
+        df["home_team_norm"] = df["home_team"].apply(normalize_team_name)
+        df["away_team_norm"] = df["away_team"].apply(normalize_team_name)
+        df["merge_key_norm"] = df.apply(
+            lambda r: _merge_key(r["home_team_norm"], r["away_team_norm"], r["game_date"]),
+            axis=1,
+        )
+
+    # Merge predictions with CLOSE snapshot odds on normalized merge_key
+    merged = odds.merge(
+        preds,
+        on="merge_key_norm",
         how="inner",
         suffixes=("", "_pred"),
     )
 
     if merged.empty:
-        logger.warning("[edge_picker] No rows after merging preds and odds.")
+        logger.warning("[edge_picker] No rows after merging preds and odds on normalized keys.")
         return pd.DataFrame(
             columns=[
                 "game_id",
