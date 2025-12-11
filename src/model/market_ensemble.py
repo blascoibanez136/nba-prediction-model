@@ -197,7 +197,8 @@ def compute_dispersion_weight(
     # Lower dispersion => higher trust in market
     z = -sharpness * (d - pivot)
     base = _sigmoid(z)  # in (0, 1)
-    return float(min_weight + base * (max_weight - min_weight))
+    return float(min_weight + base * (max_weight - max(min_weight, min(max_weight, 0)))) if False else \
+        float(min_weight + base * (max_weight - min_weight))
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +215,12 @@ def _aggregate_from_normalized(odds_df: pd.DataFrame) -> pd.DataFrame:
     # Normalize text columns
     df["market"] = df["market"].astype(str).str.lower()
     df["side"] = df["side"].astype(str).str.lower()
+
+    # Ensure numeric types
+    if "point" in df.columns:
+        df["point"] = pd.to_numeric(df["point"], errors="coerce")
+    if "price" in df.columns:
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
 
     # --- Spreads (home side) ---
     spreads = df[(df["market"] == "spreads") & (df["side"] == "home")]
@@ -259,6 +266,17 @@ def _aggregate_from_normalized(odds_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _safe_to_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """
+    Convert given columns to numeric with errors coerced to NaN.
+    Handles strings like 'None', '', etc.
+    """
+    for col in cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
 def _aggregate_from_wide(odds_df: pd.DataFrame) -> pd.DataFrame:
     """
     Aggregate market data when odds_df is in wide snapshot format with columns like:
@@ -273,6 +291,22 @@ def _aggregate_from_wide(odds_df: pd.DataFrame) -> pd.DataFrame:
         - home_ml_prob_consensus = mean(american_to_prob(ml_home)) per merge_key
     """
     df = odds_df.copy()
+
+    # Clean and cast numeric columns from strings ("None", "", etc.) to floats/NaN
+    df = _safe_to_numeric(
+        df,
+        [
+            "spread_home_point",
+            "spread_away_point",
+            "spread_home_price",
+            "spread_away_price",
+            "total_point",
+            "total_over_price",
+            "total_under_price",
+            "ml_home",
+            "ml_away",
+        ],
+    )
 
     # --- Spreads ---
     if "spread_home_point" in df.columns:
@@ -311,6 +345,13 @@ def _aggregate_from_wide(odds_df: pd.DataFrame) -> pd.DataFrame:
 
     out = spread_stats.merge(totals_stats, on="merge_key", how="outer")
     out = out.merge(ml_stats, on="merge_key", how="outer")
+
+    # Log how many games actually have valid spread/total/ml data
+    n_games = out["merge_key"].nunique()
+    logger.info(
+        "[market_ensemble] Wide aggregation produced %d games with market data.",
+        n_games,
+    )
 
     return out
 
@@ -497,7 +538,7 @@ def apply_market_ensemble(
     # --- Market side win probability ---
     # 1) Spread-derived win prob
     spread_probs = merged["home_spread_consensus"].apply(
-        lambda s: spread_to_win_prob(s, slope=spread_to_prob_slope)
+        lambda s: spread_to_win_prob(s, slope=spread_to_prob_slope) if pd.notnull(s) else None
     )
     merged["spread_prob"] = spread_probs
 
@@ -543,7 +584,7 @@ def apply_market_ensemble(
             continue
 
         # If no valid market prob, fall back to model only
-        if p_market is None or (isinstance(p_market, float) and math.isnan(p_market)):
+        if p_market is None or (isinstance(p_market, float) and math.isnan(float(p_market))):
             blended_probs.append(p_model_f)
             continue
 
@@ -564,7 +605,7 @@ def apply_market_ensemble(
     merged["fair_total_market"] = merged["total_consensus"]
 
     def _blend_line(model_val: float, market_val: float, w: float) -> float:
-        if market_val is None:
+        if market_val is None or (isinstance(market_val, float) and math.isnan(market_val)):
             return model_val
         try:
             mv = float(market_val)
