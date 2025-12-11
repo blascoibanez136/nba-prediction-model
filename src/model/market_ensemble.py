@@ -26,6 +26,10 @@ Outputs are designed to be "backtest-ready" with explicit columns for:
     - fair_total               (blended)
     - market_weight            (weight given to market in the blend)
     - home_spread_dispersion   (std dev of home spread across books)
+
+For backwards compatibility with existing edge_picker code, we also expose:
+    - consensus_close   (alias of home_spread_consensus)
+    - book_dispersion   (alias of home_spread_dispersion)
 """
 
 from __future__ import annotations
@@ -337,6 +341,8 @@ def apply_market_ensemble(
             - home_spread_dispersion
             - home_spread_consensus
             - total_consensus
+            - consensus_close (alias of home_spread_consensus)
+            - book_dispersion (alias of home_spread_dispersion)
     """
     if preds_df is None or preds_df.empty:
         logger.warning("[market_ensemble] preds_df is empty; returning unchanged.")
@@ -385,7 +391,6 @@ def apply_market_ensemble(
     merged["spread_prob"] = spread_probs
 
     # 2) Moneyline-derived win prob is already in home_ml_prob_consensus
-    #    (possibly NaN)
     # 3) Combine them
     def _choose_market_prob(row) -> Optional[float]:
         sp = row.get("spread_prob", None)
@@ -476,6 +481,15 @@ def apply_market_ensemble(
         )
     ]
 
+    # ------------------------------------------------------------------
+    # Backwards-compatibility aliases for edge_picker.py, etc.
+    # ------------------------------------------------------------------
+    if "home_spread_consensus" in merged.columns and "consensus_close" not in merged.columns:
+        merged["consensus_close"] = merged["home_spread_consensus"]
+
+    if "home_spread_dispersion" in merged.columns and "book_dispersion" not in merged.columns:
+        merged["book_dispersion"] = merged["home_spread_dispersion"]
+
     return merged
 
 
@@ -511,7 +525,6 @@ def _find_latest_snapshot_csv(
     candidates = glob.glob(pattern)
     if not candidates:
         return None
-    # Sort by filename (often timestamp) or mtime
     candidates.sort()
     latest = candidates[-1]
     return latest
@@ -575,14 +588,20 @@ def apply_market_adjustment(
             "Proceeding with model-only predictions.",
             snapshot_type,
         )
-        # Write out a copy of preds with explicit *_model columns for consistency
         preds_out = preds.copy()
+
+        # Add *_model copies and compatibility columns so edge_picker doesn't break
         if "home_win_prob" in preds_out.columns:
             preds_out["home_win_prob_model"] = preds_out["home_win_prob"]
         if "fair_spread" in preds_out.columns:
             preds_out["fair_spread_model"] = preds_out["fair_spread"]
         if "fair_total" in preds_out.columns:
             preds_out["fair_total_model"] = preds_out["fair_total"]
+
+        if "consensus_close" not in preds_out.columns:
+            preds_out["consensus_close"] = np.nan
+        if "book_dispersion" not in preds_out.columns:
+            preds_out["book_dispersion"] = np.nan
 
         if output_csv_path is None:
             base, ext = os.path.splitext(predictions_csv_path)
