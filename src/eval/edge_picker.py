@@ -71,6 +71,26 @@ COVER_PROB_ALPHA = 0.25   # slope of the logistic; tune via backtests
 
 
 # ---------------------------------------------------------------------------
+# Shared merge_key helper (for run_daily import compatibility)
+# ---------------------------------------------------------------------------
+
+def _merge_key(home_team: str, away_team: str, game_date: str) -> str:
+    """
+    Build a canonical merge_key from home_team, away_team, and game_date.
+
+    This mirrors the convention used elsewhere in the codebase:
+        merge_key = lower(home_team) + "__" + lower(away_team) + "__" + game_date
+    """
+    return (
+        str(home_team).strip().lower()
+        + "__"
+        + str(away_team).strip().lower()
+        + "__"
+        + str(game_date)
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
