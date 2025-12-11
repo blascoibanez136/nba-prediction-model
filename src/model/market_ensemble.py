@@ -2,7 +2,28 @@
 Market-aware ensemble for NBA Pro-Lite / Elite.
 
 This module is responsible for blending our model-based predictions with
-market information from The Odds API (normalized via src/ingest/odds_normalizer.py).
+market information from The Odds API.
+
+It supports TWO odds formats:
+
+1) NORMALIZED FORMAT (from src/ingest/odds_normalizer.py)
+   Columns like:
+       - merge_key
+       - market ("spreads", "totals", "h2h")
+       - side ("home", "away", "over", "under")
+       - point (numeric line)
+       - price (American odds)
+       - snapshot_type ("open", "mid", "close")
+
+2) WIDE SNAPSHOT FORMAT (from src/ingest/odds_snapshots.py)
+   Columns like:
+       - merge_key
+       - book
+       - ml_home, ml_away
+       - spread_home_point, spread_home_price
+       - spread_away_point, spread_away_price
+       - total_point, total_over_price, total_under_price
+       - snapshot_type
 
 It provides:
     - apply_market_ensemble(preds_df, odds_df, ...)
@@ -183,17 +204,134 @@ def compute_dispersion_weight(
 # Odds aggregation helpers
 # ---------------------------------------------------------------------------
 
-def aggregate_market_from_normalized_odds(
+def _aggregate_from_normalized(odds_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate market data when odds_df is in normalized format with
+    'market', 'side', 'point', and 'price' columns.
+    """
+    df = odds_df.copy()
+
+    # Normalize text columns
+    df["market"] = df["market"].astype(str).str.lower()
+    df["side"] = df["side"].astype(str).str.lower()
+
+    # --- Spreads (home side) ---
+    spreads = df[(df["market"] == "spreads") & (df["side"] == "home")]
+    if not spreads.empty:
+        spread_stats = (
+            spreads.groupby("merge_key")["point"]
+            .agg(["mean", "std"])
+            .rename(columns={"mean": "home_spread_consensus", "std": "home_spread_dispersion"})
+            .reset_index()
+        )
+    else:
+        spread_stats = pd.DataFrame(columns=["merge_key", "home_spread_consensus", "home_spread_dispersion"])
+
+    # --- Totals (use Over line as the reference total) ---
+    totals = df[(df["market"] == "totals") & (df["side"] == "over")]
+    if not totals.empty:
+        totals_stats = (
+            totals.groupby("merge_key")["point"]
+            .mean()
+            .rename("total_consensus")
+            .reset_index()
+        )
+    else:
+        totals_stats = pd.DataFrame(columns=["merge_key", "total_consensus"])
+
+    # --- Moneyline (home team) ---
+    h2h = df[(df["market"] == "h2h") & (df["side"] == "home")]
+    if not h2h.empty:
+        h2h = h2h.copy()
+        h2h["prob"] = h2h["price"].apply(american_to_prob)
+        ml_stats = (
+            h2h.groupby("merge_key")["prob"]
+            .mean()
+            .rename("home_ml_prob_consensus")
+            .reset_index()
+        )
+    else:
+        ml_stats = pd.DataFrame(columns=["merge_key", "home_ml_prob_consensus"])
+
+    out = spread_stats.merge(totals_stats, on="merge_key", how="outer")
+    out = out.merge(ml_stats, on="merge_key", how="outer")
+
+    return out
+
+
+def _aggregate_from_wide(odds_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate market data when odds_df is in wide snapshot format with columns like:
+        - spread_home_point
+        - total_point
+        - ml_home
+
+    We compute:
+        - home_spread_consensus  = mean(spread_home_point) per merge_key
+        - home_spread_dispersion = std(spread_home_point) per merge_key
+        - total_consensus        = mean(total_point) per merge_key
+        - home_ml_prob_consensus = mean(american_to_prob(ml_home)) per merge_key
+    """
+    df = odds_df.copy()
+
+    # --- Spreads ---
+    if "spread_home_point" in df.columns:
+        spread_stats = (
+            df.groupby("merge_key")["spread_home_point"]
+            .agg(["mean", "std"])
+            .rename(columns={"mean": "home_spread_consensus", "std": "home_spread_dispersion"})
+            .reset_index()
+        )
+    else:
+        spread_stats = pd.DataFrame(columns=["merge_key", "home_spread_consensus", "home_spread_dispersion"])
+
+    # --- Totals ---
+    if "total_point" in df.columns:
+        totals_stats = (
+            df.groupby("merge_key")["total_point"]
+            .mean()
+            .rename("total_consensus")
+            .reset_index()
+        )
+    else:
+        totals_stats = pd.DataFrame(columns=["merge_key", "total_consensus"])
+
+    # --- Moneyline (home) ---
+    if "ml_home" in df.columns:
+        ml_df = df[["merge_key", "ml_home"]].copy()
+        ml_df["prob"] = ml_df["ml_home"].apply(american_to_prob)
+        ml_stats = (
+            ml_df.groupby("merge_key")["prob"]
+            .mean()
+            .rename("home_ml_prob_consensus")
+            .reset_index()
+        )
+    else:
+        ml_stats = pd.DataFrame(columns=["merge_key", "home_ml_prob_consensus"])
+
+    out = spread_stats.merge(totals_stats, on="merge_key", how="outer")
+    out = out.merge(ml_stats, on="merge_key", how="outer")
+
+    return out
+
+
+def aggregate_market_from_odds(
     odds_df: pd.DataFrame,
     snapshot_type: str = "close",
 ) -> pd.DataFrame:
     """
-    From normalized odds (see src/ingest/odds_normalizer.py) compute per-game
-    consensus lines and dispersion.
+    Aggregate market data from either normalized or wide snapshot formats.
 
-    Expected columns in odds_df:
-        merge_key, home_team, away_team, game_date,
-        book, market, side, price, point, snapshot_type
+    Expected normalized columns:
+        merge_key, market, side, price, point, snapshot_type
+
+    Expected wide columns:
+        merge_key, book,
+        ml_home, ml_away,
+        spread_home_point, spread_home_price,
+        spread_away_point, spread_away_price,
+        total_point, total_over_price, total_under_price,
+        snapshot_type
 
     Returns one row per merge_key with:
         - home_spread_consensus
@@ -234,58 +372,31 @@ def aggregate_market_from_normalized_odds(
             ]
         )
 
-    # Normalize text columns
-    if "market" in df.columns:
-        df["market"] = df["market"].astype(str).str.lower()
-    if "side" in df.columns:
-        df["side"] = df["side"].astype(str).str.lower()
+    cols = set(df.columns)
 
-    # --- Spreads (home side) ---
-    if {"market", "side", "point"} <= set(df.columns):
-        spreads = df[(df["market"] == "spreads") & (df["side"] == "home")]
-        spread_stats = (
-            spreads.groupby("merge_key")["point"]
-            .agg(["mean", "std"])
-            .rename(columns={"mean": "home_spread_consensus", "std": "home_spread_dispersion"})
-            .reset_index()
-        )
-    else:
-        spread_stats = pd.DataFrame(columns=["merge_key", "home_spread_consensus", "home_spread_dispersion"])
+    # NORMALIZED FORMAT
+    if {"market", "side", "point"} <= cols:
+        logger.info("[market_ensemble] Aggregating market data from NORMALIZED format.")
+        return _aggregate_from_normalized(df)
 
-    # --- Totals (use Over line as the reference total) ---
-    if {"market", "side", "point"} <= set(df.columns):
-        totals = df[(df["market"] == "totals") & (df["side"] == "over")]
-        totals_stats = (
-            totals.groupby("merge_key")["point"]
-            .mean()
-            .rename("total_consensus")
-            .reset_index()
-        )
-    else:
-        totals_stats = pd.DataFrame(columns=["merge_key", "total_consensus"])
+    # WIDE SNAPSHOT FORMAT
+    if "spread_home_point" in cols or "total_point" in cols or "ml_home" in cols:
+        logger.info("[market_ensemble] Aggregating market data from WIDE snapshot format.")
+        return _aggregate_from_wide(df)
 
-    # --- Moneyline (home team) ---
-    if {"market", "side", "price"} <= set(df.columns):
-        h2h = df[(df["market"] == "h2h") & (df["side"] == "home")]
-        if not h2h.empty:
-            h2h = h2h.copy()
-            h2h["prob"] = h2h["price"].apply(american_to_prob)
-            ml_stats = (
-                h2h.groupby("merge_key")["prob"]
-                .mean()
-                .rename("home_ml_prob_consensus")
-                .reset_index()
-            )
-        else:
-            ml_stats = pd.DataFrame(columns=["merge_key", "home_ml_prob_consensus"])
-    else:
-        ml_stats = pd.DataFrame(columns=["merge_key", "home_ml_prob_consensus"])
-
-    # Merge all stats
-    out = spread_stats.merge(totals_stats, on="merge_key", how="outer")
-    out = out.merge(ml_stats, on="merge_key", how="outer")
-
-    return out
+    logger.warning(
+        "[market_ensemble] Odds DataFrame does not match expected normalized or wide formats; "
+        "no market aggregation will be applied."
+    )
+    return pd.DataFrame(
+        columns=[
+            "merge_key",
+            "home_spread_consensus",
+            "home_spread_dispersion",
+            "total_consensus",
+            "home_ml_prob_consensus",
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +426,7 @@ def apply_market_ensemble(
             - fair_spread
             - fair_total
     odds_df : DataFrame
-        Normalized odds CSV loaded as DataFrame.
+        Odds data, either in normalized or wide snapshot format.
     snapshot_type : str, optional
         Which snapshot to use (default "close").
     spread_to_prob_slope : float, optional
@@ -367,7 +478,7 @@ def apply_market_ensemble(
         )
 
     # Aggregate market features
-    market = aggregate_market_from_normalized_odds(odds_df, snapshot_type=snapshot_type)
+    market = aggregate_market_from_odds(odds_df, snapshot_type=snapshot_type)
 
     merged = preds.merge(market, on="merge_key", how="left", suffixes=("", "_mkt"))
 
@@ -390,7 +501,7 @@ def apply_market_ensemble(
     )
     merged["spread_prob"] = spread_probs
 
-    # 2) Moneyline-derived win prob is already in home_ml_prob_consensus
+    # 2) Moneyline-derived win prob from home_ml_prob_consensus (possibly NaN)
     # 3) Combine them
     def _choose_market_prob(row) -> Optional[float]:
         sp = row.get("spread_prob", None)
@@ -503,7 +614,7 @@ def apply_market_ensemble_from_csv(
     **kwargs,
 ) -> pd.DataFrame:
     """
-    Convenience wrapper: load predictions & normalized odds from CSV,
+    Convenience wrapper: load predictions & odds from CSV,
     apply the ensemble, and return the blended DataFrame.
     """
     preds = pd.read_csv(preds_csv_path)
@@ -517,7 +628,7 @@ def _find_latest_snapshot_csv(
     snapshot_type: str = "close",
 ) -> Optional[str]:
     """
-    Find the most recent normalized snapshot CSV for the given snapshot_type.
+    Find the most recent snapshot CSV for the given snapshot_type.
     Files are expected to look like:
         {snapshot_type}_YYYYMMDD_HHMMSS.csv
     """
@@ -544,7 +655,7 @@ def apply_market_adjustment(
 
     Behavior:
         - Load predictions CSV.
-        - Load normalized odds CSV:
+        - Load odds CSV:
             - If odds_csv_path is provided, use that.
             - Otherwise, find latest {snapshot_type}_*.csv in snapshot_dir.
         - If odds data is available, apply the market ensemble.
@@ -556,10 +667,10 @@ def apply_market_adjustment(
     predictions_csv_path : str
         Path to the base model predictions CSV.
     odds_csv_path : str, optional
-        Path to a normalized odds CSV. If None, we try to auto-discover
-        the latest snapshot in snapshot_dir.
+        Path to an odds CSV (normalized or wide snapshot). If None, we try
+        to auto-discover the latest snapshot in snapshot_dir.
     snapshot_dir : str
-        Directory containing normalized snapshot CSVs.
+        Directory containing snapshot CSVs.
     snapshot_type : str
         "open", "mid", or "close". Default is "close".
     output_csv_path : str, optional
@@ -584,7 +695,7 @@ def apply_market_adjustment(
 
     if odds_csv_path is None or not os.path.exists(odds_csv_path):
         logger.warning(
-            "[market_ensemble] No normalized odds CSV found (snapshot_type=%s). "
+            "[market_ensemble] No odds CSV found (snapshot_type=%s). "
             "Proceeding with model-only predictions.",
             snapshot_type,
         )
@@ -610,7 +721,7 @@ def apply_market_adjustment(
         preds_out.to_csv(output_csv_path, index=False)
         return output_csv_path
 
-    logger.info("[market_ensemble] Using normalized odds from %s", odds_csv_path)
+    logger.info("[market_ensemble] Using odds from %s", odds_csv_path)
     odds = pd.read_csv(odds_csv_path)
 
     blended = apply_market_ensemble(
