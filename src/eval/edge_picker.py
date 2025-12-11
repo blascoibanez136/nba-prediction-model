@@ -1,345 +1,206 @@
 """
-Edge Finder & Pick Sheet
-------------------------
-Reads today's model predictions (market-adjusted if available) and either:
-  A) the latest CLOSE snapshot from The Odds API (preferred; has prices), or
-  B) the dispersion/consensus file (outputs/odds_dispersion_latest.csv; no prices)
+Edge picker for NBA Pro-Lite / Elite.
 
-Builds a composite merge key to join predictions and odds reliably across ID systems:
-  merge_key = norm(home_team) + "__" + norm(away_team) + "__" + game_date (UTC)
+Reads the latest market-adjusted predictions CSV, joins it with the latest
+CLOSE odds snapshot, evaluates edges on spreads, and emits a pick sheet:
 
-Outputs:
-- outputs/picks_<YYYY-MM-DD>.csv
-- picks_report.html
+    outputs/picks_YYYY-MM-DD.csv
 
-Filtering (priced picks only):
-- EDGE_THRESHOLD  : minimum absolute edge in points (float, default 0.0)
-- KELLY_THRESHOLD : minimum Kelly fraction (float, default 0.0)
-- BOOK_WHITELIST  : optional comma-separated list of book keys (e.g. "draftkings,fanduel")
+with one recommended spread pick per game (or zero if no edges qualify).
 
-Run locally:
-    PYTHONPATH=. python src/eval/edge_picker.py
+Columns in the pick sheet:
+
+    - game_id
+    - game_date
+    - book
+    - market_side             ("home" or "away")
+    - market_price            (American odds for the chosen side)
+    - book_spread_home        (home team spread at that book)
+    - model_fair_spread       (our fair spread for the home team; blended)
+    - model_edge_pts          (edge in points for the chosen side)
+    - book_implied_prob       (book's implied probability from the price)
+    - model_side_prob         (our estimated win/cover probability)
+    - suggested_kelly         (Kelly fraction of bankroll)
+    - suggested_stake_units   (stake in abstract "units")
+    - consensus_close         (consensus closing home spread across books)
+    - book_dispersion         (std dev of home spreads across books)
+
+The selection logic is conservative but configurable via the constants in
+the CONFIG section below.
 """
 
 from __future__ import annotations
 
-import os
+import argparse
 import glob
-from datetime import date, datetime, timezone
-from typing import List, Dict, Any, Tuple, Optional
+import logging
+import math
+import os
+from dataclasses import dataclass
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 
-SNAP_DIR = "data/_snapshots"
+logger = logging.getLogger(__name__)
 
 
-# -----------------------
-# helpers (normalization)
-# -----------------------
-def _norm_team(s: str) -> str:
-    if not isinstance(s, str):
-        return ""
-    s = s.lower().strip()
-    aliases = {
-        "la clippers": "los angeles clippers",
-        "la lakers": "los angeles lakers",
-        "ny knicks": "new york knicks",
-        # extend as you discover more book/team variations
-    }
-    return aliases.get(s, s)
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+
+OUTPUTS_DIR = "outputs"
+SNAPSHOT_DIR = "data/_snapshots"
+SNAPSHOT_TYPE = "close"
+
+# Edge thresholds
+MIN_EDGE_PTS = 1.5        # minimum edge in points on the chosen side
+MIN_MODEL_PROB = 0.55     # minimum model spread-cover probability
+MIN_KELLY = 0.01          # minimum Kelly fraction to consider a bet
+MAX_KELLY = 0.07          # cap Kelly for sanity
+
+# Kelly -> units translation
+BANKROLL_UNITS = 100.0    # "bankroll" measured in abstract units
+MAX_UNITS = 3.0           # never bet more than this many units on a single play
+
+# Mapping from point edge to cover probability via logistic curve.
+# edge_pts = book_spread_home - fair_spread (for home side).
+# For the chosen side, we use edge_pts >= 0 and:
+#     P(cover) = sigmoid(ALPHA * edge_pts)
+COVER_PROB_ALPHA = 0.25   # slope of the logistic; tune via backtests
 
 
-def _merge_key(home_team: str, away_team: str, game_date: str) -> str:
-    return f"{_norm_team(home_team)}__{_norm_team(away_team)}__{game_date}"
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
+def american_to_prob(odds: float) -> Optional[float]:
+    """
+    Convert American odds to implied probability (single-sided, no-vig).
 
-def _date_utc_from_commence(ts: str) -> str:
-    ts = str(ts)
-    if ts.endswith("Z"):
-        ts = ts.replace("Z", "+00:00")
-    dt = datetime.fromisoformat(ts).astimezone(timezone.utc)
-    return dt.strftime("%Y-%m-%d")
+    Returns None if odds is missing or invalid.
+    """
+    if odds is None:
+        return None
 
-
-# -----------------------
-# odds price/prob helpers
-# -----------------------
-def _american_to_prob(american: float) -> float:
     try:
-        a = float(american)
-    except Exception:
-        return np.nan
-    if a > 0:
-        return 100.0 / (a + 100.0)
+        o = float(odds)
+    except (TypeError, ValueError):
+        return None
+
+    if o == 0.0 or math.isnan(o):
+        return None
+
+    if o > 0:
+        return 100.0 / (o + 100.0)
     else:
-        return (-a) / ((-a) + 100.0)
+        return -o / (-o + 100.0)
 
 
-def _price_to_prob(price: float) -> float:
+def cover_prob_from_edge(edge_pts: float, alpha: float = COVER_PROB_ALPHA) -> float:
     """
-    Convert a price (American or decimal) to implied probability.
+    Map a point edge (>= 0) to an approximate spread-cover probability
+    using a logistic curve:
 
-    Heuristics:
-      - If |p| >= 10, treat as American odds (e.g. -110, +150).
-      - If 1.01 <= p <= 10, treat as decimal odds (e.g. 1.90).
-      - Otherwise, fallback to American.
+        P(cover) = sigmoid(alpha * edge_pts)
+
+    where:
+        edge_pts = book_spread_home - fair_spread
+    for the chosen side.
+
+    This is a simple, monotonic approximation that can be calibrated later
+    with historical data.
     """
-    if pd.isna(price):
-        return np.nan
-    try:
-        p = float(price)
-    except Exception:
-        return np.nan
-
-    if abs(p) >= 10:
-        # American odds
-        return _american_to_prob(p)
-    elif 1.01 <= p <= 10.0:
-        # Decimal odds
-        return 1.0 / p
-    else:
-        # Fallback: treat as American
-        return _american_to_prob(p)
+    if edge_pts <= 0 or math.isnan(edge_pts):
+        return 0.5
+    z = alpha * edge_pts
+    return 1.0 / (1.0 + math.exp(-z))
 
 
-def _kelly_fraction(p: float, price: float) -> float:
+def _find_latest_predictions_file(outputs_dir: str = OUTPUTS_DIR) -> Optional[str]:
     """
-    Kelly stake fraction for a single outcome with a given price.
+    Find the latest predictions_*_market.csv file in the outputs directory.
 
-    We support both American and decimal odds using the same heuristic
-    as _price_to_prob:
-
-      - If |price| >= 10, treat as American.
-      - If 1.01 <= price <= 10, treat as decimal.
+    Files are expected to look like:
+        predictions_YYYY-MM-DD_market.csv
     """
-    if pd.isna(price):
-        return 0.0
-    try:
-        p = float(p)
-        pr = float(price)
-    except Exception:
-        return 0.0
-
-    if p <= 0.0 or p >= 1.0:
-        return 0.0
-
-    # Determine 'b' = net odds (profit per 1 unit staked)
-    if abs(pr) >= 10:
-        # American odds
-        if pr > 0:
-            b = pr / 100.0
-        else:
-            b = 100.0 / abs(pr)
-    elif 1.01 <= pr <= 10.0:
-        # Decimal odds
-        b = pr - 1.0
-    else:
-        # Fallback, treat as American
-        if pr > 0:
-            b = pr / 100.0
-        else:
-            b = 100.0 / abs(pr)
-
-    q = 1.0 - p
-    k = (b * p - q) / b
-    return max(0.0, float(k))
+    pattern = os.path.join(outputs_dir, "predictions_*_market.csv")
+    candidates = glob.glob(pattern)
+    if not candidates:
+        return None
+    candidates.sort()
+    latest = candidates[-1]
+    return latest
 
 
-# -----------------------
-# predictions & snapshots
-# -----------------------
-def load_predictions_for_today() -> Tuple[str, pd.DataFrame]:
-    today = os.getenv("RUN_DATE") or date.today().strftime("%Y-%m-%d")
-    base = f"outputs/predictions_{today}.csv"
-    market = f"outputs/predictions_{today}_market.csv"
-
-    # Prefer market-adjusted file if present
-    if os.path.exists(market):
-        path = market
-    else:
-        path = base
-
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"No predictions found for {today} (looked for {path})")
-
-    df = pd.read_csv(path)
-
-    # Ensure basic columns
-    required_cols = {"home_team", "away_team", "game_date"}
-    missing_basic = required_cols - set(df.columns)
-    if missing_basic:
-        raise ValueError(f"predictions missing columns: {missing_basic}")
-
-    # Ensure we have win prob + fair_spread
-    if "home_win_prob" not in df.columns and "home_win_prob_market" not in df.columns:
-        raise ValueError("predictions missing 'home_win_prob' / 'home_win_prob_market'.")
-
-    if "fair_spread" not in df.columns and "fair_spread_market" not in df.columns:
-        raise ValueError("predictions missing 'fair_spread' / 'fair_spread_market'.")
-
-    # Build merge_key if missing
-    if "merge_key" not in df.columns:
-        df["merge_key"] = df.apply(
-            lambda r: _merge_key(r["home_team"], r["away_team"], r["game_date"]), axis=1
-        )
-
-    # Ensure game_id exists (even synthetic)
-    if "game_id" not in df.columns:
-        df["game_id"] = df["merge_key"]
-
-    return today, df
-
-
-def _latest_close_snapshot() -> Optional[str]:
-    os.makedirs(SNAP_DIR, exist_ok=True)
-    files = sorted(glob.glob(os.path.join(SNAP_DIR, "close_*.csv")))
-    return files[-1] if files else None
-
-
-# -----------------------
-# flatten spreads (snapshot path)
-# -----------------------
-def flatten_spreads_from_snapshot(csv_path: str) -> pd.DataFrame:
+def _extract_run_date_from_predictions_path(path: str) -> str:
     """
-    Input: normalized snapshot CSV produced by src.ingest.odds_normalizer
-           with one row per (game, bookmaker).
-
-    Output: tidy spreads with teams, prices, and derived game_date + merge_key:
-        columns = [game_id, book, team, spread, price,
-                   home_team, away_team, game_date, merge_key]
+    Given a path like:
+        outputs/predictions_2025-12-11_market.csv
+    return:
+        "2025-12-11"
     """
-    raw = pd.read_csv(csv_path)
-    rows: List[Dict[str, Any]] = []
-
-    if raw.empty:
-        return pd.DataFrame(
-            columns=[
-                "game_id",
-                "book",
-                "team",
-                "spread",
-                "price",
-                "home_team",
-                "away_team",
-                "game_date",
-                "merge_key",
-            ]
-        )
-
-    for _, row in raw.iterrows():
-        game_id = str(row.get("game_id") or "")
-        home = row.get("home_team")
-        away = row.get("away_team")
-        book = row.get("book")
-        game_date = row.get("game_date")
-        commence = row.get("commence_time")
-
-        if pd.isna(game_date) and pd.notna(commence):
-            game_date = _date_utc_from_commence(str(commence))
-
-        if not home or not away or not game_date:
-            continue
-
-        mk = _merge_key(home, away, str(game_date))
-
-        # Home side
-        sp_home = row.get("spread_home_point")
-        pr_home = row.get("spread_home_price")
-        if not pd.isna(sp_home):
-            rows.append(
-                {
-                    "game_id": game_id,
-                    "book": str(book),
-                    "team": home,
-                    "spread": float(sp_home),
-                    "price": float(pr_home) if not pd.isna(pr_home) else np.nan,
-                    "home_team": home,
-                    "away_team": away,
-                    "game_date": str(game_date),
-                    "merge_key": mk,
-                }
-            )
-
-        # Away side
-        sp_away = row.get("spread_away_point")
-        pr_away = row.get("spread_away_price")
-        if not pd.isna(sp_away):
-            rows.append(
-                {
-                    "game_id": game_id,
-                    "book": str(book),
-                    "team": away,
-                    "spread": float(sp_away),
-                    "price": float(pr_away) if not pd.isna(pr_away) else np.nan,
-                    "home_team": home,
-                    "away_team": away,
-                    "game_date": str(game_date),
-                    "merge_key": mk,
-                }
-            )
-
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df["game_id"] = df["game_id"].astype(str)
-    return df
+    base = os.path.basename(path)
+    # predictions_YYYY-MM-DD_market.csv
+    without_prefix = base.replace("predictions_", "")
+    date_part = without_prefix.split("_market")[0]
+    return date_part
 
 
-def build_side_table(spreads_df: pd.DataFrame) -> pd.DataFrame:
+def _find_close_snapshot_for_date(
+    run_date: str,
+    snapshot_dir: str = SNAPSHOT_DIR,
+    snapshot_type: str = SNAPSHOT_TYPE,
+) -> Optional[str]:
     """
-    Produce two rows per book/game: HOME and AWAY sides from home perspective,
-    carrying merge_key for a reliable join with predictions.
+    Find the latest CLOSE snapshot CSV for a given run_date.
+
+    Snapshots are expected to look like:
+        {snapshot_type}_YYYYMMDD_HHMMSS.csv
     """
-    if spreads_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "merge_key",
-                "game_id",
-                "book",
-                "home_team",
-                "away_team",
-                "game_date",
-                "market_side",
-                "book_spread_home",
-                "market_price",
-            ]
-        )
-
-    home_rows = spreads_df[spreads_df["team"] == spreads_df["home_team"]].copy()
-    away_rows = spreads_df[spreads_df["team"] == spreads_df["away_team"]].copy()
-
-    home_rows["market_side"] = "HOME"
-    home_rows["book_spread_home"] = home_rows["spread"]
-    home_rows["market_price"] = home_rows["price"]
-
-    away_rows["market_side"] = "AWAY"
-    away_rows["book_spread_home"] = -away_rows["spread"]
-    away_rows["market_price"] = away_rows["price"]
-
-    merged = pd.concat([home_rows, away_rows], ignore_index=True, sort=False)
-    keep = [
-        "merge_key",
-        "game_id",
-        "book",
-        "home_team",
-        "away_team",
-        "game_date",
-        "market_side",
-        "book_spread_home",
-        "market_price",
-    ]
-    return merged[keep].dropna(subset=["book_spread_home"])
+    ymd = run_date.replace("-", "")
+    pattern = os.path.join(snapshot_dir, f"{snapshot_type}_{ymd}_*.csv")
+    candidates = glob.glob(pattern)
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[-1]
 
 
-# -----------------------
-# picks: priced (snapshot) or reduced (dispersion)
-# -----------------------
-def make_picks_with_prices(preds: pd.DataFrame, side_table: pd.DataFrame) -> pd.DataFrame:
+@dataclass
+class PickConfig:
+    min_edge_pts: float = MIN_EDGE_PTS
+    min_model_prob: float = MIN_MODEL_PROB
+    min_kelly: float = MIN_KELLY
+    max_kelly: float = MAX_KELLY
+    alpha: float = COVER_PROB_ALPHA
+    bankroll_units: float = BANKROLL_UNITS
+    max_units: float = MAX_UNITS
+
+
+# ---------------------------------------------------------------------------
+# Core pick generation
+# ---------------------------------------------------------------------------
+
+def generate_spread_picks(
+    preds_df: pd.DataFrame,
+    odds_df: pd.DataFrame,
+    config: PickConfig,
+) -> pd.DataFrame:
     """
-    Full picks (with price, implied prob, Kelly stake).
-    Join on merge_key to avoid cross-provider ID mismatches.
+    Generate spread picks by comparing our fair spread to each book's line.
+
+    For each game/book, we:
+        - compute home_edge_pts = book_spread_home - fair_spread
+        - compute away_edge_pts = -home_edge_pts
+        - choose the side (home/away) with the larger positive edge
+        - map edge_pts -> model_side_prob via logistic
+        - compare model_side_prob to book implied probability from the price
+        - compute Kelly fraction
+        - filter by thresholds in config
+    We then keep at most ONE pick per game (the highest-Kelly candidate).
     """
-    if side_table.empty:
+    if preds_df.empty or odds_df.empty:
         return pd.DataFrame(
             columns=[
                 "game_id",
@@ -359,99 +220,166 @@ def make_picks_with_prices(preds: pd.DataFrame, side_table: pd.DataFrame) -> pd.
             ]
         )
 
-    # Merge odds with predictions via merge_key
-    base_cols = [
-        "merge_key",
-        "game_id",
-        "game_date",
-        "home_team",
-        "away_team",
-        "fair_spread",
-        "consensus_close",
-        "book_dispersion",
-    ]
-    if "fair_spread_market" in preds.columns:
-        base_cols.append("fair_spread_market")
-    if "home_win_prob_market" in preds.columns:
-        base_cols.append("home_win_prob_market")
-    if "home_win_prob" in preds.columns:
-        base_cols.append("home_win_prob")
+    # Merge predictions with CLOSE snapshot odds on merge_key + teams + date
+    merge_cols = ["merge_key", "game_date", "home_team", "away_team"]
+    missing_cols = [c for c in merge_cols if c not in preds_df.columns or c not in odds_df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing merge columns in preds/odds: {missing_cols}")
 
-    df = side_table.merge(
-        preds[base_cols].drop_duplicates("merge_key"),
-        on="merge_key",
-        how="left",
+    merged = odds_df.merge(
+        preds_df,
+        on=merge_cols,
+        how="inner",
         suffixes=("", "_pred"),
     )
 
-    # Choose market-adjusted or raw model spread
-    if "fair_spread_market" in df.columns and df["fair_spread_market"].notna().any():
-        df["model_fair_spread"] = pd.to_numeric(df["fair_spread_market"], errors="coerce")
-    else:
-        df["model_fair_spread"] = pd.to_numeric(df["fair_spread"], errors="coerce")
+    if merged.empty:
+        logger.warning("[edge_picker] No rows after merging preds and odds.")
+        return pd.DataFrame(
+            columns=[
+                "game_id",
+                "game_date",
+                "book",
+                "market_side",
+                "market_price",
+                "book_spread_home",
+                "model_fair_spread",
+                "model_edge_pts",
+                "book_implied_prob",
+                "model_side_prob",
+                "suggested_kelly",
+                "suggested_stake_units",
+                "consensus_close",
+                "book_dispersion",
+            ]
+        )
 
-    # Choose market-adjusted or raw win prob
-    if "home_win_prob_market" in df.columns and df["home_win_prob_market"].notna().any():
-        use_wp = pd.to_numeric(df["home_win_prob_market"], errors="coerce")
-    else:
-        use_wp = pd.to_numeric(df["home_win_prob"], errors="coerce")
+    # Ensure numeric types for spread/price columns
+    for col in [
+        "spread_home_point",
+        "spread_away_point",
+        "spread_home_price",
+        "spread_away_price",
+    ]:
+        if col in merged.columns:
+            merged[col] = pd.to_numeric(merged[col], errors="coerce")
 
-    # Model side prob from home perspective
-    df["model_side_prob"] = np.where(
-        df["market_side"].eq("HOME"),
-        use_wp,
-        1.0 - use_wp,
+    candidates: List[dict] = []
+
+    for _, row in merged.iterrows():
+        line_home = row.get("spread_home_point", np.nan)
+        price_home = row.get("spread_home_price", np.nan)
+        price_away = row.get("spread_away_price", np.nan)
+        fair_spread = row.get("fair_spread", np.nan)  # blended fair spread for home
+
+        if pd.isna(line_home) or pd.isna(fair_spread):
+            continue
+
+        # Edge in points from home perspective
+        home_edge_pts = line_home - fair_spread
+        away_edge_pts = -home_edge_pts
+
+        best_side: Optional[str] = None
+        edge_pts: float = 0.0
+        market_price: Optional[float] = None
+
+        # Decide which side (if any) has enough edge in points
+        if home_edge_pts >= config.min_edge_pts and home_edge_pts >= away_edge_pts:
+            best_side = "home"
+            edge_pts = float(home_edge_pts)
+            market_price = price_home
+        elif away_edge_pts >= config.min_edge_pts and away_edge_pts > home_edge_pts:
+            best_side = "away"
+            edge_pts = float(away_edge_pts)
+            market_price = price_away
+        else:
+            continue  # no strong edge on either side
+
+        if best_side is None or market_price is None or pd.isna(market_price):
+            continue
+
+        # Model's estimated cover probability for the chosen side
+        model_side_prob = cover_prob_from_edge(edge_pts, alpha=config.alpha)
+        if model_side_prob < config.min_model_prob:
+            continue
+
+        # Book's implied probability from the chosen side's price
+        book_implied_prob = american_to_prob(market_price)
+        if book_implied_prob is None:
+            continue
+
+        # Compute Kelly fraction: k = (p*(b+1) - 1) / b, where b = decimal_odds - 1
+        if market_price > 0:
+            decimal_odds = 1.0 + market_price / 100.0
+        else:
+            decimal_odds = 1.0 + 100.0 / abs(market_price)
+
+        b = decimal_odds - 1.0
+        if b <= 0:
+            continue
+
+        kelly = (model_side_prob * (b + 1.0) - 1.0) / b
+        if kelly <= config.min_kelly:
+            continue
+
+        kelly = float(min(kelly, config.max_kelly))
+
+        # Translate Kelly fraction into "units"
+        suggested_units = min(config.max_units, config.bankroll_units * kelly)
+
+        if suggested_units <= 0:
+            continue
+
+        candidates.append(
+            {
+                "game_id": row.get("game_id"),
+                "game_date": row.get("game_date"),
+                "book": row.get("book"),
+                "market_side": best_side,
+                "market_price": market_price,
+                "book_spread_home": line_home,
+                "model_fair_spread": fair_spread,
+                "model_edge_pts": edge_pts,
+                "book_implied_prob": book_implied_prob,
+                "model_side_prob": model_side_prob,
+                "suggested_kelly": kelly,
+                "suggested_stake_units": suggested_units,
+                "consensus_close": row.get("consensus_close", np.nan),
+                "book_dispersion": row.get("book_dispersion", np.nan),
+            }
+        )
+
+    if not candidates:
+        return pd.DataFrame(
+            columns=[
+                "game_id",
+                "game_date",
+                "book",
+                "market_side",
+                "market_price",
+                "book_spread_home",
+                "model_fair_spread",
+                "model_edge_pts",
+                "book_implied_prob",
+                "model_side_prob",
+                "suggested_kelly",
+                "suggested_stake_units",
+                "consensus_close",
+                "book_dispersion",
+            ]
+        )
+
+    # From the candidate list, select the best (highest Kelly) per game_id
+    candidates_df = pd.DataFrame(candidates)
+    picks = (
+        candidates_df.sort_values("suggested_kelly", ascending=False)
+        .groupby("game_id", as_index=False)
+        .head(1)
+        .reset_index(drop=True)
     )
 
-    # Implied probability from market price
-    df["market_price"] = pd.to_numeric(df["market_price"], errors="coerce")
-    df["book_implied_prob"] = df["market_price"].apply(_price_to_prob)
-
-    # Edge in points (model - market)
-    df["model_edge_pts"] = df["model_fair_spread"] - df["book_spread_home"]
-
-    # Kelly (capped)
-    k_raw = [
-        _kelly_fraction(p, price if not pd.isna(price) else np.nan)
-        if not pd.isna(price) and not pd.isna(p)
-        else 0.0
-        for p, price in zip(df["model_side_prob"], df["market_price"])
-    ]
-    df["kelly_raw"] = k_raw
-    kelly_cap = float(os.getenv("KELLY_CAP", "0.25"))  # default cap 25%
-    df["suggested_kelly"] = np.clip(df["kelly_raw"], 0.0, kelly_cap)
-    bankroll_units = float(os.getenv("BANKROLL_UNITS", "100.0"))
-    df["suggested_stake_units"] = df["suggested_kelly"] * bankroll_units
-
-    # Drop rows where we have no model opinion
-    df = df[
-        df["model_fair_spread"].notna()
-        & df["model_side_prob"].notna()
-    ].copy()
-
-    # Optional book whitelist
-    book_whitelist = os.getenv("BOOK_WHITELIST")
-    if book_whitelist:
-        wl = [b.strip().lower() for b in book_whitelist.split(",") if b.strip()]
-        if wl:
-            df = df[df["book"].str.lower().isin(wl)].copy()
-
-    # Edge / Kelly thresholds
-    edge_thresh = float(os.getenv("EDGE_THRESHOLD", "0.0"))
-    kelly_thresh = float(os.getenv("KELLY_THRESHOLD", "0.0"))
-
-    if edge_thresh > 0.0 or kelly_thresh > 0.0:
-        df = df[
-            (df["model_edge_pts"].abs() >= edge_thresh)
-            & (df["suggested_kelly"] >= kelly_thresh)
-        ].copy()
-
-    keep = [
-        "game_id",
-        "game_date",
-        "book",
-        "market_side",
-        "market_price",
+    # Round for readability
+    for col in [
         "book_spread_home",
         "model_fair_spread",
         "model_edge_pts",
@@ -461,161 +389,145 @@ def make_picks_with_prices(preds: pd.DataFrame, side_table: pd.DataFrame) -> pd.
         "suggested_stake_units",
         "consensus_close",
         "book_dispersion",
+    ]:
+        if col in picks.columns:
+            picks[col] = picks[col].astype(float).round(4)
+
+    return picks[
+        [
+            "game_id",
+            "game_date",
+            "book",
+            "market_side",
+            "market_price",
+            "book_spread_home",
+            "model_fair_spread",
+            "model_edge_pts",
+            "book_implied_prob",
+            "model_side_prob",
+            "suggested_kelly",
+            "suggested_stake_units",
+            "consensus_close",
+            "book_dispersion",
+        ]
     ]
 
-    # Only keep columns that actually exist
-    available = [c for c in keep if c in df.columns]
-    missing = [c for c in keep if c not in df.columns]
 
-    if missing:
-        print(f"[edge_picker] Warning: missing columns in pick sheet output: {missing}")
+# ---------------------------------------------------------------------------
+# Orchestration / CLI
+# ---------------------------------------------------------------------------
 
-    # Sort by Kelly and edge
-    sort_cols = ["suggested_kelly", "model_edge_pts"]
-    for col in sort_cols:
-        if col not in df.columns:
-            raise KeyError(
-                f"[edge_picker] Required column '{col}' not found in DataFrame "
-                f"columns: {list(df.columns)}"
-            )
-
-    out = df[available].sort_values(sort_cols, ascending=[False, False])
-    return out
-
-
-def make_picks_reduced(preds: pd.DataFrame, dispersion: pd.DataFrame) -> pd.DataFrame:
+def main(run_date: Optional[str] = None) -> None:
     """
-    Reduced pick sheet (no prices/stakes). Uses consensus close and dispersion.
+    Entry point used by run_daily.py and CLI.
+
+    Steps:
+        1) Discover latest predictions_*_market.csv if run_date is not provided.
+        2) Resolve run_date from that filename.
+        3) Find CLOSE snapshot CSV for that date.
+        4) Generate spread picks.
+        5) Write outputs/picks_YYYY-MM-DD.csv and picks_report.html.
     """
-    if dispersion is None or dispersion.empty:
-        return pd.DataFrame(
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] [edge_picker] %(message)s",
+    )
+
+    # 1) Resolve predictions file & run date
+    predictions_path = _find_latest_predictions_file()
+    if predictions_path is None:
+        logger.warning("No predictions_*_market.csv files found in %s; no picks generated.", OUTPUTS_DIR)
+        return
+
+    inferred_date = _extract_run_date_from_predictions_path(predictions_path)
+    if run_date is None:
+        run_date = inferred_date
+    else:
+        # If run_date is provided, override the predictions_path if a better match exists
+        candidate_path = os.path.join(OUTPUTS_DIR, f"predictions_{run_date}_market.csv")
+        if os.path.exists(candidate_path):
+            predictions_path = candidate_path
+
+    logger.info("Using predictions file: %s (run_date=%s)", predictions_path, run_date)
+
+    preds = pd.read_csv(predictions_path)
+
+    # 2) Find CLOSE snapshot for run_date
+    snapshot_path = _find_close_snapshot_for_date(run_date)
+    if snapshot_path is None:
+        logger.warning(
+            "No CLOSE snapshot found for %s in %s; picks will not be generated.",
+            run_date,
+            SNAPSHOT_DIR,
+        )
+        picks = pd.DataFrame(
             columns=[
                 "game_id",
-                "home_team",
-                "away_team",
+                "game_date",
+                "book",
+                "market_side",
+                "market_price",
+                "book_spread_home",
                 "model_fair_spread",
-                "consensus_close",
                 "model_edge_pts",
+                "book_implied_prob",
+                "model_side_prob",
+                "suggested_kelly",
+                "suggested_stake_units",
+                "consensus_close",
                 "book_dispersion",
             ]
         )
-
-    # Ensure merge_key in dispersion
-    if "merge_key" not in dispersion.columns:
-        if {"home_team", "away_team", "game_date"}.issubset(dispersion.columns):
-            dispersion = dispersion.copy()
-            dispersion["merge_key"] = dispersion.apply(
-                lambda r: _merge_key(r["home_team"], r["away_team"], r["game_date"]), axis=1
-            )
-        else:
-            return pd.DataFrame(
-                columns=[
-                    "game_id",
-                    "home_team",
-                    "away_team",
-                    "model_fair_spread",
-                    "consensus_close",
-                    "model_edge_pts",
-                    "book_dispersion",
-                ]
-            )
-
-    # Ensure merge_key in preds
-    if "merge_key" not in preds.columns:
-        preds = preds.copy()
-        preds["merge_key"] = preds.apply(
-            lambda r: _merge_key(r["home_team"], r["away_team"], r["game_date"]), axis=1
-        )
-
-    df = preds.merge(
-        dispersion[["merge_key", "consensus_close", "book_dispersion"]],
-        on="merge_key",
-        how="left",
-    )
-
-    # Use market-adjusted spread if present, else model fair_spread
-    if "fair_spread_market" in df.columns and df["fair_spread_market"].notna().any():
-        df["model_fair_spread"] = df["fair_spread_market"]
     else:
-        df["model_fair_spread"] = df["fair_spread"]
+        logger.info("Using CLOSE snapshot: %s", snapshot_path)
+        odds = pd.read_csv(snapshot_path)
 
-    df["model_edge_pts"] = df["model_fair_spread"] - df["consensus_close"]
+        cfg = PickConfig()
+        picks = generate_spread_picks(preds, odds, cfg)
 
-    keep = [
-        "game_id",
-        "home_team",
-        "away_team",
-        "model_fair_spread",
-        "consensus_close",
-        "model_edge_pts",
-        "book_dispersion",
-    ]
-    out = df[keep].dropna(subset=["consensus_close"]).copy()
-    out = out.sort_values(
-        ["model_edge_pts", "book_dispersion"], ascending=[False, True]
-    )
-    return out
+    # 3) Write picks CSV
+    picks_csv_path = os.path.join(OUTPUTS_DIR, f"picks_{run_date}.csv")
+    picks.to_csv(picks_csv_path, index=False)
+    logger.info("Wrote picks CSV to %s (%d rows).", picks_csv_path, len(picks))
 
-
-# -----------------------
-# HTML report
-# -----------------------
-def render_html(picks: pd.DataFrame, out_html: str, today: str):
+    # 4) Write simple HTML report
+    html_path = "picks_report.html"
     if picks.empty:
-        html = (
-            f"<html><body><h1>Picks for {today}</h1>"
-            f"<p>No edges today.</p></body></html>"
-        )
-        open(out_html, "w").write(html)
-        return
-    floats = {col: "{:.4f}".format for col in picks.select_dtypes(include=[float]).columns}
-    table_html = picks.to_html(index=False, formatters=floats)
-    html = f"""
-    <html><head><meta charset="utf-8">
-    <style>
-      body {{ font-family: system-ui, sans-serif; padding: 16px; }}
-      table {{ border-collapse: collapse; }}
-      th, td {{ padding: 6px 8px; border: 1px solid #ddd; }}
-      th {{ background: #f6f6f6; }}
-    </style>
-    </head><body>
-      <h1>Picks for {today}</h1>
-      <p>If prices are unavailable, this report shows a reduced pick sheet using consensus close (no stakes).</p>
-      {table_html}
-    </body></html>
-    """
-    open(out_html, "w").write(html)
-
-
-# -----------------------
-# main
-# -----------------------
-def main():
-    today, preds = load_predictions_for_today()
-    os.makedirs("outputs", exist_ok=True)
-
-    # Prefer snapshot (priced picks). If missing, fallback to dispersion (reduced picks).
-    snap = _latest_close_snapshot()
-    disp_path = "outputs/odds_dispersion_latest.csv"
-    have_snap = bool(snap and os.path.exists(snap))
-    have_disp = os.path.exists(disp_path)
-
-    if have_snap:
-        spreads = flatten_spreads_from_snapshot(snap)
-        side_table = build_side_table(spreads)
-        picks = make_picks_with_prices(preds, side_table)
-    elif have_disp:
-        disp = pd.read_csv(disp_path)
-        picks = make_picks_reduced(preds, disp)
+        html_content = f"<html><body><h1>Picks for {run_date}</h1><p>No edges today.</p></body></html>"
     else:
-        print("No CLOSE snapshot or dispersion file available; writing empty pick sheet.")
-        picks = pd.DataFrame()
+        # Basic HTML table for quick viewing
+        html_content = [
+            "<html><body>",
+            f"<h1>Picks for {run_date}</h1>",
+            "<table border='1' cellpadding='4' cellspacing='0'>",
+            "<tr>",
+        ]
+        for col in picks.columns:
+            html_content.append(f"<th>{col}</th>")
+        html_content.append("</tr>")
 
-    out_csv = f"outputs/picks_{today}.csv"
-    picks.to_csv(out_csv, index=False)
-    print(f"✅ Wrote {out_csv} ({len(picks)} rows)")
-    render_html(picks, "picks_report.html", today)
+        for _, row in picks.iterrows():
+            html_content.append("<tr>")
+            for col in picks.columns:
+                html_content.append(f"<td>{row[col]}</td>")
+            html_content.append("</tr>")
+
+        html_content.append("</table></body></html>")
+        html_content = "".join(html_content)
+
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    logger.info("Wrote picks HTML report to %s.", html_path)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Generate NBA spread picks from predictions and odds.")
+    parser.add_argument(
+        "--run-date",
+        type=str,
+        default=None,
+        help="Run date in YYYY-MM-DD (defaults to latest predictions_*_market.csv date).",
+    )
+    args = parser.parse_args()
+    main(run_date=args.run_date)
