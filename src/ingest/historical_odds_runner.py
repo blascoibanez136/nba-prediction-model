@@ -2,7 +2,7 @@
 Historical Odds Runner (CLOSE only)
 
 Fetches historical NBA odds (spread + total + moneyline) from The Odds API
-and normalizes them using the existing odds_normalizer pipeline.
+and normalizes them using normalize_odds_list().
 
 Outputs:
     data/_snapshots/close_YYYYMMDD.csv
@@ -18,9 +18,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict
 
+import pandas as pd
 import requests
 
-from src.ingest.odds_normalizer import normalize_odds_snapshot
+from src.ingest.odds_normalizer import normalize_odds_list
 
 
 # -----------------------
@@ -91,18 +92,25 @@ def write_raw_snapshot(data: List[Dict], run_date: str) -> Path:
     return out_path
 
 
-def normalize_snapshot(raw_path: Path, run_date: str) -> Path:
+def normalize_snapshot(odds: List[Dict], run_date: str) -> Path:
+    """
+    Normalize odds list into CLOSE snapshot CSV using existing normalizer.
+    """
     NORM_DIR.mkdir(parents=True, exist_ok=True)
 
     out_csv = NORM_DIR / f"close_{run_date.replace('-', '')}.csv"
 
-    normalize_odds_snapshot(
-        raw_json_path=str(raw_path),
-        out_csv_path=str(out_csv),
+    df = normalize_odds_list(
+        odds,
         snapshot_type="close",
     )
 
-    logger.info("Wrote normalized CLOSE odds %s", out_csv)
+    if df.empty:
+        raise ValueError("Normalized odds DataFrame is empty")
+
+    df.to_csv(out_csv, index=False)
+    logger.info("Wrote normalized CLOSE odds %s (%d rows)", out_csv, len(df))
+
     return out_csv
 
 
@@ -123,16 +131,16 @@ def run_range(start: str, end: str, overwrite: bool):
 
     for d in daterange(start_d, end_d):
         run_date = d.strftime("%Y-%m-%d")
-        norm_path = NORM_DIR / f"close_{run_date.replace('-', '')}.csv"
+        out_csv = NORM_DIR / f"close_{run_date.replace('-', '')}.csv"
 
-        if norm_path.exists() and not overwrite:
+        if out_csv.exists() and not overwrite:
             logger.info("Skipping %s (already exists)", run_date)
             continue
 
         try:
-            data = fetch_odds_for_date(run_date)
-            raw_path = write_raw_snapshot(data, run_date)
-            normalize_snapshot(raw_path, run_date)
+            odds = fetch_odds_for_date(run_date)
+            write_raw_snapshot(odds, run_date)
+            normalize_snapshot(odds, run_date)
         except Exception as e:
             logger.warning("Failed odds fetch for %s: %s", run_date, e)
 
