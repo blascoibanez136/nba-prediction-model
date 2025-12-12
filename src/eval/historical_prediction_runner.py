@@ -1,155 +1,96 @@
-"""
-Historical Prediction Runner for NBA Pro-Lite.
-
-Generates historical model predictions using the SAME
-predict_games() pipeline as run_daily.py.
-
-Outputs:
-    outputs/predictions_YYYY-MM-DD.csv
-"""
-
 from __future__ import annotations
 
 import argparse
 import logging
 import os
 from datetime import datetime, timedelta
-from typing import Iterable
+from pathlib import Path
 
 import pandas as pd
 
 from src.model.predict import predict_games
-from src.eval.edge_picker import _merge_key as ep_merge_key
-from src.ingest.team_normalizer import normalize_team_name
+from src.model.market_ensemble import apply_market_ensemble
+from src.eval.edge_picker import _merge_key
+from src.ingest.historical_schedule_loader import load_games_for_date
+
+SNAPSHOT_DIR = Path("data/_snapshots")
+OUTPUT_DIR = Path("outputs")
+
+logger = logging.getLogger("historical")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [historical] %(message)s",
+)
 
 
-OUTPUT_DIR = "outputs"
-HISTORY_DEFAULT = "data/history/games_2019_2024.csv"
-
-logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-
-def parse_date(d: str):
-    return datetime.strptime(d, "%Y-%m-%d").date()
+def daterange(start: str, end: str):
+    d0 = datetime.strptime(start, "%Y-%m-%d")
+    d1 = datetime.strptime(end, "%Y-%m-%d")
+    while d0 <= d1:
+        yield d0.strftime("%Y-%m-%d")
+        d0 += timedelta(days=1)
 
 
-def daterange(start, end) -> Iterable:
-    cur = start
-    while cur <= end:
-        yield cur
-        cur += timedelta(days=1)
-
-
-# ---------------------------------------------------------------------
-# Core logic
-# ---------------------------------------------------------------------
-
-def load_history(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"History file not found: {path}")
-
-    df = pd.read_csv(path)
-
-    required = {"game_date", "home_team", "away_team"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"History file missing columns: {missing}")
-
-    df["game_date"] = df["game_date"].astype(str)
-    df["home_team"] = df["home_team"].apply(normalize_team_name)
-    df["away_team"] = df["away_team"].apply(normalize_team_name)
-
-    return df
-
-
-def build_daily_games(history: pd.DataFrame, day) -> pd.DataFrame:
-    day_str = day.strftime("%Y-%m-%d")
-    games = history[history["game_date"] == day_str].copy()
-
+def run_day(run_date: str, apply_market: bool, overwrite: bool):
+    games = load_games_for_date(run_date)
     if games.empty:
-        return games
-
-    games["game_date"] = day_str
-
-    # Match predict_games() expectations
-    return games[["game_date", "home_team", "away_team"]]
-
-
-def run_for_day(history: pd.DataFrame, day, overwrite: bool):
-    day_str = day.strftime("%Y-%m-%d")
-    out_path = f"{OUTPUT_DIR}/predictions_{day_str}.csv"
-
-    if os.path.exists(out_path) and not overwrite:
-        logger.info("Skipping %s (already exists)", day_str)
+        logger.info("No games for %s — skipping", run_date)
         return
 
-    games_df = build_daily_games(history, day)
-    if games_df.empty:
-        logger.info("No games on %s", day_str)
-        return
+    logger.info("Running predictions for %s (%d games)", run_date, len(games))
 
-    logger.info("Running predictions for %s (%d games)", day_str, len(games_df))
-
-    preds = predict_games(games_df)
-
-    if "game_date" not in preds.columns:
-        preds["game_date"] = day_str
-
+    preds = predict_games(games)
+    preds["game_date"] = run_date
     preds["merge_key"] = preds.apply(
-        lambda r: ep_merge_key(r["home_team"], r["away_team"], r["game_date"]),
+        lambda r: _merge_key(r["home_team"], r["away_team"], r["game_date"]),
         axis=1,
     )
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    preds.to_csv(out_path, index=False)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    base_path = OUTPUT_DIR / f"predictions_{run_date}.csv"
 
-    logger.info("Wrote %s (%d rows)", out_path, len(preds))
+    if base_path.exists() and not overwrite:
+        logger.info("Base predictions already exist — skipping")
+        return
 
+    preds.to_csv(base_path, index=False)
+    logger.info("Wrote %s (%d rows)", base_path, len(preds))
 
-def run_range(history_path: str, start: str, end: str, overwrite: bool):
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] [historical] %(message)s",
-    )
+    if not apply_market:
+        return
 
-    history = load_history(history_path)
+    close_csv = SNAPSHOT_DIR / f"close_{run_date.replace('-', '')}.csv"
+    if not close_csv.exists():
+        logger.warning("No CLOSE odds for %s — skipping market ensemble", run_date)
+        return
 
-    start_d = parse_date(start)
-    end_d = parse_date(end)
+    odds = pd.read_csv(close_csv)
+    market_preds = apply_market_ensemble(preds, odds)
 
-    logger.info("Historical predictions %s → %s", start, end)
+    out_path = OUTPUT_DIR / f"predictions_{run_date}_market.csv"
+    market_preds.to_csv(out_path, index=False)
+    logger.info("Wrote %s (%d rows)", out_path, len(market_preds))
 
-    for d in daterange(start_d, end_d):
-        run_for_day(history, d, overwrite)
-
-    logger.info("Historical prediction run complete.")
-
-
-# ---------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Generate historical NBA predictions using Pro-Lite pipeline."
-    )
-    parser.add_argument("--history", default=HISTORY_DEFAULT)
-    parser.add_argument("--start", required=True)
-    parser.add_argument("--end", required=True)
-    parser.add_argument("--overwrite", action="store_true")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start", required=True)
+    ap.add_argument("--end", required=True)
+    ap.add_argument("--apply-market", action="store_true")
+    ap.add_argument("--overwrite", action="store_true")
+    args = ap.parse_args()
 
-    args = parser.parse_args()
-
-    run_range(
-        history_path=args.history,
-        start=args.start,
-        end=args.end,
-        overwrite=args.overwrite,
+    logger.info(
+        "Historical predictions %s → %s (market=%s)",
+        args.start,
+        args.end,
+        args.apply_market,
     )
+
+    for d in daterange(args.start, args.end):
+        run_day(d, args.apply_market, args.overwrite)
+
+    logger.info("Historical prediction run complete.")
 
 
 if __name__ == "__main__":
