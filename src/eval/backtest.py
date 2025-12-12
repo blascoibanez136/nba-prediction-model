@@ -1,320 +1,486 @@
 """
-Backtesting engine for NBA Pro-Lite.
+Backtesting engine for NBA Pro-Lite / Elite.
 
-Usage (from repo root):
+Phase 1:
+    - Evaluate model probability + spread accuracy against historical results.
+    - Works over a range of predictions_*_market.csv files.
+    - Joins with a results CSV containing final scores.
+    - Computes:
+        * Brier score
+        * Log loss
+        * Calibration bins
+        * Spread MAE / RMSE
 
-    python -m src.eval.backtest --start 2025-10-01 --end 2025-12-31 \
-        --results data/results/results_master.csv
-
-What it does:
-
-- Loads final scores from results_master.csv
-- Loads daily predictions between start and end dates:
-    * Prefer: outputs/predictions_YYYY-MM-DD_market.csv
-    * Fallback: outputs/predictions_YYYY-MM-DD.csv
-- Joins predictions with results on merge_key
-- Computes:
-    * Brier score for:
-        - home_win_prob (model-only)
-        - home_win_prob_market (market ensemble)
-    * Spread MAE for:
-        - fair_spread
-        - fair_spread_market
-    * Simple calibration buckets
-
-Outputs:
-
-- outputs/backtest_summary_START_END.md
-- outputs/backtest_calibration_START_END.csv
-
-You can extend this later to compute ROI from picks once results+odds
-are fully standardized.
+Phase 2 (future):
+    - ROI / Kelly simulation using historical odds and/or saved picks.
+    - CLV (closing line value) tracking.
 """
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import List, Optional
+import glob
+import json
+import logging
+import math
+import os
+from dataclasses import dataclass, asdict
+from typing import List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
+from src.ingest.team_normalizer import normalize_team_name
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-OUTPUTS_DIR = REPO_ROOT / "outputs"
-
-
-# ---------------------------------------------------------------------------
-# Data loading helpers
-# ---------------------------------------------------------------------------
-
-def _parse_date(s: str) -> datetime:
-    return datetime.strptime(s, "%Y-%m-%d")
+logger = logging.getLogger(__name__)
 
 
-def _date_range(start: str, end: str) -> List[str]:
-    d0 = _parse_date(start)
-    d1 = _parse_date(end)
-    days: List[str] = []
-    cur = d0
-    while cur <= d1:
-        days.append(cur.strftime("%Y-%m-%d"))
-        cur += timedelta(days=1)
-    return days
+# ---------------------------------------------------------------------
+# CONFIG / DATA CLASSES
+# ---------------------------------------------------------------------
 
 
-def load_results(results_path: Path) -> pd.DataFrame:
-    if not results_path.exists():
-        raise FileNotFoundError(f"Results file not found: {results_path}")
-
-    df = pd.read_csv(results_path)
-
-    required = {"merge_key", "game_date", "home_team", "away_team", "home_score", "away_score"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(
-            f"results_master.csv is missing required columns: {sorted(missing)}\n"
-            f"Expected at least: {sorted(required)}"
-        )
-
-    # Ensure correct types
-    df["game_date"] = pd.to_datetime(df["game_date"]).dt.strftime("%Y-%m-%d")
-    df["home_score"] = df["home_score"].astype(int)
-    df["away_score"] = df["away_score"].astype(int)
-
-    return df
-
-
-def load_predictions_for_range(start: str, end: str) -> pd.DataFrame:
+@dataclass
+class BacktestConfig:
     """
-    Load predictions_{date}_market.csv (preferred) or predictions_{date}.csv
-    for each date in the range.
+    Configuration for a backtest run.
     """
-    frames: List[pd.DataFrame] = []
 
-    for date_str in _date_range(start, end):
-        market_path = OUTPUTS_DIR / f"predictions_{date_str}_market.csv"
-        base_path = OUTPUTS_DIR / f"predictions_{date_str}.csv"
+    predictions_dir: str = "outputs"
+    predictions_pattern: str = "predictions_*_market.csv"
 
-        if market_path.exists():
-            df = pd.read_csv(market_path)
-            df["game_date"] = date_str
-            frames.append(df)
-        elif base_path.exists():
-            df = pd.read_csv(base_path)
-            df["game_date"] = date_str
-            frames.append(df)
-        else:
-            # No predictions for this date; skip silently.
+    # Historical results file with final scores.
+    # Expected columns:
+    #   - game_date (YYYY-MM-DD)
+    #   - home_team
+    #   - away_team
+    #   - home_score
+    #   - away_score
+    results_path: str = "data/history/games_2019_2024.csv"
+
+    # Date range (inclusive). If None, uses all predictions found.
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+
+    # Which probability and spread columns to evaluate
+    prob_col: str = "home_win_prob"        # can switch to "home_win_prob_market"
+    fair_spread_col: str = "fair_spread"   # can switch to "fair_spread_market"
+
+    # Number of bins to use for calibration
+    n_calibration_bins: int = 10
+
+    # Output files
+    metrics_path: str = os.path.join("outputs", "backtest_metrics.json")
+    calibration_path: str = os.path.join("outputs", "backtest_calibration.csv")
+    per_game_path: str = os.path.join("outputs", "backtest_per_game.csv")
+
+
+@dataclass
+class BacktestMetrics:
+    """
+    Summary metrics for the backtest.
+    """
+
+    n_games: int
+    prob_col: str
+    fair_spread_col: str
+
+    # Classification / probability metrics
+    brier_score: float
+    log_loss: float
+    mean_pred_prob: float
+    base_rate_home_win: float
+
+    # Spread error (using fair_spread -> expected margin)
+    spread_mae: float
+    spread_rmse: float
+
+    # Raw score distributions (optional for inspection)
+    avg_home_score: float
+    avg_away_score: float
+    avg_margin: float
+
+
+# ---------------------------------------------------------------------
+# IO HELPERS
+# ---------------------------------------------------------------------
+
+
+def _parse_date_from_predictions_filename(path: str) -> Optional[str]:
+    """
+    Given a path like:
+        outputs/predictions_2025-12-11_market.csv
+    return:
+        "2025-12-11"
+    """
+    base = os.path.basename(path)
+    if not base.startswith("predictions_"):
+        return None
+    without_prefix = base.replace("predictions_", "")
+    date_part = without_prefix.split("_market")[0]
+    return date_part
+
+
+def load_predictions_history(cfg: BacktestConfig) -> pd.DataFrame:
+    """
+    Load and concatenate all predictions_*_market.csv files in the given
+    directory and date range.
+
+    Returns a DataFrame with at least:
+        - game_date
+        - home_team
+        - away_team
+        - home_win_prob (or chosen prob column)
+        - fair_spread (or chosen spread column)
+    """
+    pattern = os.path.join(cfg.predictions_dir, cfg.predictions_pattern)
+    files = glob.glob(pattern)
+
+    if not files:
+        raise FileNotFoundError(f"No prediction files found matching {pattern}")
+
+    logger.info("[backtest] Found %d prediction files.", len(files))
+
+    dfs: List[pd.DataFrame] = []
+    for path in sorted(files):
+        date_str = _parse_date_from_predictions_filename(path)
+        if date_str is None:
             continue
 
-    if not frames:
-        raise FileNotFoundError(
-            f"No prediction files found between {start} and {end}.\n"
-            f"Looked for predictions_YYYY-MM-DD[_market].csv under outputs/."
+        if cfg.start_date and date_str < cfg.start_date:
+            continue
+        if cfg.end_date and date_str > cfg.end_date:
+            continue
+
+        df = pd.read_csv(path)
+        df["game_date"] = df["game_date"].astype(str)
+        df["pred_file_date"] = date_str
+        dfs.append(df)
+
+    if not dfs:
+        raise ValueError(
+            f"No prediction files within date range {cfg.start_date} .. {cfg.end_date}"
         )
 
-    preds = pd.concat(frames, ignore_index=True)
+    all_preds = pd.concat(dfs, ignore_index=True)
 
-    if "merge_key" not in preds.columns:
-        raise ValueError("Predictions files are missing 'merge_key' column.")
+    required_cols = {"game_date", "home_team", "away_team", cfg.prob_col, cfg.fair_spread_col}
+    missing = required_cols - set(all_preds.columns)
+    if missing:
+        raise ValueError(f"Predictions are missing required columns: {missing}")
 
-    # Normalize date formats
-    preds["game_date"] = pd.to_datetime(preds["game_date"]).dt.strftime("%Y-%m-%d")
-
-    return preds
-
-
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-
-@dataclass
-class BrierResult:
-    name: str
-    brier: float
-    n: int
+    logger.info(
+        "[backtest] Loaded %d rows of predictions from %d files.",
+        len(all_preds),
+        len(dfs),
+    )
+    return all_preds
 
 
-def brier_score(probs: pd.Series, outcomes: pd.Series, name: str) -> Optional[BrierResult]:
-    mask = probs.notna() & outcomes.notna()
-    if mask.sum() == 0:
-        return None
-
-    p = probs[mask].astype(float).clip(0.0, 1.0)
-    y = outcomes[mask].astype(float)
-    b = float(((p - y) ** 2).mean())
-    return BrierResult(name=name, brier=b, n=int(mask.sum()))
-
-
-@dataclass
-class SpreadMAE:
-    name: str
-    mae: float
-    n: int
-
-
-def spread_mae(fair_spread: pd.Series, margin: pd.Series, name: str) -> Optional[SpreadMAE]:
-    mask = fair_spread.notna() & margin.notna()
-    if mask.sum() == 0:
-        return None
-
-    fs = fair_spread[mask].astype(float)
-    m = margin[mask].astype(float)
-    mae = float((fs - m).abs().mean())
-    return SpreadMAE(name=name, mae=mae, n=int(mask.sum()))
-
-
-def calibration_table(
-    probs: pd.Series,
-    outcomes: pd.Series,
-    bucket_width: float = 0.05,
-) -> pd.DataFrame:
+def load_results(cfg: BacktestConfig) -> pd.DataFrame:
     """
-    Build a simple calibration table: bucket, expected, actual, n.
+    Load historical results CSV with final scores.
 
-    Example:
-        bucket  expected  actual    n
-        0.45    0.45      0.48      50
-        0.50    0.50      0.51      60
+    Expected columns:
+        - game_date
+        - home_team
+        - away_team
+        - home_score
+        - away_score
     """
-    mask = probs.notna() & outcomes.notna()
-    if mask.sum() == 0:
-        return pd.DataFrame(columns=["bucket", "expected", "actual", "n"])
+    if not os.path.exists(cfg.results_path):
+        raise FileNotFoundError(
+            f"Results file not found at {cfg.results_path}. "
+            "Make sure you have a CSV with columns: "
+            "game_date, home_team, away_team, home_score, away_score."
+        )
 
-    p = probs[mask].astype(float).clip(0.0, 1.0)
-    y = outcomes[mask].astype(float)
+    results = pd.read_csv(cfg.results_path)
+    required_cols = {
+        "game_date",
+        "home_team",
+        "away_team",
+        "home_score",
+        "away_score",
+    }
+    missing = required_cols - set(results.columns)
+    if missing:
+        raise ValueError(f"Results CSV missing required columns: {missing}")
 
-    # Assign buckets by rounding to nearest bucket_width
-    buckets = (p / bucket_width).round() * bucket_width
-    df = pd.DataFrame({"bucket": buckets, "p": p, "y": y})
+    results["game_date"] = results["game_date"].astype(str)
+    logger.info("[backtest] Loaded %d rows of results from %s.", len(results), cfg.results_path)
+    return results
 
-    grouped = df.groupby("bucket")
-    out = grouped.agg(expected=("p", "mean"), actual=("y", "mean"), n=("y", "size")).reset_index()
-    out = out.sort_values("bucket").reset_index(drop=True)
+
+# ---------------------------------------------------------------------
+# MERGE PREDICTIONS + RESULTS
+# ---------------------------------------------------------------------
+
+
+def _add_normalized_keys(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add normalized team names and a canonical merge key to a DataFrame
+    with columns:
+        - game_date
+        - home_team
+        - away_team
+    """
+    out = df.copy()
+    out["home_team_norm"] = out["home_team"].apply(normalize_team_name)
+    out["away_team_norm"] = out["away_team"].apply(normalize_team_name)
+    out["merge_key_norm"] = (
+        out["home_team_norm"].astype(str)
+        + "__"
+        + out["away_team_norm"].astype(str)
+        + "__"
+        + out["game_date"].astype(str)
+    )
     return out
 
 
-# ---------------------------------------------------------------------------
-# Backtest driver
-# ---------------------------------------------------------------------------
+def merge_predictions_and_results(
+    preds: pd.DataFrame,
+    results: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Merge predictions with final results on normalized merge key.
+    """
+    preds_keyed = _add_normalized_keys(preds)
+    results_keyed = _add_normalized_keys(results)
 
-def run_backtest(start: str, end: str, results_path: str) -> None:
-    results_file = REPO_ROOT / results_path
-    results = load_results(results_file)
-    preds = load_predictions_for_range(start, end)
-
-    # Join predictions with results on merge_key
-    merged = preds.merge(
-        results[["merge_key", "home_score", "away_score"]],
-        on="merge_key",
+    merged = preds_keyed.merge(
+        results_keyed[
+            [
+                "merge_key_norm",
+                "home_score",
+                "away_score",
+            ]
+        ],
+        on="merge_key_norm",
         how="inner",
+        suffixes=("", "_res"),
     )
 
     if merged.empty:
         raise ValueError(
-            "No overlapping games between predictions and results.\n"
-            "Check that merge_key formatting matches in both files."
+            "No overlap between predictions and results after merging on normalized keys. "
+            "Check that team naming and dates are consistent."
         )
 
-    merged["home_win"] = (merged["home_score"] > merged["away_score"]).astype(float)
-    merged["margin"] = merged["home_score"] - merged["away_score"]
-
-    # Compute metrics
-    brier_results: List[BrierResult] = []
-    spread_results: List[SpreadMAE] = []
-
-    if "home_win_prob" in merged.columns:
-        br = brier_score(merged["home_win_prob"], merged["home_win"], "home_win_prob")
-        if br:
-            brier_results.append(br)
-
-    if "home_win_prob_market" in merged.columns:
-        brm = brier_score(merged["home_win_prob_market"], merged["home_win"], "home_win_prob_market")
-        if brm:
-            brier_results.append(brm)
-
-    if "fair_spread" in merged.columns:
-        sm = spread_mae(merged["fair_spread"], merged["margin"], "fair_spread")
-        if sm:
-            spread_results.append(sm)
-
-    if "fair_spread_market" in merged.columns:
-        smm = spread_mae(merged["fair_spread_market"], merged["margin"], "fair_spread_market")
-        if smm:
-            spread_results.append(smm)
-
-    # Calibration table (market prob if available, else model prob)
-    if "home_win_prob_market" in merged.columns:
-        calib = calibration_table(merged["home_win_prob_market"], merged["home_win"])
-        calib_name = "home_win_prob_market"
-    elif "home_win_prob" in merged.columns:
-        calib = calibration_table(merged["home_win_prob"], merged["home_win"])
-        calib_name = "home_win_prob"
-    else:
-        calib = pd.DataFrame(columns=["bucket", "expected", "actual", "n"])
-        calib_name = "none"
-
-    # Write outputs
-    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    summary_path = OUTPUTS_DIR / f"backtest_summary_{start}_{end}.md"
-    calib_path = OUTPUTS_DIR / f"backtest_calibration_{start}_{end}.csv"
-
-    lines: List[str] = []
-    lines.append(f"# Backtest summary\n")
-    lines.append(f"Period: {start} → {end}\n")
-    lines.append(f"Games with predictions + results: {len(merged)}\n")
-
-    if brier_results:
-        lines.append("\n## Brier scores\n")
-        for br in brier_results:
-            lines.append(f"- **{br.name}**: {br.brier:.4f} (n={br.n})")
-    else:
-        lines.append("\n## Brier scores\n- No probability columns found.\n")
-
-    if spread_results:
-        lines.append("\n## Spread MAE\n")
-        for sm in spread_results:
-            lines.append(f"- **{sm.name}**: {sm.mae:.3f} pts (n={sm.n})")
-    else:
-        lines.append("\n## Spread MAE\n- No fair_spread columns found.\n")
-
-    lines.append(f"\n## Calibration\nUsing: `{calib_name}`\n")
-    lines.append(f"- Saved detailed table to `{calib_path.relative_to(REPO_ROOT)}`")
-
-    summary_path.write_text("\n".join(lines), encoding="utf-8")
-    calib.to_csv(calib_path, index=False)
-
-    print(f"✅ Backtest complete. Summary written to {summary_path}")
-    print(f"   Calibration table written to {calib_path}")
+    logger.info("[backtest] Merged to %d rows (games with both predictions and results).", len(merged))
+    return merged
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# METRICS
+# ---------------------------------------------------------------------
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="NBA Pro-Lite backtesting engine")
+
+def compute_metrics(
+    df: pd.DataFrame,
+    cfg: BacktestConfig,
+) -> Tuple[BacktestMetrics, pd.DataFrame]:
+    """
+    Compute backtest metrics given a DataFrame that already contains:
+
+        - home_score
+        - away_score
+        - cfg.prob_col (e.g. home_win_prob or home_win_prob_market)
+        - cfg.fair_spread_col (e.g. fair_spread or fair_spread_market)
+
+    Returns:
+        - BacktestMetrics dataclass
+        - Calibration DataFrame (for writing to CSV)
+    """
+    df = df.copy()
+
+    # Actual home win indicator
+    df["home_win_actual"] = (df["home_score"] > df["away_score"]).astype(int)
+
+    # Predicted probability (clipped for log-loss stability)
+    p = df[cfg.prob_col].astype(float).clip(1e-6, 1 - 1e-6)
+    y = df["home_win_actual"].astype(float)
+
+    # Brier score
+    brier = float(((p - y) ** 2).mean())
+
+    # Log loss
+    log_loss = float(-(y * np.log(p) + (1 - y) * np.log(1 - p)).mean())
+
+    # Base rates
+    mean_p = float(p.mean())
+    base_rate = float(y.mean())
+
+    # Spread error:
+    # Our fair_spread is from the home perspective:
+    #   negative = home favorite by |spread|
+    # For evaluation, we convert fair_spread to expected margin:
+    #   expected_margin = -fair_spread
+    # Actual margin is home_score - away_score.
+    fair_spread = df[cfg.fair_spread_col].astype(float)
+    expected_margin = -fair_spread
+    actual_margin = df["home_score"] - df["away_score"]
+
+    spread_error = expected_margin - actual_margin
+    spread_mae = float(spread_error.abs().mean())
+    spread_rmse = float(math.sqrt((spread_error ** 2).mean()))
+
+    # Calibration bins
+    n_bins = cfg.n_calibration_bins
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_indices = np.digitize(p, bin_edges, right=True)  # 1..n_bins
+    df["prob_bin"] = bin_indices
+
+    calib_rows = []
+    for b in range(1, n_bins + 1):
+        mask = df["prob_bin"] == b
+        if not mask.any():
+            continue
+        bin_p = p[mask].mean()
+        bin_y = y[mask].mean()
+        count = int(mask.sum())
+        calib_rows.append(
+            {
+                "bin": b,
+                "bin_lower": bin_edges[b - 1],
+                "bin_upper": bin_edges[b],
+                "mean_pred_prob": float(bin_p),
+                "empirical_win_rate": float(bin_y),
+                "n_games": count,
+            }
+        )
+
+    calib_df = pd.DataFrame(calib_rows)
+
+    metrics = BacktestMetrics(
+        n_games=int(len(df)),
+        prob_col=cfg.prob_col,
+        fair_spread_col=cfg.fair_spread_col,
+        brier_score=brier,
+        log_loss=log_loss,
+        mean_pred_prob=mean_p,
+        base_rate_home_win=base_rate,
+        spread_mae=spread_mae,
+        spread_rmse=spread_rmse,
+        avg_home_score=float(df["home_score"].mean()),
+        avg_away_score=float(df["away_score"].mean()),
+        avg_margin=float(actual_margin.mean()),
+    )
+
+    # Attach some useful per-game columns for optional investigation
+    df["expected_margin"] = expected_margin
+    df["spread_error"] = spread_error
+
+    return metrics, calib_df, df
+
+
+# ---------------------------------------------------------------------
+# ORCHESTRATION
+# ---------------------------------------------------------------------
+
+
+def run_backtest(cfg: BacktestConfig) -> BacktestMetrics:
+    """
+    Run the full backtest and write outputs to disk:
+
+        - cfg.metrics_path (JSON summary)
+        - cfg.calibration_path (CSV with calibration bins)
+        - cfg.per_game_path (CSV with per-game errors)
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] [backtest] %(message)s",
+    )
+
+    logger.info("Starting backtest with config: %s", cfg)
+
+    preds = load_predictions_history(cfg)
+    results = load_results(cfg)
+    merged = merge_predictions_and_results(preds, results)
+
+    metrics, calib_df, per_game_df = compute_metrics(merged, cfg)
+
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(cfg.metrics_path), exist_ok=True)
+
+    # Write metrics JSON
+    with open(cfg.metrics_path, "w", encoding="utf-8") as f:
+        json.dump(asdict(metrics), f, indent=2)
+    logger.info("Wrote backtest metrics to %s", cfg.metrics_path)
+
+    # Write calibration CSV
+    calib_df.to_csv(cfg.calibration_path, index=False)
+    logger.info("Wrote calibration bins to %s", cfg.calibration_path)
+
+    # Write per-game CSV
+    per_game_df.to_csv(cfg.per_game_path, index=False)
+    logger.info("Wrote per-game backtest data to %s", cfg.per_game_path)
+
+    logger.info(
+        "Backtest complete: n_games=%d, Brier=%.4f, log_loss=%.4f, spread_MAE=%.3f",
+        metrics.n_games,
+        metrics.brier_score,
+        metrics.log_loss,
+        metrics.spread_mae,
+    )
+    return metrics
+
+
+def _parse_args() -> BacktestConfig:
+    parser = argparse.ArgumentParser(description="Run NBA model backtest over historical games.")
+    parser.add_argument(
+        "--results",
+        type=str,
+        default="data/history/games_2019_2024.csv",
+        help="Path to CSV with historical results (with scores).",
+    )
+    parser.add_argument(
+        "--pred-dir",
+        type=str,
+        default="outputs",
+        help="Directory with predictions_*_market.csv files.",
+    )
     parser.add_argument(
         "--start",
-        required=True,
-        help="Start date (YYYY-MM-DD)",
+        type=str,
+        default=None,
+        help="Start date (YYYY-MM-DD) for backtest (inclusive).",
     )
     parser.add_argument(
         "--end",
-        required=True,
-        help="End date (YYYY-MM-DD)",
+        type=str,
+        default=None,
+        help="End date (YYYY-MM-DD) for backtest (inclusive).",
     )
     parser.add_argument(
-        "--results",
-        default="data/results/results_master.csv",
-        help="Path to results CSV (default: data/results/results_master.csv)",
+        "--prob-col",
+        type=str,
+        default="home_win_prob",
+        help="Probability column to evaluate (e.g. 'home_win_prob_market').",
+    )
+    parser.add_argument(
+        "--spread-col",
+        type=str,
+        default="fair_spread",
+        help="Spread column to evaluate (e.g. 'fair_spread_market').",
     )
 
     args = parser.parse_args()
-    run_backtest(args.start, args.end, args.results)
+
+    cfg = BacktestConfig(
+        predictions_dir=args.pred_dir,
+        results_path=args.results,
+        start_date=args.start,
+        end_date=args.end,
+        prob_col=args.prob_col,
+        fair_spread_col=args.spread_col,
+    )
+    return cfg
+
+
+def main() -> None:
+    cfg = _parse_args()
+    run_backtest(cfg)
 
 
 if __name__ == "__main__":
