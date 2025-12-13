@@ -224,7 +224,29 @@ def load_results(cfg: BacktestConfig) -> pd.DataFrame:
     missing = required_cols - set(results.columns)
     if missing:
         raise ValueError(f"Results CSV missing required columns: {missing}")
+    # Normalize and (optionally) filter to the configured date range.
+    # IMPORTANT: Coverage must be computed against the *same* evaluation window
+    # as the predictions we loaded.
     results["game_date"] = results["game_date"].astype(str)
+
+    # Inclusive filter. Apply either boundary if provided.
+    start = str(cfg.start_date) if cfg.start_date else None
+    end = str(cfg.end_date) if cfg.end_date else None
+    if start or end:
+        before = len(results)
+        if start:
+            results = results[results["game_date"] >= start]
+        if end:
+            results = results[results["game_date"] <= end]
+        results = results.copy()
+        logger.info(
+            "[backtest] Filtered results to date range %s..%s: %d -> %d rows.",
+            start,
+            end,
+            before,
+            len(results),
+        )
+
     logger.info(
         "[backtest] Loaded %d rows of results from %s.", len(results), cfg.results_path
     )
