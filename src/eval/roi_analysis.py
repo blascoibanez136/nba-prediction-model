@@ -1,25 +1,38 @@
 """
-Moneyline ROI and edge bucket analysis (with optional calibration).
+Enhanced moneyline ROI and edge bucket analysis with bet‑side support.
 
-This module provides utilities to evaluate moneyline betting strategies on
-historical NBA data.  It computes flat‑stake ROI, win rates, and edge
-distributions, and supports applying a pre‑trained probability calibrator
-using isotonic regression.  The primary use case is to analyze the output
-from ``src/eval/backtest.py`` (per‑game predictions and results) and
-simulate simple betting rules.
+This module fixes the previous limitation where only home bets were considered.  It
+computes vig‑free implied probabilities from moneylines, compares the model's raw
+win probability to the market, and supports betting either the home or away
+team based on whichever side has a sufficiently large positive edge.
+
+Key features:
+
+* **Separate calibration vs. selection:**  You may optionally pass a
+  probability calibrator.  The calibrator is applied to the model's win
+  probability and recorded for diagnostics, but the *raw* model probability
+  (pre‑calibration) is always used to compute edges and make bet decisions.
+
+* **Bet side logic:**  For each game, both the home and away edges are
+  computed.  A bet is placed on the home team if its edge exceeds the
+  threshold and is greater than or equal to the away edge.  A bet is placed on
+  the away team if its edge exceeds the threshold and is greater than the
+  home edge.  If neither side has a qualifying edge, no bet is made.
+
+* **Side‑specific ROI:**  Summary metrics and ROI are reported separately for
+  home bets, away bets, and the combined portfolio.  This allows you to
+  verify that both sides behave reasonably and to detect any asymmetries.
+
+The per‑bucket summaries remain available for the combined portfolio and
+continue to group bets by edge magnitude.
 
 Usage example:
 
-    python -m roi_analysis \
+    python -m src.eval.roi_analysis \
         --per_game outputs/backtest_per_game.csv \
         --edge 0.02 \
-        --out_json outputs/roi_metrics.json \
         --calibrator models/calibrator.joblib
 
-If ``--calibrator`` is provided, the script will load the specified
-calibrator and apply it to the model probability column before computing
-edges.  This is useful to correct for systematic over/underconfidence in
-predicted win probabilities.
 """
 
 from __future__ import annotations
@@ -29,16 +42,17 @@ import json
 import math
 import os
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, List
 
 import pandas as pd
 
 from src.model.calibration import load_calibrator, apply_calibrator
 
 
-# ----------------------------
+# -----------------------------------------------------------------------------
 # Odds + payout helpers
-# ----------------------------
+# -----------------------------------------------------------------------------
+
 
 def american_to_prob(odds: float) -> Optional[float]:
     """Implied probability from American odds (includes vig if using one side only)."""
@@ -82,9 +96,10 @@ def payout_per_dollar(odds: float) -> Optional[float]:
     return (o / 100.0) if o > 0 else (100.0 / abs(o))
 
 
-# ----------------------------
+# -----------------------------------------------------------------------------
 # Column detection
-# ----------------------------
+# -----------------------------------------------------------------------------
+
 
 @dataclass
 class Cols:
@@ -97,7 +112,7 @@ class Cols:
     ml_away: Optional[str]
 
 
-def _pick_first(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+def _pick_first(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     for c in candidates:
         if c in df.columns:
             return c
@@ -105,11 +120,12 @@ def _pick_first(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
 
 
 def detect_columns(df: pd.DataFrame) -> Cols:
+    """Infer the key column names used by downstream logic."""
     merge_key = _pick_first(df, ["merge_key", "merge_key_norm"])
     date = _pick_first(df, ["game_date", "date", "commence_time"])
     home_win = _pick_first(df, ["home_win_actual", "home_win", "home_win_result"])
 
-    # Prob columns: prefer blended "home_win_prob" (post market ensemble) if present
+    # Probability columns: prefer blended "home_win_prob" if present.
     model_prob = _pick_first(df, ["home_win_prob", "home_win_prob_model", "home_prob_model"])
     market_prob = _pick_first(df, ["home_win_prob_market", "home_prob_market"])
 
@@ -117,7 +133,7 @@ def detect_columns(df: pd.DataFrame) -> Cols:
     ml_home = _pick_first(df, ["ml_home_consensus", "ml_home", "home_ml", "home_ml_consensus"])
     ml_away = _pick_first(df, ["ml_away_consensus", "ml_away", "away_ml", "away_ml_consensus"])
 
-    missing = []
+    missing: List[str] = []
     for name, val in [
         ("merge_key", merge_key),
         ("date", date),
@@ -142,24 +158,46 @@ def detect_columns(df: pd.DataFrame) -> Cols:
     )
 
 
-# ----------------------------
-# Core analysis
-# ----------------------------
+# -----------------------------------------------------------------------------
+# Bet construction (with side selection)
+# -----------------------------------------------------------------------------
 
-def build_bets(df: pd.DataFrame, cols: Cols, edge_threshold: float) -> pd.DataFrame:
+
+def build_bets(
+    df: pd.DataFrame, cols: Cols, edge_threshold: float, model_prob_col: str
+) -> pd.DataFrame:
+    """
+    Build a betting DataFrame with side selection.
+
+    Args:
+        df: DataFrame containing per‑game predictions and market data.
+        cols: Column metadata inferred by `detect_columns`.
+        edge_threshold: Minimum edge (probability points) required to place a bet.
+        model_prob_col: Name of the column holding the *raw* model home win probability.
+
+    Returns:
+        A copy of `df` with additional columns:
+          - market_prob_home: vig‑free implied home probability
+          - home_edge / away_edge: edges for each side
+          - bet_side: "home", "away", or None
+          - bet: bool flag indicating whether a bet was placed
+          - payout_per_home / payout_per_away: profit per $1 for each side
+          - profit: realized profit on a $1 stake (NaN for no bet)
+          - stake: 1.0 for a placed bet, 0.0 otherwise
+          - bet_win_bin: 1 if the bet won, 0 if lost, NaN if no bet
+          - edge_used: the edge corresponding to the chosen side (home_edge or away_edge)
+    """
     out = df.copy()
 
-    # Ensure numeric
-    out[cols.model_prob] = pd.to_numeric(out[cols.model_prob], errors="coerce")
+    # Ensure numeric types for probabilities and odds
+    out[model_prob_col] = pd.to_numeric(out[model_prob_col], errors="coerce")
     out[cols.ml_home] = pd.to_numeric(out[cols.ml_home], errors="coerce")
     if cols.ml_away:
         out[cols.ml_away] = pd.to_numeric(out[cols.ml_away], errors="coerce")
 
-    # Market implied home prob
+    # Compute market implied probabilities
     p_home = out[cols.ml_home].apply(american_to_prob)
-    p_away = (
-        out[cols.ml_away].apply(american_to_prob) if cols.ml_away else None
-    )
+    p_away = out[cols.ml_away].apply(american_to_prob) if cols.ml_away else None
 
     if p_away is not None:
         out["market_prob_home"] = [
@@ -167,88 +205,161 @@ def build_bets(df: pd.DataFrame, cols: Cols, edge_threshold: float) -> pd.DataFr
         ]
         out["market_prob_method"] = "devig_two_way"
     else:
+        # Single side only (no away odds) → use implied prob directly
         out["market_prob_home"] = p_home
         out["market_prob_method"] = "single_side_implied"
 
-    # Edge = model - market
-    out["edge"] = out[cols.model_prob] - out["market_prob_home"]
+    # Compute edges for each side
+    out["home_edge"] = out[model_prob_col] - out["market_prob_home"]
+    # For away: model away probability minus market away prob = -(home_edge)
+    out["away_edge"] = -out["home_edge"]
 
-    # Qualifying bets (HOME only, flat $1)
-    out["bet"] = (
-        (out["edge"] >= edge_threshold)
-        & out["market_prob_home"].notna()
-        & out[cols.model_prob].notna()
-    )
+    # Determine bet side: prefer side with highest edge if above threshold
+    def pick_side(row) -> Optional[str]:
+        he = row["home_edge"]
+        ae = row["away_edge"]
+        if pd.isna(he) or pd.isna(ae):
+            return None
+        # Both edges negative or below threshold → no bet
+        if he < edge_threshold and ae < edge_threshold:
+            return None
+        # If both exceed threshold, choose the larger edge
+        if he >= edge_threshold and he >= ae:
+            return "home"
+        if ae >= edge_threshold and ae > he:
+            return "away"
+        return None
 
-    # Profit per $1 stake
-    out["payout_per_1"] = out[cols.ml_home].apply(payout_per_dollar)
+    out["bet_side"] = out.apply(pick_side, axis=1)
+    out["bet"] = out["bet_side"].notna()
 
-    # Normalize win column to 0/1
+    # Payouts for each side
+    out["payout_per_home"] = out[cols.ml_home].apply(payout_per_dollar)
+    if cols.ml_away:
+        out["payout_per_away"] = out[cols.ml_away].apply(payout_per_dollar)
+    else:
+        out["payout_per_away"] = None
+
+    # Normalize actual result to 0/1 for home win
     hw = out[cols.home_win]
     if hw.dtype == bool:
         out["home_win_bin"] = hw.astype(int)
     else:
         out["home_win_bin"] = pd.to_numeric(hw, errors="coerce")
 
-    # Profit: win -> +payout_per_1 ; lose -> -1
+    # Compute bet win flag and profit
+    out["bet_win_bin"] = None
     out["profit"] = None
-    out.loc[out["bet"] & (out["home_win_bin"] == 1), "profit"] = out.loc[
-        out["bet"] & (out["home_win_bin"] == 1), "payout_per_1"
-    ]
-    out.loc[out["bet"] & (out["home_win_bin"] == 0), "profit"] = -1.0
-
-    # Stakes (flat $1)
     out["stake"] = 0.0
-    out.loc[out["bet"], "stake"] = 1.0
+    out["edge_used"] = None
+
+    # Home bets
+    mask_home = out["bet_side"] == "home"
+    # Bet win if home actually won
+    out.loc[mask_home, "bet_win_bin"] = out.loc[mask_home, "home_win_bin"]
+    out.loc[mask_home, "edge_used"] = out.loc[mask_home, "home_edge"]
+    # Profit: payout if win, -1 if loss
+    out.loc[mask_home & (out["home_win_bin"] == 1), "profit"] = out.loc[
+        mask_home & (out["home_win_bin"] == 1), "payout_per_home"
+    ]
+    out.loc[mask_home & (out["home_win_bin"] == 0), "profit"] = -1.0
+    out.loc[mask_home, "stake"] = 1.0
+
+    # Away bets
+    mask_away = out["bet_side"] == "away"
+    # Bet win if home lost (away won)
+    out.loc[mask_away, "bet_win_bin"] = 1.0 - out.loc[mask_away, "home_win_bin"]
+    out.loc[mask_away, "edge_used"] = out.loc[mask_away, "away_edge"]
+    # Profit: payout per away if away won, else -1
+    if cols.ml_away:
+        out.loc[
+            mask_away & (out["home_win_bin"] == 0), "profit"
+        ] = out.loc[
+            mask_away & (out["home_win_bin"] == 0), "payout_per_away"
+        ]
+        out.loc[mask_away & (out["home_win_bin"] == 1), "profit"] = -1.0
+    else:
+        # No away odds → cannot compute profit; set to NaN
+        out.loc[mask_away, "profit"] = float("nan")
+    out.loc[mask_away, "stake"] = 1.0
 
     return out
 
 
-def bucketize(edge: pd.Series) -> pd.Series:
-    # buckets in absolute probability points: 0–1%, 1–2%, 2–4%, 4–6%, 6%+
-    bins = [-1e9, 0.01, 0.02, 0.04, 0.06, 1e9]
-    labels = ["0–1%", "1–2%", "2–4%", "4–6%", "6%+"]
-    return pd.cut(edge, bins=bins, labels=labels, include_lowest=True)
+# -----------------------------------------------------------------------------
+# Metrics summarization
+# -----------------------------------------------------------------------------
 
 
-def summarize(bets_df: pd.DataFrame) -> Tuple[dict, pd.DataFrame]:
-    b = bets_df[bets_df["bet"]].copy()
-
+def _summarize_portfolio(b: pd.DataFrame) -> Dict[str, float]:
+    """Compute ROI summary for a subset of bets DataFrame."""
     total_stake = float(b["stake"].sum())
     total_profit = float(pd.to_numeric(b["profit"], errors="coerce").sum())
     roi = (total_profit / total_stake) if total_stake > 0 else float("nan")
-
-    win_rate = (
-        float((b["home_win_bin"] == 1).mean()) if len(b) else float("nan")
-    )
-
-    metrics = {
+    win_rate = float(b["bet_win_bin"].mean()) if len(b) else float("nan")
+    return {
         "bets": int(len(b)),
         "stake": total_stake,
         "profit": total_profit,
         "roi": roi,
         "win_rate": win_rate,
-        "avg_edge": float(b["edge"].mean()) if len(b) else float("nan"),
+        "avg_edge": float(b["edge_used"].mean()) if len(b) else float("nan"),
         "avg_model_prob": float(b["home_win_prob_model_used"].mean())
         if "home_win_prob_model_used" in b.columns and len(b)
         else float("nan"),
         "avg_market_prob": float(b["market_prob_home"].mean()) if len(b) else float("nan"),
-        "market_prob_method": b["market_prob_method"].iloc[0]
-        if len(b)
-        else None,
     }
 
-    # Bucket summary
-    b["bucket"] = bucketize(b["edge"])
+
+def summarize(bets_df: pd.DataFrame) -> Tuple[Dict[str, Dict[str, float]], pd.DataFrame]:
+    """
+    Summarize betting results for home, away, and combined portfolios.
+
+    Args:
+        bets_df: DataFrame returned by `build_bets` containing bet flags and profit.
+
+    Returns:
+        metrics: nested dict with keys 'combined', 'home', 'away', each mapping to ROI
+            summary for that portfolio.
+        bucket: per‑edge bucket summary for combined bets.
+    """
+    bets_only = bets_df[bets_df["bet"]].copy()
+
+    # Combined metrics
+    combined_metrics = _summarize_portfolio(bets_only)
+
+    # Home portfolio
+    home_portfolio = bets_only[bets_only["bet_side"] == "home"].copy()
+    home_metrics = _summarize_portfolio(home_portfolio)
+
+    # Away portfolio
+    away_portfolio = bets_only[bets_only["bet_side"] == "away"].copy()
+    away_metrics = _summarize_portfolio(away_portfolio)
+
+    metrics = {
+        "combined": combined_metrics,
+        "home": home_metrics,
+        "away": away_metrics,
+    }
+
+    # Bucket summary for combined bets
+    def bucketize(edge: pd.Series) -> pd.Series:
+        # buckets in absolute probability points: 0–1%, 1–2%, 2–4%, 4–6%, 6%+
+        bins = [-1e9, 0.01, 0.02, 0.04, 0.06, 1e9]
+        labels = ["0–1%", "1–2%", "2–4%", "4–6%", "6%+"]
+        return pd.cut(edge, bins=bins, labels=labels, include_lowest=True)
+
+    bucket_df = bets_only.copy()
+    bucket_df["bucket"] = bucketize(bucket_df["edge_used"].abs())
     bucket = (
-        b.groupby("bucket", dropna=False)
+        bucket_df.groupby("bucket", dropna=False)
         .agg(
             bets=("bet", "size"),
-            win_rate=("home_win_bin", "mean"),
-            avg_edge=("edge", "mean"),
+            win_rate=("bet_win_bin", "mean"),
+            avg_edge=("edge_used", "mean"),
             avg_model_prob=("home_win_prob_model_used", "mean")
-            if "home_win_prob_model_used" in b.columns
-            else ("edge", "mean"),
+            if "home_win_prob_model_used" in bucket_df.columns
+            else ("edge_used", "mean"),
             avg_market_prob=("market_prob_home", "mean"),
             roi=("profit", lambda s: float(pd.to_numeric(s, errors="coerce").sum()) / len(s) if len(s) else float("nan")),
         )
@@ -258,28 +369,33 @@ def summarize(bets_df: pd.DataFrame) -> Tuple[dict, pd.DataFrame]:
     return metrics, bucket
 
 
+# -----------------------------------------------------------------------------
+# Entry point
+# -----------------------------------------------------------------------------
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--per_game",
         default="outputs/backtest_per_game.csv",
-        help="CSV with per‑game predictions/results.  Generated by backtest.py",
+        help="CSV with per‑game predictions/results. Generated by backtest.py",
     )
     ap.add_argument(
         "--edge",
         type=float,
         default=0.02,
-        help="Edge threshold in probability points (0.02 = 2%)",
+        help="Edge threshold in probability points (0.02 = 2%).  A bet is placed on the side whose edge exceeds this threshold and is the larger of the two.",
     )
     ap.add_argument(
         "--out_json",
         default="outputs/roi_metrics.json",
-        help="Path to write summary metrics JSON",
+        help="Path to write summary metrics JSON (home/away/combined)",
     )
     ap.add_argument(
         "--out_bucket",
         default="outputs/roi_buckets.csv",
-        help="Path to write per‑bucket summary CSV",
+        help="Path to write per‑bucket summary CSV (combined)",
     )
     ap.add_argument(
         "--out_bets",
@@ -289,8 +405,8 @@ def main() -> None:
     ap.add_argument(
         "--calibrator",
         default=None,
-        help="Optional path to a calibrator (.joblib).  When provided, the model probability column"
-             " will be transformed via the calibrator before edge computation.",
+        help="Optional path to a calibrator (.joblib). When provided, the model probability column"
+             " will be calibrated for diagnostic purposes (stored as home_win_prob_model_used) but not used for edge computation.",
     )
     args = ap.parse_args()
 
@@ -300,23 +416,24 @@ def main() -> None:
     df = pd.read_csv(args.per_game)
     cols = detect_columns(df)
 
-    # If calibrator provided, apply it to model probability column
+    # Always preserve the raw model probability column for edge computation
     df = df.copy()
+    df[cols.model_prob] = pd.to_numeric(df[cols.model_prob], errors="coerce")
+    df["home_win_prob_model_raw"] = df[cols.model_prob]
+
+    # Apply calibrator for diagnostics if provided
     if args.calibrator:
         calib = load_calibrator(args.calibrator)
-        # Apply calibrator and overwrite the model_prob column for edge computation
-        df[cols.model_prob] = apply_calibrator(
-            pd.to_numeric(df[cols.model_prob], errors="coerce"), calib
+        df["home_win_prob_model_calibrated"] = apply_calibrator(df[cols.model_prob], calib)
+        df["home_win_prob_model_used"] = df["home_win_prob_model_calibrated"]
+        print(
+            f"[roi_analysis] Applied calibrator from {args.calibrator} to column '{cols.model_prob}'."
         )
-        # Record which probability is used
-        df["home_win_prob_model_used"] = df[cols.model_prob]
-        print(f"[roi_analysis] Applied calibrator from {args.calibrator} to column '{cols.model_prob}'.")
     else:
-        # Without calibration, still coerce numeric and record
-        df[cols.model_prob] = pd.to_numeric(df[cols.model_prob], errors="coerce")
         df["home_win_prob_model_used"] = df[cols.model_prob]
 
-    bets = build_bets(df, cols, edge_threshold=args.edge)
+    # Build bets using raw model probability for edges
+    bets = build_bets(df, cols, edge_threshold=args.edge, model_prob_col=cols.model_prob)
     metrics, bucket = summarize(bets)
 
     os.makedirs(os.path.dirname(args.out_json), exist_ok=True)
@@ -327,9 +444,11 @@ def main() -> None:
     bucket.to_csv(args.out_bucket, index=False)
     bets.to_csv(args.out_bets, index=False)
 
+    # Print combined summary to console for convenience
+    combined = metrics["combined"]
     print(f"[roi] edge_threshold={args.edge:.4f}")
     print(
-        f"[roi] bets={metrics['bets']} stake={metrics['stake']:.1f} profit={metrics['profit']:.3f} roi={metrics['roi']:.4f} win_rate={metrics['win_rate']:.4f}"
+        f"[roi] bets={combined['bets']} stake={combined['stake']:.1f} profit={combined['profit']:.3f} roi={combined['roi']:.4f} win_rate={combined['win_rate']:.4f}"
     )
     print(f"[roi] wrote: {args.out_json}")
     print(f"[roi] wrote: {args.out_bucket}")
