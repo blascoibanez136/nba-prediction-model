@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
@@ -21,6 +23,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] [historical] %(message)s",
 )
 
+# Coverage thresholds (match your contract)
+COVERAGE_DISABLE_THRESHOLD = 0.80
+COVERAGE_WARN_THRESHOLD = 0.95
+
 
 def daterange(start: str, end: str):
     """Yield YYYY-MM-DD strings for each day in the inclusive range [start, end]."""
@@ -33,31 +39,50 @@ def daterange(start: str, end: str):
 
 def load_games_for_date(history_df: pd.DataFrame, run_date: str) -> pd.DataFrame:
     """Extract games for a specific run_date from the history DataFrame."""
-    day = history_df[history_df["game_date"] == run_date].copy()
+    day = history_df[history_df["game_date"].astype(str) == run_date].copy()
     if day.empty:
         return pd.DataFrame(columns=["game_date", "home_team", "away_team"])
+
     # Only what predict_games needs
-    return day[["game_date", "home_team", "away_team"]].copy()
+    out = day[["game_date", "home_team", "away_team"]].copy()
+    out["game_date"] = run_date
+    return out
 
 
-def run_day(history_df: pd.DataFrame, run_date: str, apply_market: bool, overwrite: bool):
+def _find_latest_snapshot_for_date(run_date: str, snapshot_type: str = "close") -> Optional[Path]:
+    """
+    Locate the latest snapshot CSV for a given date.
+
+    Accepts BOTH formats:
+      - close_YYYYMMDD.csv
+      - close_YYYYMMDD_HHMMSS.csv  (preferred / most common in this repo)
+
+    Returns:
+      Path to the newest matching file, or None.
+    """
+    ymd = run_date.replace("-", "")
+    # Prefer timestamped (can be multiple snapshots per day)
+    pattern_ts = str(SNAPSHOT_DIR / f"{snapshot_type}_{ymd}_*.csv")
+    candidates = sorted(glob.glob(pattern_ts))
+
+    # Fallback: non-timestamp single file
+    if not candidates:
+        pattern_plain = SNAPSHOT_DIR / f"{snapshot_type}_{ymd}.csv"
+        if pattern_plain.exists():
+            return pattern_plain
+        return None
+
+    # newest (lexicographic works for YYYYMMDD_HHMMSS)
+    return Path(candidates[-1])
+
+
+def run_day(history_df: pd.DataFrame, run_date: str, apply_market: bool, overwrite: bool) -> None:
     """
     Run predictions for a single day.
 
-    Parameters
-    ----------
-    history_df : pd.DataFrame
-        DataFrame containing historical game schedule with columns game_date, home_team, away_team.
-    run_date : str
-        Date to run predictions for (YYYY-MM-DD).
-    apply_market : bool
-        Whether to attempt market ensemble adjustment using odds snapshots.
-    overwrite : bool
-        If True, overwrite existing prediction outputs.
-
-    This function will compute coverage of odds snapshots and decide whether to apply
-    market ensemble based on configurable thresholds. Coverage <80% disables
-    ensemble, 80%–95% warns but proceeds, >=95% proceeds normally.
+    - Writes base predictions: outputs/predictions_{run_date}.csv
+    - Optionally writes market preds: outputs/predictions_{run_date}_market.csv
+      (only if odds snapshot exists AND coverage passes thresholds)
     """
     games = load_games_for_date(history_df, run_date)
     if games.empty:
@@ -65,7 +90,6 @@ def run_day(history_df: pd.DataFrame, run_date: str, apply_market: bool, overwri
         return
 
     logger.info("Running predictions for %s (%d games)", run_date, len(games))
-
     preds = predict_games(games)
 
     # Ensure required columns exist and compute merge_key
@@ -79,81 +103,99 @@ def run_day(history_df: pd.DataFrame, run_date: str, apply_market: bool, overwri
     base_path = OUTPUT_DIR / f"predictions_{run_date}.csv"
 
     if base_path.exists() and not overwrite:
-        logger.info("Base predictions already exist for %s — skipping", run_date)
+        logger.info("Base predictions already exist for %s — skipping write", run_date)
     else:
         preds.to_csv(base_path, index=False)
         logger.info("Wrote %s (%d rows)", base_path, len(preds))
 
-    # If the caller does not want market ensemble, stop here
     if not apply_market:
         return
 
-    close_csv = SNAPSHOT_DIR / f"close_{run_date.replace('-', '')}.csv"
-    if not close_csv.exists():
+    snap_path = _find_latest_snapshot_for_date(run_date, snapshot_type="close")
+    if snap_path is None:
+        logger.warning("No CLOSE odds snapshot found for %s in %s — skipping market ensemble", run_date, SNAPSHOT_DIR)
+        return
+
+    odds = pd.read_csv(snap_path)
+    if odds.empty or "merge_key" not in odds.columns:
         logger.warning(
-            "No CLOSE odds CSV for %s (%s) — skipping market ensemble", run_date, close_csv
+            "CLOSE snapshot invalid for %s (%s): empty=%s, has_merge_key=%s — skipping market ensemble",
+            run_date,
+            snap_path,
+            odds.empty,
+            "merge_key" in odds.columns,
         )
         return
 
-    # Load odds snapshot (per-book wide format)
-    odds = pd.read_csv(close_csv)
+    # Coverage: unique merge_keys present in odds vs schedule
+    schedule_keys = set(preds["merge_key"].astype(str).tolist())
+    odds_keys = set(odds["merge_key"].dropna().astype(str).tolist())
 
-    # Compute coverage: unique merge_keys present in odds vs schedule
-    schedule_keys = set(preds["merge_key"].tolist())
-    odds_keys = set(odds["merge_key"].dropna().astype(str).unique().tolist())
     covered = len(schedule_keys & odds_keys)
     total = len(schedule_keys)
     coverage = covered / total if total else 0.0
+
     logger.info(
-        "Odds coverage for %s: %d/%d games (%.1f%%)",
+        "Using CLOSE snapshot: %s | Odds coverage for %s: %d/%d games (%.1f%%)",
+        snap_path,
         run_date,
         covered,
         total,
-        coverage * 100,
+        coverage * 100.0,
     )
 
-    # Enforce merge coverage thresholds
-    if coverage < 0.80:
+    if coverage < COVERAGE_DISABLE_THRESHOLD:
         logger.warning(
-            "Coverage %.1f%% < 80%% for %s — disabling market ensemble", coverage * 100, run_date
+            "Coverage %.1f%% < %.0f%% for %s — disabling market ensemble for this day",
+            coverage * 100.0,
+            COVERAGE_DISABLE_THRESHOLD * 100.0,
+            run_date,
         )
         return
-    elif coverage < 0.95:
+    elif coverage < COVERAGE_WARN_THRESHOLD:
         logger.warning(
-            "Coverage %.1f%% < 95%% for %s — proceeding with market ensemble, results may be incomplete",
-            coverage * 100,
+            "Coverage %.1f%% < %.0f%% for %s — proceeding, but results may be incomplete",
+            coverage * 100.0,
+            COVERAGE_WARN_THRESHOLD * 100.0,
             run_date,
         )
 
-    # Apply market ensemble
     market_preds = apply_market_ensemble(preds, odds)
 
     out_path = OUTPUT_DIR / f"predictions_{run_date}_market.csv"
+    if out_path.exists() and not overwrite:
+        logger.info("Market predictions already exist for %s — skipping write", run_date)
+        return
+
     market_preds.to_csv(out_path, index=False)
     logger.info("Wrote %s (%d rows)", out_path, len(market_preds))
 
 
-def main():
+def main() -> None:
     """
-    CLI entry point. Example usage:
+    Example:
 
-        python -m src.eval.historical_prediction_runner \
-            --history data/games_2019_2024.csv \
-            --start 2021-10-19 \
-            --end 2023-06-15 \
-            --apply-market \
-            --overwrite
+      python -m src.eval.historical_prediction_runner \
+        --history data/history/games_2019_2024.csv \
+        --start 2023-10-24 \
+        --end 2024-06-17 \
+        --apply-market \
+        --overwrite
 
-    The history CSV must contain at least columns: game_date, home_team, away_team.
+    History CSV must contain:
+      - game_date
+      - home_team
+      - away_team
+    (It may contain scores too; we ignore them here.)
     """
     ap = argparse.ArgumentParser(
         description="Run historical model predictions (optionally market-adjusted)."
     )
     ap.add_argument("--history", required=True, help="Path to games history CSV (with game_date, home_team, away_team)")
-    ap.add_argument("--start", required=True)
-    ap.add_argument("--end", required=True)
-    ap.add_argument("--apply-market", action="store_true")
-    ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--start", required=True, help="Start date YYYY-MM-DD (inclusive)")
+    ap.add_argument("--end", required=True, help="End date YYYY-MM-DD (inclusive)")
+    ap.add_argument("--apply-market", action="store_true", help="Apply market ensemble using CLOSE snapshots if available")
+    ap.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
     args = ap.parse_args()
 
     history_df = pd.read_csv(args.history)
@@ -163,10 +205,11 @@ def main():
         raise ValueError(f"History CSV missing required columns: {missing}")
 
     logger.info(
-        "Historical predictions %s → %s (apply_market=%s)",
+        "Historical predictions %s → %s (apply_market=%s overwrite=%s)",
         args.start,
         args.end,
         args.apply_market,
+        args.overwrite,
     )
 
     for d in daterange(args.start, args.end):
