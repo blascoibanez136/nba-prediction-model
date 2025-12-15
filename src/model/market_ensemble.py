@@ -92,7 +92,6 @@ def clean_american_ml(x) -> Optional[float]:
         return None
     if o == 0 or math.isnan(o) or math.isinf(o):
         return None
-    # American odds must have magnitude >= 100. Anything else is decimal-like or corrupted.
     if abs(o) < 100:
         return None
     return o
@@ -181,10 +180,7 @@ def _sanitize_ml_columns(
 # ---------------------------------------------------------------------
 
 def american_to_prob(odds: float) -> Optional[float]:
-    """Convert American moneyline odds to implied probability.
-
-    Returns None if odds are missing or zero.
-    """
+    """Convert American moneyline odds to implied probability."""
     if odds is None:
         return None
     try:
@@ -197,15 +193,11 @@ def american_to_prob(odds: float) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------
-# Spread -> win probability
+# Spread <-> win probability
 # ---------------------------------------------------------------------
 
 def spread_to_win_prob(spread_home: float, slope: float = -0.165) -> Optional[float]:
-    """Map a point spread to a win probability using a logistic curve.
-
-    A negative slope indicates larger spreads favour the road team.
-    Returns None if spread is missing.
-    """
+    """Map home spread to win probability using logistic curve."""
     if spread_home is None:
         return None
     try:
@@ -215,6 +207,25 @@ def spread_to_win_prob(spread_home: float, slope: float = -0.165) -> Optional[fl
     if math.isnan(s):
         return None
     return _sigmoid(slope * s)
+
+
+def win_prob_to_spread(p_home: float, slope: float = -0.165) -> Optional[float]:
+    """
+    Invert spread_to_win_prob.
+    p = sigmoid(slope * spread)  =>  spread = logit(p) / slope
+    With slope negative, p>0.5 yields negative spreads (home favored), which matches market convention.
+    """
+    if p_home is None:
+        return None
+    try:
+        p = float(p_home)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(p) or math.isinf(p) or not (0.0 < p < 1.0):
+        return None
+    if slope == 0:
+        return None
+    return _logit(p) / float(slope)
 
 
 # ---------------------------------------------------------------------
@@ -229,11 +240,7 @@ def compute_dispersion_weight(
     pivot: float = 1.5,
     sharpness: float = 2.0,
 ) -> float:
-    """Map spread dispersion to a blending weight between model and market.
-
-    A lower dispersion implies greater market consensus and a higher weight.
-    Returns 0.5 if dispersion is missing or invalid.
-    """
+    """Map spread dispersion to a blending weight between model and market."""
     if dispersion is None:
         return 0.5
     try:
@@ -260,11 +267,7 @@ def _safe_to_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 
 
 def _detect_pred_points_cols(df: pd.DataFrame) -> tuple[Optional[str], Optional[str]]:
-    """
-    Best-effort detection of predicted home/away points columns.
-
-    We search common naming patterns used across pipelines.
-    """
+    """Best-effort detection of predicted home/away points columns."""
     home_candidates = [
         "pred_home_points_model",
         "pred_home_points",
@@ -273,7 +276,6 @@ def _detect_pred_points_cols(df: pd.DataFrame) -> tuple[Optional[str], Optional[
         "pred_home_score",
         "home_pred_points",
         "model_home_points",
-        "home_pred",
     ]
     away_candidates = [
         "pred_away_points_model",
@@ -283,9 +285,7 @@ def _detect_pred_points_cols(df: pd.DataFrame) -> tuple[Optional[str], Optional[
         "pred_away_score",
         "away_pred_points",
         "model_away_points",
-        "away_pred",
     ]
-
     home_col = next((c for c in home_candidates if c in df.columns), None)
     away_col = next((c for c in away_candidates if c in df.columns), None)
     return home_col, away_col
@@ -296,9 +296,8 @@ def _compute_fair_spread_model_from_points(df: pd.DataFrame) -> Optional[pd.Seri
     Compute fair_spread_model from predicted points.
 
     Convention:
-    - NBA home spread lines are typically NEGATIVE when the HOME team is favored.
-    - Predicted margin = pred_home_pts - pred_away_pts
-    - Therefore: fair_spread_model (home line) = -predicted_margin
+    predicted_margin = pred_home_pts - pred_away_pts
+    fair_spread_model (home line) = -predicted_margin
     """
     hcol, acol = _detect_pred_points_cols(df)
     if not hcol or not acol:
@@ -307,7 +306,6 @@ def _compute_fair_spread_model_from_points(df: pd.DataFrame) -> Optional[pd.Seri
     h = pd.to_numeric(df[hcol], errors="coerce")
     a = pd.to_numeric(df[acol], errors="coerce")
 
-    # Require high coverage so we don't silently compute garbage
     coverage = float((h.notna() & a.notna()).mean())
     if coverage < 0.95:
         logger.warning(
@@ -319,24 +317,67 @@ def _compute_fair_spread_model_from_points(df: pd.DataFrame) -> Optional[pd.Seri
         return None
 
     margin = h - a
-    fair_spread_model = -margin  # critical sign convention
+    spread = -margin
 
-    # Sanity: NBA spreads beyond 40 are almost certainly scale/units bugs
-    max_abs = float(pd.to_numeric(fair_spread_model, errors="coerce").abs().max())
+    max_abs = float(pd.to_numeric(spread, errors="coerce").abs().max())
     if math.isnan(max_abs) or max_abs > 40:
         raise RuntimeError(
-            f"[market_ensemble] fair_spread_model out of bounds after points-derived computation: max_abs={max_abs}. "
+            f"[market_ensemble] fair_spread_model out of bounds from points-derived computation: max_abs={max_abs}. "
             f"Check predicted points scale. Detected cols: home={hcol} away={acol}"
         )
 
     logger.info(
-        "[market_ensemble] Computed fair_spread_model from predicted points cols: home=%s away=%s (coverage=%.3f, max_abs=%.2f)",
+        "[market_ensemble] Computed fair_spread_model from predicted points: home=%s away=%s (coverage=%.3f, max_abs=%.2f)",
         hcol,
         acol,
         coverage,
         max_abs,
     )
-    return fair_spread_model
+    return spread
+
+
+def _compute_fair_spread_model_from_prob(df: pd.DataFrame, *, slope: float) -> Optional[pd.Series]:
+    """
+    Compute fair_spread_model from model win probability using inverse logistic.
+
+    This is the correct Pro-Lite fallback when predicted points are not available.
+    """
+    prob_col = None
+    for c in ["home_win_prob_model", "home_win_prob"]:
+        if c in df.columns:
+            prob_col = c
+            break
+    if not prob_col:
+        return None
+
+    p = pd.to_numeric(df[prob_col], errors="coerce")
+    coverage = float(p.notna().mean())
+    if coverage < 0.95:
+        logger.warning(
+            "[market_ensemble] Model prob coverage too low to compute fair_spread_model from probability: coverage=%.3f prob_col=%s",
+            coverage,
+            prob_col,
+        )
+        return None
+
+    spread = p.apply(lambda x: win_prob_to_spread(x, slope=slope))
+    spread = pd.to_numeric(spread, errors="coerce")
+
+    max_abs = float(spread.abs().max())
+    if math.isnan(max_abs) or max_abs > 40:
+        raise RuntimeError(
+            f"[market_ensemble] fair_spread_model out of bounds from prob-derived computation: max_abs={max_abs}. "
+            f"Check prob calibration/scale and slope={slope} prob_col={prob_col}"
+        )
+
+    logger.info(
+        "[market_ensemble] Computed fair_spread_model from model win prob: prob_col=%s (coverage=%.3f, max_abs=%.2f, slope=%.3f)",
+        prob_col,
+        coverage,
+        max_abs,
+        slope,
+    )
+    return spread
 
 
 # ---------------------------------------------------------------------
@@ -569,37 +610,40 @@ def apply_market_ensemble(
     merged = preds.merge(market, on="merge_key", how="left")
 
     # rename model outputs for clarity before blending
-    # NOTE: fair_spread_model is computed robustly below (not blindly copied)
     if "home_win_prob" in merged.columns:
         merged["home_win_prob_model"] = merged["home_win_prob"]
     if "fair_total" in merged.columns:
         merged["fair_total_model"] = merged["fair_total"]
 
-    # ---- FIX: COMPUTE fair_spread_model CORRECTLY ----
-    # Prefer points-derived computation. Fallback to existing fair_spread if truly unavailable.
+    # ---- FIX: COMPUTE fair_spread_model ROBUSTLY ----
+    # Preference order:
+    #   1) predicted points (best)
+    #   2) inverse-logistic from model win prob (Pro-Lite correct fallback)
+    #   3) fallback to fair_spread only if not constant
     spread_from_points = _compute_fair_spread_model_from_points(merged)
-
     if spread_from_points is not None:
         merged["fair_spread_model"] = spread_from_points
     else:
-        # Fallback: use existing model fair_spread if present
-        if "fair_spread" in merged.columns:
-            merged["fair_spread_model"] = pd.to_numeric(merged["fair_spread"], errors="coerce")
-            # Fail loud if it is constant (this was your root cause)
-            nun = int(merged["fair_spread_model"].nunique(dropna=True))
-            if nun <= 1:
-                raise RuntimeError(
-                    "[market_ensemble] fair_spread_model fallback source 'fair_spread' is constant or missing. "
-                    "Cannot safely run ATS. Provide predicted points columns or fix upstream fair_spread."
-                )
-            logger.warning(
-                "[market_ensemble] Using fallback fair_spread -> fair_spread_model (points cols not found). nunique=%d",
-                nun,
-            )
+        spread_from_prob = _compute_fair_spread_model_from_prob(merged, slope=spread_to_prob_slope)
+        if spread_from_prob is not None:
+            merged["fair_spread_model"] = spread_from_prob
         else:
-            raise RuntimeError(
-                "[market_ensemble] Cannot compute fair_spread_model: no predicted points columns detected and no 'fair_spread' column present."
-            )
+            if "fair_spread" in merged.columns:
+                merged["fair_spread_model"] = pd.to_numeric(merged["fair_spread"], errors="coerce")
+                nun = int(merged["fair_spread_model"].nunique(dropna=True))
+                if nun <= 1:
+                    raise RuntimeError(
+                        "[market_ensemble] fair_spread_model fallback source 'fair_spread' is constant or missing. "
+                        "Cannot safely run ATS. Provide predicted points columns or ensure upstream fair_spread varies per game."
+                    )
+                logger.warning(
+                    "[market_ensemble] Using fallback fair_spread -> fair_spread_model (no points/prob cols detected). nunique=%d",
+                    nun,
+                )
+            else:
+                raise RuntimeError(
+                    "[market_ensemble] Cannot compute fair_spread_model: no predicted points columns, no prob columns, and no fair_spread present."
+                )
 
     # compute market-only win probability: average of spread-implied and ML-implied
     merged["home_win_prob_market"] = merged.apply(
