@@ -33,10 +33,10 @@ import pandas as pd
 from src.model.calibration import load_calibrator, apply_calibrator
 from src.model.market_relative_calibration import (
     load_delta_calibrator,
-    apply_delta_calibrator_prob,
+    apply_delta_calibrator,  # <-- correct function name
 )
 
-ROI_ANALYSIS_VERSION = "roi_analysis_v7_prob_ev_evcal_ml_policy_away_only_optional_american_only_bet_gated_2025-12-15"
+ROI_ANALYSIS_VERSION = "roi_analysis_v7_prob_ev_evcal_ml_policy_away_only_optional_american_only_bet_gated_2025-12-15_fix_import"
 REQUIRED_ODDS_COLS = ["ml_home_consensus", "ml_away_consensus"]
 
 
@@ -140,7 +140,7 @@ def pick_model_prob_col(df: pd.DataFrame) -> str:
     candidates = [
         "home_win_prob_model_raw",
         "home_win_prob_model",
-        "home_win_prob",  # blended or model depending on upstream
+        "home_win_prob",
     ]
     for c in candidates:
         if c in df.columns:
@@ -171,37 +171,26 @@ def _col_exists(df: pd.DataFrame, col: str) -> bool:
 @dataclass(frozen=True)
 class ROIConfig:
     per_game_path: str
+    mode: str = "prob"              # prob | ev | ev_cal
+    ml_side: str = "both"           # both | away_only | home_only
 
-    # Selection mode: prob | ev | ev_cal
-    mode: str = "prob"
-
-    # Policy: which side(s) can be bet on
-    ml_side: str = "both"  # both | away_only | home_only
-
-    # Thresholds
     prob_edge_threshold: float = 0.04
     ev_threshold: float = 0.01
 
-    # Optional absolute calibrator (diagnostics only)
-    calibrator_path: Optional[str] = None
-
-    # Delta calibrator path (required for ev_cal)
-    delta_calibrator_path: Optional[str] = None
+    calibrator_path: Optional[str] = None          # diagnostics only
+    delta_calibrator_path: Optional[str] = None    # required for ev_cal
 
     out_dir: str = "outputs"
 
-    # Bet gating
     min_market_weight: float = 0.35
     max_market_weight: float = 0.75
     max_dispersion: float = 2.25
     require_market_weight: bool = False
     require_dispersion: bool = False
 
-    # Guardrails
     max_profit_abs: float = 10.0
     max_bet_rate: float = 0.35
 
-    # Pre-bet odds sanity
     enforce_max_profit_per_unit_gate: bool = True
 
 
@@ -243,7 +232,7 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
     df["model_prob_home_raw"] = df[model_col]
     df["model_prob_away_raw"] = 1.0 - df["model_prob_home_raw"]
 
-    # Optional absolute calibrator for diagnostics only (NOT used for selection)
+    # Optional absolute calibrator for diagnostics only
     if cfg.calibrator_path:
         cal = load_calibrator(cfg.calibrator_path)
         diag_target = "home_win_prob" if "home_win_prob" in df.columns else model_col
@@ -251,7 +240,7 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
         df[f"{diag_target}_calibrated"] = apply_calibrator(df[diag_target], cal)
         print(f"[roi_analysis] Applied calibrator from {cfg.calibrator_path} to column '{diag_target}' (diagnostics only).")
 
-    # Legacy prob edges vs market
+    # Prob edges vs market (diagnostics + prob mode)
     df["home_edge_prob"] = df["model_prob_home_raw"] - df["market_prob_home"]
     df["away_edge_prob"] = df["model_prob_away_raw"] - (1.0 - df["market_prob_home"])
 
@@ -259,26 +248,24 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
     df["home_ev_raw"] = df.apply(lambda r: expected_value_units(r["model_prob_home_raw"], r["ml_home_consensus"]), axis=1)
     df["away_ev_raw"] = df.apply(lambda r: expected_value_units(r["model_prob_away_raw"], r["ml_away_consensus"]), axis=1)
 
-    # Calibrated probabilities for ev_cal (market-relative delta calibrator)
+    # ev_cal: calibrated probabilities via delta calibrator (market-relative)
     if str(cfg.mode).strip().lower() == "ev_cal":
         if not cfg.delta_calibrator_path:
             raise RuntimeError("[roi] mode=ev_cal requires --delta-calibrator")
         cal_obj = load_delta_calibrator(cfg.delta_calibrator_path)
 
-        # Apply calibrated probability on the HOME side
-        # p_cal_home = f(delta, odds_bucket)
+        # Apply on HOME side; away is complement
         df["model_prob_home_cal"] = df.apply(
-            lambda r: apply_delta_calibrator_prob(
+            lambda r: apply_delta_calibrator(
                 calibrator=cal_obj,
-                model_prob=float(r["model_prob_home_raw"]) if pd.notna(r["model_prob_home_raw"]) else None,
-                market_prob=float(r["market_prob_home"]) if pd.notna(r["market_prob_home"]) else None,
-                ml_home=float(r["ml_home_consensus"]) if pd.notna(r["ml_home_consensus"]) else None,
+                model_prob=(float(r["model_prob_home_raw"]) if pd.notna(r["model_prob_home_raw"]) else None),
+                market_prob=(float(r["market_prob_home"]) if pd.notna(r["market_prob_home"]) else None),
+                ml_home=(float(r["ml_home_consensus"]) if pd.notna(r["ml_home_consensus"]) else None),
             ),
             axis=1,
         )
         df["model_prob_away_cal"] = 1.0 - pd.to_numeric(df["model_prob_home_cal"], errors="coerce")
 
-        # EV using calibrated probabilities
         df["home_ev_cal"] = df.apply(lambda r: expected_value_units(r["model_prob_home_cal"], r["ml_home_consensus"]), axis=1)
         df["away_ev_cal"] = df.apply(lambda r: expected_value_units(r["model_prob_away_cal"], r["ml_away_consensus"]), axis=1)
 
@@ -340,24 +327,14 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
     if ml_side not in ("both", "away_only", "home_only"):
         raise RuntimeError(f"[roi] Invalid ml_side='{cfg.ml_side}'. Expected 'both', 'away_only', or 'home_only'.")
 
-    # Select the score columns based on mode
+    # Select score columns based on mode
     if mode == "prob":
-        home_score_col = "home_edge_prob"
-        away_score_col = "away_edge_prob"
-        threshold = cfg.prob_edge_threshold
-        metric_type = "prob_edge"
+        home_score_col, away_score_col, threshold, metric_type = "home_edge_prob", "away_edge_prob", cfg.prob_edge_threshold, "prob_edge"
     elif mode == "ev":
-        home_score_col = "home_ev_raw"
-        away_score_col = "away_ev_raw"
-        threshold = cfg.ev_threshold
-        metric_type = "ev_units"
-    else:  # ev_cal
-        home_score_col = "home_ev_cal"
-        away_score_col = "away_ev_cal"
-        threshold = cfg.ev_threshold
-        metric_type = "ev_units_cal"
+        home_score_col, away_score_col, threshold, metric_type = "home_ev_raw", "away_ev_raw", cfg.ev_threshold, "ev_units"
+    else:
+        home_score_col, away_score_col, threshold, metric_type = "home_ev_cal", "away_ev_cal", cfg.ev_threshold, "ev_units_cal"
 
-    # Choose side: best metric above threshold, respecting ml_side policy
     def choose_side(r) -> Tuple[bool, Optional[str], Optional[float], Optional[str]]:
         if not bool(r["eligible"]):
             return False, None, None, None
@@ -365,7 +342,7 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
         hs = r.get(home_score_col, None)
         as_ = r.get(away_score_col, None)
 
-        # Apply side policy
+        # Side policy
         if ml_side == "away_only":
             hs = float("nan")
         elif ml_side == "home_only":
@@ -374,7 +351,6 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
         if pd.isna(hs) and pd.isna(as_):
             return False, None, None, None
 
-        # Best-of with tie-breaking toward home (legacy) unless away strictly larger
         if pd.notna(hs) and float(hs) >= threshold and (pd.isna(as_) or float(hs) >= float(as_)):
             return True, "home", float(hs), metric_type
         if pd.notna(as_) and float(as_) >= threshold and (pd.isna(hs) or float(as_) > float(hs)):
@@ -394,7 +370,6 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
 
     bets["stake"] = 1.0
 
-    # Odds price for the bet
     bets["odds_price"] = bets.apply(
         lambda r: r["ml_home_consensus"] if str(r["bet_side"]).lower() == "home" else r["ml_away_consensus"],
         axis=1,
@@ -413,7 +388,6 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
             + sample.to_string(index=False)
         )
 
-    # Settle
     def settle_result(r) -> str:
         side = str(r["bet_side"]).lower()
         hwa = r["home_win_actual"]
@@ -428,7 +402,6 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
     bets["result"] = bets.apply(settle_result, axis=1).astype(str)
     bets["result_win"] = bets["result"].astype(str).str.lower().eq("win")
 
-    # Profit for 1u stake
     def profit_units(r) -> float:
         stake = float(r["stake"])
         res = str(r["result"]).lower()
@@ -461,15 +434,12 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
     if bet_rate > cfg.max_bet_rate:
         raise RuntimeError(
             f"[roi] Bet-rate too high: bets={len(bets)} total_games={total_games} bet_rate={bet_rate:.3f} "
-            f"(cap={cfg.max_bet_rate}). This indicates edge logic or gating regression."
+            f"(cap={cfg.max_bet_rate})."
         )
 
     return bets.reset_index(drop=True)
 
 
-# -----------------------------
-# Summaries
-# -----------------------------
 def summarize(bets: pd.DataFrame) -> Dict[str, Any]:
     if bets is None or bets.empty:
         return {"bets": 0, "stake": 0.0, "profit": 0.0, "roi": None, "win_rate": None}
@@ -480,9 +450,6 @@ def summarize(bets: pd.DataFrame) -> Dict[str, Any]:
     return {"bets": int(len(bets)), "stake": stake, "profit": profit, "roi": roi, "win_rate": win_rate}
 
 
-# -----------------------------
-# Main
-# -----------------------------
 def main() -> None:
     ap = argparse.ArgumentParser("roi_analysis.py (American-only, bet-gated, optional ML side policy)")
     ap.add_argument("--per_game", required=True, help="Path to outputs/backtest_per_game.csv")
@@ -496,18 +463,15 @@ def main() -> None:
     ap.add_argument("--calibrator", default=None, help="Optional absolute calibrator joblib (diagnostics only)")
     ap.add_argument("--delta-calibrator", default=None, help="Delta calibrator joblib (required for ev_cal)")
 
-    # Gating knobs
     ap.add_argument("--min-market-weight", type=float, default=0.35)
     ap.add_argument("--max-market-weight", type=float, default=0.75)
     ap.add_argument("--max-dispersion", type=float, default=2.25)
     ap.add_argument("--require-market-weight", action="store_true")
     ap.add_argument("--require-dispersion", action="store_true")
 
-    # Guardrails
     ap.add_argument("--max-profit-abs", type=float, default=10.0)
     ap.add_argument("--max-bet-rate", type=float, default=0.35)
 
-    # Pre-bet payout sanity
     ap.add_argument("--no-ppu-gate", action="store_true", help="Disable pre-bet profit-per-unit gate (not recommended)")
 
     args = ap.parse_args()
@@ -545,7 +509,6 @@ def main() -> None:
 
     df = pd.read_csv(cfg.per_game_path)
 
-    # Contract visibility
     for c in REQUIRED_ODDS_COLS:
         if c in df.columns:
             s = pd.to_numeric(df[c], errors="coerce")
@@ -569,7 +532,6 @@ def main() -> None:
     print(f"[roi] bet_rate: {bet_rate:.3f}" if bet_rate is not None else "[roi] bet_rate: n/a")
 
     os.makedirs(cfg.out_dir, exist_ok=True)
-    # Preserve output filenames for compatibility
     metrics_path = os.path.join(cfg.out_dir, "roi_metrics.json")
     bets_path = os.path.join(cfg.out_dir, "roi_bets.csv")
 
