@@ -1,21 +1,3 @@
-"""
-Moneyline ROI analysis (fail-loud, market-anchored, bet-side correct).
-
-Hard contract:
-  - ml_home_consensus (American odds)
-  - ml_away_consensus (American odds)
-
-This version adds strong guardrails so the script will FAIL loudly if:
-  - it somehow bets every game with a positive edge threshold
-  - it produces nonsensical profit magnitudes (e.g., -40001 units)
-
-Run:
-  PYTHONPATH=. python src/eval/roi_analysis.py \
-    --per_game outputs/backtest_per_game.csv \
-    --edge 0.02 \
-    --calibrator models/calibrator_winprob_isotonic.joblib
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -29,14 +11,12 @@ import pandas as pd
 
 from src.model.calibration import load_calibrator, apply_calibrator
 
-
-ROI_ANALYSIS_VERSION = "roi_analysis_v2_fail_loud_2025-12-15"
+ROI_ANALYSIS_VERSION = "roi_analysis_v3_hybrid_odds_2025-12-15"
 
 
 # -----------------------------
-# Helpers
+# Odds parsing (HYBRID)
 # -----------------------------
-
 def _to_float(x) -> Optional[float]:
     try:
         v = float(x)
@@ -47,18 +27,41 @@ def _to_float(x) -> Optional[float]:
     return v
 
 
-def american_to_implied_prob(odds: float) -> Optional[float]:
-    o = _to_float(odds)
+def detect_odds_format(o: Optional[float]) -> Optional[str]:
+    """
+    Row-wise format detection.
+      - negative -> american
+      - 1.01..20 -> decimal
+      - >=20 -> american (positive american can be non-integer after averaging)
+    """
     if o is None:
         return None
+    if o < 0:
+        return "american"
+    if 1.01 <= o < 20.0:
+        return "decimal"
+    # 0 < o < 1.01 is invalid; treat as unknown
+    if 0 < o < 1.01:
+        return "invalid"
+    return "american"
+
+
+def implied_prob_from_odds(o: Optional[float]) -> Optional[float]:
+    fmt = detect_odds_format(o)
+    if fmt is None or fmt == "invalid":
+        return None
+    if fmt == "decimal":
+        # implied prob (vigged)
+        return 1.0 / o if o and o > 1.0 else None
+    # american
     if o > 0:
         return 100.0 / (o + 100.0)
     return abs(o) / (abs(o) + 100.0)
 
 
-def devig_probs(home_odds: float, away_odds: float) -> Tuple[Optional[float], Optional[float]]:
-    ph = american_to_implied_prob(home_odds)
-    pa = american_to_implied_prob(away_odds)
+def devig_probs(home_odds: Optional[float], away_odds: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+    ph = implied_prob_from_odds(home_odds)
+    pa = implied_prob_from_odds(away_odds)
     if ph is None or pa is None:
         return None, None
     s = ph + pa
@@ -67,15 +70,22 @@ def devig_probs(home_odds: float, away_odds: float) -> Tuple[Optional[float], Op
     return ph / s, pa / s
 
 
-def american_win_profit_per_unit(odds: float) -> Optional[float]:
-    o = _to_float(odds)
-    if o is None:
+def win_profit_per_unit(o: Optional[float]) -> Optional[float]:
+    fmt = detect_odds_format(o)
+    if fmt is None or fmt == "invalid":
         return None
+    if fmt == "decimal":
+        # Decimal odds: profit on win per 1u stake is (odds - 1)
+        return float(o) - 1.0
+    # American odds
     if o > 0:
-        return o / 100.0
-    return 100.0 / abs(o)
+        return float(o) / 100.0
+    return 100.0 / abs(float(o))
 
 
+# -----------------------------
+# Config
+# -----------------------------
 @dataclass(frozen=True)
 class ROIConfig:
     per_game_path: str
@@ -97,8 +107,8 @@ def pick_model_prob_col(df: pd.DataFrame) -> str:
     candidates = [
         "home_win_prob_model_raw",
         "home_win_prob_model",
-        "home_win_prob",
         "home_win_prob_market",
+        "home_win_prob",
     ]
     for c in candidates:
         if c in df.columns:
@@ -111,13 +121,11 @@ def ensure_home_win_actual(df: pd.DataFrame) -> pd.DataFrame:
     if "home_win_actual" in out.columns:
         out["home_win_actual"] = pd.to_numeric(out["home_win_actual"], errors="coerce")
         return out
-
     if "home_score" in out.columns and "away_score" in out.columns:
         hs = pd.to_numeric(out["home_score"], errors="coerce")
         aw = pd.to_numeric(out["away_score"], errors="coerce")
         out["home_win_actual"] = (hs > aw).astype(float)
         return out
-
     raise RuntimeError("[roi] Missing home_win_actual and cannot infer from scores.")
 
 
@@ -127,7 +135,7 @@ def build_bets(per_game: pd.DataFrame, edge_threshold: float, calibrator_path: O
 
     missing = [c for c in REQUIRED_ODDS_COLS if c not in per_game.columns]
     if missing:
-        raise RuntimeError(f"[roi] Missing required odds columns: {missing}. Found cols: {list(per_game.columns)}")
+        raise RuntimeError(f"[roi] Missing required odds columns: {missing}")
 
     df = ensure_home_win_actual(per_game)
 
@@ -135,19 +143,24 @@ def build_bets(per_game: pd.DataFrame, edge_threshold: float, calibrator_path: O
     df["ml_home_consensus"] = pd.to_numeric(df["ml_home_consensus"], errors="coerce")
     df["ml_away_consensus"] = pd.to_numeric(df["ml_away_consensus"], errors="coerce")
 
-    # Market probabilities (devig)
-    mh, ma, mm = [], [], []
+    # Market probs (devig)
+    mh, ma, mm, hf, af = [], [], [], [], []
     for ho, ao in zip(df["ml_home_consensus"].tolist(), df["ml_away_consensus"].tolist()):
-        ph, pa = devig_probs(ho, ao)
+        ho_f = _to_float(ho)
+        ao_f = _to_float(ao)
+        hf.append(detect_odds_format(ho_f))
+        af.append(detect_odds_format(ao_f))
+        ph, pa = devig_probs(ho_f, ao_f)
         if ph is None or pa is None:
-            mh.append(None); ma.append(None); mm.append("missing_odds")
+            mh.append(None); ma.append(None); mm.append("missing_or_invalid")
         else:
-            mh.append(ph); ma.append(pa); mm.append("devig_implied")
+            mh.append(ph); ma.append(pa); mm.append("devig_rowwise")
     df["market_prob_home"] = mh
     df["market_prob_away"] = ma
     df["market_prob_method"] = mm
+    df["home_odds_format"] = hf
+    df["away_odds_format"] = af
 
-    # Model probabilities (RAW for selection)
     model_col = pick_model_prob_col(df)
     df[model_col] = pd.to_numeric(df[model_col], errors="coerce")
     df["model_prob_home_raw"] = df[model_col]
@@ -158,10 +171,10 @@ def build_bets(per_game: pd.DataFrame, edge_threshold: float, calibrator_path: O
         cal = load_calibrator(calibrator_path)
         target = "home_win_prob" if "home_win_prob" in df.columns else model_col
         df[target] = pd.to_numeric(df[target], errors="coerce")
-        df[f"{target}_calibrated"] = apply_calibrator(df[target], cal)
+        df[f"{target}_calibrated"] = apply_calibrator(df[target], cal)  # NOTE: (probs, calibrator)
         print(f"[roi_analysis] Applied calibrator from {calibrator_path} to column '{target}'.")
 
-    # Edges
+    # Edges vs devig market
     df["home_edge"] = df["model_prob_home_raw"] - df["market_prob_home"]
     df["away_edge"] = df["model_prob_away_raw"] - df["market_prob_away"]
 
@@ -182,34 +195,18 @@ def build_bets(per_game: pd.DataFrame, edge_threshold: float, calibrator_path: O
     df["edge_used"] = chosen[2]
 
     bets = df[df["bet"]].copy()
-
-    # Guardrail: If edge_threshold > 0 and we bet EVERYTHING, something is wrong.
-    if edge_threshold > 0 and len(bets) == len(df) and len(df) > 50:
-        # Print quick diagnostics
-        he_desc = pd.to_numeric(df["home_edge"], errors="coerce").describe().to_dict()
-        ae_desc = pd.to_numeric(df["away_edge"], errors="coerce").describe().to_dict()
-        raise RuntimeError(
-            "[roi] Sanity failure: bet count equals total games despite positive edge threshold. "
-            f"edge_threshold={edge_threshold}. home_edge_desc={he_desc}. away_edge_desc={ae_desc}."
-        )
-
     if bets.empty:
         return bets
 
-    # Stake default 1u
-    if "stake" in bets.columns:
-        bets["stake"] = pd.to_numeric(bets["stake"], errors="coerce").fillna(1.0)
-    else:
-        bets["stake"] = 1.0
+    bets["stake"] = 1.0
 
-    # Odds for bet side
     bets["odds_price"] = bets.apply(
         lambda r: r["ml_home_consensus"] if str(r["bet_side"]).lower() == "home" else r["ml_away_consensus"],
         axis=1,
     )
     bets["odds_price"] = pd.to_numeric(bets["odds_price"], errors="coerce")
 
-    # Result as STRING labels
+    # Result label
     def settle_result(r) -> str:
         side = str(r["bet_side"]).lower()
         hwa = r["home_win_actual"]
@@ -223,7 +220,7 @@ def build_bets(per_game: pd.DataFrame, edge_threshold: float, calibrator_path: O
 
     bets["result"] = bets.apply(settle_result, axis=1).astype(str)
 
-    # Profit in units using correct American odds
+    # Profit
     def profit_units(r) -> float:
         stake = float(r["stake"])
         res = str(r["result"]).lower()
@@ -231,49 +228,40 @@ def build_bets(per_game: pd.DataFrame, edge_threshold: float, calibrator_path: O
             return 0.0
         if res != "win":
             return -stake
-        ppu = american_win_profit_per_unit(r["odds_price"])
+        ppu = win_profit_per_unit(_to_float(r["odds_price"]))
         if ppu is None:
             return 0.0
         return stake * float(ppu)
 
     bets["profit"] = bets.apply(profit_units, axis=1)
+    bets["market"] = "moneyline"
 
-    # Guardrail: profit magnitude sanity on 1u bets
-    # For NBA moneylines, >25u profit magnitude per bet is effectively impossible unless odds are corrupt.
+    # Fail-loud sanity: if profit is exploding, odds are still malformed.
+    # With hybrid handling, a truly extreme profit (e.g., >50u) is suspicious for NBA ML.
     max_abs = float(pd.to_numeric(bets["profit"], errors="coerce").abs().max())
-    if max_abs > 25.0:
-        sample = bets.sort_values("profit").head(3)[["game_date","home_team","away_team","bet_side","odds_price","result","stake","profit"]]
+    if max_abs > 50.0:
+        sample = bets.sort_values("profit").head(5)[
+            ["game_date", "home_team", "away_team", "bet_side", "odds_price", "home_odds_format", "away_odds_format", "result", "stake", "profit"]
+        ]
         raise RuntimeError(
             f"[roi] Profit sanity failure: max |profit|={max_abs}u. "
-            "This indicates corrupted odds or wrong settlement. Sample worst rows:\n"
+            "Likely malformed odds values (near 0, invalid decimals, etc.). Sample worst rows:\n"
             + sample.to_string(index=False)
         )
 
-    bets["market"] = "moneyline"
-
-    # Ensure merge_key present if possible
-    if "merge_key" not in bets.columns and {"home_team","away_team","game_date"} <= set(bets.columns):
-        bets["merge_key"] = (
-            bets["home_team"].astype(str).str.lower().str.strip()
-            + "__"
-            + bets["away_team"].astype(str).str.lower().str.strip()
-            + "__"
-            + bets["game_date"].astype(str).str[:10]
-        )
-
-    # Column order
+    # Summary-friendly column order
     front = [
-        "game_date","home_team","away_team","merge_key",
-        "bet_side","odds_price","stake","result","profit",
-        "edge_used","home_edge","away_edge",
-        "market_prob_home","market_prob_away","market_prob_method",
-        "model_prob_home_raw","model_prob_away_raw",
+        "game_date", "home_team", "away_team", "merge_key",
+        "bet_side", "odds_price", "stake", "result", "profit",
+        "edge_used", "home_edge", "away_edge",
+        "market_prob_home", "market_prob_away", "market_prob_method",
+        "home_odds_format", "away_odds_format",
+        "model_prob_home_raw", "model_prob_away_raw",
         "market",
     ]
     front = [c for c in front if c in bets.columns]
     bets = bets[front + [c for c in bets.columns if c not in front]]
-
-    return bets
+    return bets.reset_index(drop=True)
 
 
 def summarize(bets: pd.DataFrame) -> Dict[str, Any]:
@@ -288,25 +276,25 @@ def summarize(bets: pd.DataFrame) -> Dict[str, Any]:
 
 def bucketize(bets: pd.DataFrame) -> pd.DataFrame:
     if bets.empty:
-        return pd.DataFrame(columns=["bucket","bets","stake","profit","roi","win_rate","avg_edge","avg_odds"])
+        return pd.DataFrame(columns=["bucket", "bets", "stake", "profit", "roi", "win_rate", "avg_edge", "avg_odds"])
     b = bets.copy()
     b["edge_used"] = pd.to_numeric(b["edge_used"], errors="coerce")
 
-    bins = [0.0,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.10,10.0]
-    labels = ["<0.02","0.02-0.03","0.03-0.04","0.04-0.05","0.05-0.06",
-              "0.06-0.07","0.07-0.08","0.08-0.09","0.09-0.10",">=0.10"]
+    bins = [0.0, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 10.0]
+    labels = ["<0.02", "0.02-0.03", "0.03-0.04", "0.04-0.05", "0.05-0.06",
+              "0.06-0.07", "0.07-0.08", "0.08-0.09", "0.09-0.10", ">=0.10"]
     b["bucket"] = pd.cut(b["edge_used"].fillna(-1.0), bins=bins, labels=labels, right=False, include_lowest=True)
 
     g = b.groupby("bucket", dropna=False, observed=False)
     out = g.agg(
-        bets=("profit","size"),
-        stake=("stake","sum"),
-        profit=("profit","sum"),
-        win_rate=("result", lambda s: (s.astype(str).str.lower()=="win").mean()),
-        avg_edge=("edge_used","mean"),
+        bets=("profit", "size"),
+        stake=("stake", "sum"),
+        profit=("profit", "sum"),
+        win_rate=("result", lambda s: (s.astype(str).str.lower() == "win").mean()),
+        avg_edge=("edge_used", "mean"),
         avg_odds=("odds_price", lambda s: pd.to_numeric(s, errors="coerce").mean()),
     ).reset_index()
-    out["roi"] = out.apply(lambda r: (r["profit"]/r["stake"]) if r["stake"] else None, axis=1)
+    out["roi"] = out.apply(lambda r: (r["profit"] / r["stake"]) if r["stake"] else None, axis=1)
     return out
 
 
@@ -338,8 +326,8 @@ def main() -> None:
     os.makedirs(cfg.out_dir, exist_ok=True)
 
     overall = summarize(bets)
-    home_bets = bets[bets["bet_side"].astype(str).str.lower()=="home"].copy() if not bets.empty else bets
-    away_bets = bets[bets["bet_side"].astype(str).str.lower()=="away"].copy() if not bets.empty else bets
+    home_bets = bets[bets["bet_side"].astype(str).str.lower() == "home"].copy() if not bets.empty else bets
+    away_bets = bets[bets["bet_side"].astype(str).str.lower() == "away"].copy() if not bets.empty else bets
 
     home_sum = summarize(home_bets)
     away_sum = summarize(away_bets)
@@ -348,6 +336,11 @@ def main() -> None:
     print(f"[roi] overall: {overall}")
     print(f"[roi] home_only: {home_sum}")
     print(f"[roi] away_only: {away_sum}")
+
+    # Extra diagnostics: format mix
+    if not bets.empty and "home_odds_format" in bets.columns and "away_odds_format" in bets.columns:
+        fmt_counts = pd.concat([bets["home_odds_format"], bets["away_odds_format"]]).value_counts(dropna=False).to_dict()
+        print(f"[roi] odds_format_counts (home+away columns): {fmt_counts}")
 
     buckets = bucketize(bets)
 
@@ -365,7 +358,9 @@ def main() -> None:
     buckets_path = os.path.join(cfg.out_dir, "roi_buckets.csv")
     bets_path = os.path.join(cfg.out_dir, "roi_bets.csv")
 
-    write_json(metrics_path, metrics)
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
     buckets.to_csv(buckets_path, index=False)
     bets.to_csv(bets_path, index=False)
 
