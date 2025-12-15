@@ -112,7 +112,6 @@ def _sanitize_ml_columns(
     if home_col not in out.columns and away_col not in out.columns:
         return out
 
-    # Pre-stats (count decimal-like / malformed)
     def _count_decimal_like(s: pd.Series) -> int:
         s_num = pd.to_numeric(s, errors="coerce")
         return int(((s_num.abs() < 100) & (s_num.abs() > 0)).sum())
@@ -149,7 +148,6 @@ def _sanitize_ml_columns(
         before_decimal_like_away,
     )
 
-    # Fail loud if ANY decimal-like survived into consensus cols
     def _survivors(col: str) -> pd.Series:
         s = pd.to_numeric(out[col], errors="coerce")
         return (s.abs() < 100) & (s.abs() > 0)
@@ -159,7 +157,6 @@ def _sanitize_ml_columns(
     survivors = int(survivors_home + survivors_away)
 
     if survivors > 0:
-        # Provide a small sample for debugging
         cols = ["merge_key"]
         if home_col in out.columns:
             cols.append(home_col)
@@ -262,30 +259,102 @@ def _safe_to_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return df
 
 
+def _detect_pred_points_cols(df: pd.DataFrame) -> tuple[Optional[str], Optional[str]]:
+    """
+    Best-effort detection of predicted home/away points columns.
+
+    We search common naming patterns used across pipelines.
+    """
+    home_candidates = [
+        "pred_home_points_model",
+        "pred_home_points",
+        "home_points_pred",
+        "home_score_pred",
+        "pred_home_score",
+        "home_pred_points",
+        "model_home_points",
+        "home_pred",
+    ]
+    away_candidates = [
+        "pred_away_points_model",
+        "pred_away_points",
+        "away_points_pred",
+        "away_score_pred",
+        "pred_away_score",
+        "away_pred_points",
+        "model_away_points",
+        "away_pred",
+    ]
+
+    home_col = next((c for c in home_candidates if c in df.columns), None)
+    away_col = next((c for c in away_candidates if c in df.columns), None)
+    return home_col, away_col
+
+
+def _compute_fair_spread_model_from_points(df: pd.DataFrame) -> Optional[pd.Series]:
+    """
+    Compute fair_spread_model from predicted points.
+
+    Convention:
+    - NBA home spread lines are typically NEGATIVE when the HOME team is favored.
+    - Predicted margin = pred_home_pts - pred_away_pts
+    - Therefore: fair_spread_model (home line) = -predicted_margin
+    """
+    hcol, acol = _detect_pred_points_cols(df)
+    if not hcol or not acol:
+        return None
+
+    h = pd.to_numeric(df[hcol], errors="coerce")
+    a = pd.to_numeric(df[acol], errors="coerce")
+
+    # Require high coverage so we don't silently compute garbage
+    coverage = float((h.notna() & a.notna()).mean())
+    if coverage < 0.95:
+        logger.warning(
+            "[market_ensemble] Pred points coverage too low to compute fair_spread_model safely: coverage=%.3f home_col=%s away_col=%s",
+            coverage,
+            hcol,
+            acol,
+        )
+        return None
+
+    margin = h - a
+    fair_spread_model = -margin  # critical sign convention
+
+    # Sanity: NBA spreads beyond 40 are almost certainly scale/units bugs
+    max_abs = float(pd.to_numeric(fair_spread_model, errors="coerce").abs().max())
+    if math.isnan(max_abs) or max_abs > 40:
+        raise RuntimeError(
+            f"[market_ensemble] fair_spread_model out of bounds after points-derived computation: max_abs={max_abs}. "
+            f"Check predicted points scale. Detected cols: home={hcol} away={acol}"
+        )
+
+    logger.info(
+        "[market_ensemble] Computed fair_spread_model from predicted points cols: home=%s away=%s (coverage=%.3f, max_abs=%.2f)",
+        hcol,
+        acol,
+        coverage,
+        max_abs,
+    )
+    return fair_spread_model
+
+
 # ---------------------------------------------------------------------
 # Normalized odds aggregation
 # ---------------------------------------------------------------------
 
 def _aggregate_from_normalized(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate normalized odds into consensus statistics.
-
-    Expects columns: merge_key, market, side, point, price. The `side` column
-    indicates 'home' or 'away' for h2h moneylines and spreads, and 'over'
-    for totals. Prices are American odds. Points are spread or total values.
-    """
+    """Aggregate normalized odds into consensus statistics."""
     df = df.copy()
     df["market"] = df["market"].astype(str).str.lower()
     df["side"] = df["side"].astype(str).str.lower()
     df["point"] = pd.to_numeric(df.get("point"), errors="coerce")
     df["price"] = pd.to_numeric(df.get("price"), errors="coerce")
 
-    # filter by market/side for spreads and totals
     spreads = df[(df.market == "spreads") & (df.side == "home")]
     totals = df[(df.market == "totals") & (df.side == "over")]
-    # include both home and away for h2h so we can de-vig
     h2h = df[(df.market == "h2h") & (df.side.isin(["home", "away"]))]
 
-    # consensus spread mean and dispersion
     if not spreads.empty:
         spread_stats = (
             spreads.groupby("merge_key")["point"]
@@ -296,7 +365,6 @@ def _aggregate_from_normalized(df: pd.DataFrame) -> pd.DataFrame:
     else:
         spread_stats = pd.DataFrame(columns=["merge_key", "home_spread_consensus", "home_spread_dispersion"])
 
-    # consensus total mean
     if not totals.empty:
         totals_stats = (
             totals.groupby("merge_key")["point"]
@@ -307,23 +375,17 @@ def _aggregate_from_normalized(df: pd.DataFrame) -> pd.DataFrame:
     else:
         totals_stats = pd.DataFrame(columns=["merge_key", "total_consensus"])
 
-    # moneyline price and de-vigged probability consensus
     if not h2h.empty:
-        # Enforce American-only contract on raw prices BEFORE aggregation
         h2h = h2h.copy()
         h2h["price"] = h2h["price"].apply(clean_american_ml)
-
-        # implied probability per outcome from price (American only)
         h2h["prob"] = h2h["price"].apply(american_to_prob)
 
-        # mean price by side
         ml_price = (
             h2h.pivot_table(index="merge_key", columns="side", values="price", aggfunc="mean")
             .rename(columns={"home": "ml_home_consensus", "away": "ml_away_consensus"})
             .reset_index()
         )
 
-        # mean implied probability by side
         ml_prob = (
             h2h.pivot_table(index="merge_key", columns="side", values="prob", aggfunc="mean")
             .rename(columns={"home": "home_ml_prob_raw", "away": "away_ml_prob_raw"})
@@ -333,10 +395,6 @@ def _aggregate_from_normalized(df: pd.DataFrame) -> pd.DataFrame:
         ml_stats = ml_price.merge(ml_prob, on="merge_key", how="outer")
 
         def _devig_row(r: pd.Series) -> Optional[float]:
-            """De-vig a pair of implied probs into a single home implied prob.
-            If both home and away probs are present and sum > 0, return the
-            normalized home prob. Otherwise return the home raw prob.
-            """
             ph = r.get("home_ml_prob_raw")
             pa = r.get("away_ml_prob_raw")
             if pd.notna(ph) and pd.notna(pa) and (ph + pa) > 0:
@@ -349,13 +407,10 @@ def _aggregate_from_normalized(df: pd.DataFrame) -> pd.DataFrame:
     else:
         ml_stats = pd.DataFrame(columns=["merge_key", "ml_home_consensus", "ml_away_consensus", "home_ml_prob_consensus"])
 
-    # merge all components
     out = spread_stats.merge(totals_stats, on="merge_key", how="outer")
     out = out.merge(ml_stats, on="merge_key", how="outer")
 
-    # Apply ML contract sanitizer + instrumentation on consensus outputs
     out = _sanitize_ml_columns(out, context="aggregate_from_normalized")
-
     return out
 
 
@@ -364,13 +419,9 @@ def _aggregate_from_normalized(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------
 
 def _aggregate_from_wide(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate wide snapshot odds into consensus statistics.
-
-    Auto-detects column names for spreads, totals, and moneyline prices.
-    """
+    """Aggregate wide snapshot odds into consensus statistics."""
     df = df.copy()
 
-    # helper to find the first matching column from a set
     def _find(cols):
         for c in cols:
             if c in df.columns:
@@ -382,10 +433,8 @@ def _aggregate_from_wide(df: pd.DataFrame) -> pd.DataFrame:
     ml_home_col = _find(["ml_home", "home_ml"])
     ml_away_col = _find(["ml_away", "away_ml"])
 
-    # cast numeric columns safely
     df = _safe_to_numeric(df, [spread_col, total_col, ml_home_col, ml_away_col])
 
-    # spread consensus and dispersion
     if spread_col:
         spread_stats = (
             df.groupby("merge_key")[spread_col]
@@ -396,7 +445,6 @@ def _aggregate_from_wide(df: pd.DataFrame) -> pd.DataFrame:
     else:
         spread_stats = pd.DataFrame(columns=["merge_key", "home_spread_consensus", "home_spread_dispersion"])
 
-    # total consensus
     if total_col:
         totals_stats = (
             df.groupby("merge_key")[total_col]
@@ -407,15 +455,11 @@ def _aggregate_from_wide(df: pd.DataFrame) -> pd.DataFrame:
     else:
         totals_stats = pd.DataFrame(columns=["merge_key", "total_consensus"])
 
-    # moneyline consensus
     if ml_home_col and ml_away_col:
         ml = df[["merge_key", ml_home_col, ml_away_col]].copy()
-
-        # Enforce American-only contract on raw wide columns BEFORE aggregation
         ml[ml_home_col] = ml[ml_home_col].apply(clean_american_ml)
         ml[ml_away_col] = ml[ml_away_col].apply(clean_american_ml)
 
-        # mean price consensus per side
         ml_price = (
             ml.groupby("merge_key")[[ml_home_col, ml_away_col]]
             .mean()
@@ -423,7 +467,6 @@ def _aggregate_from_wide(df: pd.DataFrame) -> pd.DataFrame:
             .reset_index()
         )
 
-        # compute implied probability per row and de-vig
         def _devig(r: pd.Series) -> Optional[float]:
             ph = american_to_prob(r[ml_home_col])
             pa = american_to_prob(r[ml_away_col])
@@ -452,11 +495,9 @@ def _aggregate_from_wide(df: pd.DataFrame) -> pd.DataFrame:
     else:
         ml_stats = pd.DataFrame(columns=["merge_key", "ml_home_consensus", "ml_away_consensus", "home_ml_prob_consensus"])
 
-    # combine all consensus pieces
     out = spread_stats.merge(totals_stats, on="merge_key", how="outer")
     out = out.merge(ml_stats, on="merge_key", how="outer")
 
-    # Apply ML contract sanitizer + instrumentation on consensus outputs
     out = _sanitize_ml_columns(out, context="aggregate_from_wide")
 
     logger.info("[market_ensemble] Wide aggregation produced %d games.", out.merge_key.nunique() if "merge_key" in out.columns else len(out))
@@ -468,12 +509,7 @@ def _aggregate_from_wide(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------
 
 def aggregate_market_from_odds(odds_df: pd.DataFrame, snapshot_type: str = "close") -> pd.DataFrame:
-    """Aggregate odds snapshot DataFrame into market consensus features.
-
-    This function chooses the appropriate aggregation routine based on the
-    presence of normalized or wide columns. It filters to the desired
-    snapshot type and normalizes merge_key casing.
-    """
+    """Aggregate odds snapshot DataFrame into market consensus features."""
     if odds_df is None or odds_df.empty:
         return pd.DataFrame(columns=[
             "merge_key", "home_spread_consensus", "home_spread_dispersion",
@@ -482,11 +518,9 @@ def aggregate_market_from_odds(odds_df: pd.DataFrame, snapshot_type: str = "clos
         ])
 
     df = odds_df.copy()
-    # filter by snapshot type
     if "snapshot_type" in df.columns:
         df = df[df.snapshot_type.astype(str).str.lower() == snapshot_type.lower()]
 
-    # normalize merge_key
     df["merge_key"] = df["merge_key"].astype(str).str.strip().str.lower()
 
     logger.info(
@@ -497,15 +531,12 @@ def aggregate_market_from_odds(odds_df: pd.DataFrame, snapshot_type: str = "clos
         df["merge_key"].nunique() if "merge_key" in df.columns else -1,
     )
 
-    # decide aggregation based on columns present
     if {"market", "side", "point"} <= set(df.columns):
         out = _aggregate_from_normalized(df)
     else:
         out = _aggregate_from_wide(df)
 
-    # Final guard: contract must hold on output no matter which path
     out = _sanitize_ml_columns(out, context="aggregate_market_from_odds_final_guard")
-
     return out
 
 
@@ -522,17 +553,9 @@ def apply_market_ensemble(
     min_market_weight: float = 0.20,
     max_market_weight: float = 0.80,
 ) -> pd.DataFrame:
-    """Blend model predictions with market consensus.
-
-    This function takes a DataFrame of model predictions (preds_df) and a
-    DataFrame of market odds (odds_df), aggregates the market data, and
-    produces blended probabilities and fair lines. The merge_key is
-    constructed on the fly if missing in preds_df. Market weights are
-    determined by the dispersion of consensus spreads.
-    """
+    """Blend model predictions with market consensus."""
     preds = preds_df.copy()
 
-    # construct merge_key if missing
     if "merge_key" not in preds.columns:
         preds["merge_key"] = (
             preds.home_team.str.lower().str.strip() + "__" +
@@ -546,9 +569,37 @@ def apply_market_ensemble(
     merged = preds.merge(market, on="merge_key", how="left")
 
     # rename model outputs for clarity before blending
-    merged["home_win_prob_model"] = merged["home_win_prob"]
-    merged["fair_spread_model"] = merged["fair_spread"]
-    merged["fair_total_model"] = merged["fair_total"]
+    # NOTE: fair_spread_model is computed robustly below (not blindly copied)
+    if "home_win_prob" in merged.columns:
+        merged["home_win_prob_model"] = merged["home_win_prob"]
+    if "fair_total" in merged.columns:
+        merged["fair_total_model"] = merged["fair_total"]
+
+    # ---- FIX: COMPUTE fair_spread_model CORRECTLY ----
+    # Prefer points-derived computation. Fallback to existing fair_spread if truly unavailable.
+    spread_from_points = _compute_fair_spread_model_from_points(merged)
+
+    if spread_from_points is not None:
+        merged["fair_spread_model"] = spread_from_points
+    else:
+        # Fallback: use existing model fair_spread if present
+        if "fair_spread" in merged.columns:
+            merged["fair_spread_model"] = pd.to_numeric(merged["fair_spread"], errors="coerce")
+            # Fail loud if it is constant (this was your root cause)
+            nun = int(merged["fair_spread_model"].nunique(dropna=True))
+            if nun <= 1:
+                raise RuntimeError(
+                    "[market_ensemble] fair_spread_model fallback source 'fair_spread' is constant or missing. "
+                    "Cannot safely run ATS. Provide predicted points columns or fix upstream fair_spread."
+                )
+            logger.warning(
+                "[market_ensemble] Using fallback fair_spread -> fair_spread_model (points cols not found). nunique=%d",
+                nun,
+            )
+        else:
+            raise RuntimeError(
+                "[market_ensemble] Cannot compute fair_spread_model: no predicted points columns detected and no 'fair_spread' column present."
+            )
 
     # compute market-only win probability: average of spread-implied and ML-implied
     merged["home_win_prob_market"] = merged.apply(
@@ -572,18 +623,18 @@ def apply_market_ensemble(
     )
 
     # blend model and market win probabilities in logit space
-    merged["home_win_prob"] = merged.apply(
-        lambda r:
-            _sigmoid(
-                (1 - r.market_weight) * _logit(r.home_win_prob_model)
-                + r.market_weight * _logit(r.home_win_prob_market)
-            )
-            if pd.notna(r.home_win_prob_market)
-            else r.home_win_prob_model,
-        axis=1
-    )
-
-    merged["away_win_prob"] = 1 - merged["home_win_prob"]
+    if "home_win_prob_model" in merged.columns:
+        merged["home_win_prob"] = merged.apply(
+            lambda r:
+                _sigmoid(
+                    (1 - r.market_weight) * _logit(r.home_win_prob_model)
+                    + r.market_weight * _logit(r.home_win_prob_market)
+                )
+                if pd.notna(r.home_win_prob_market)
+                else r.home_win_prob_model,
+            axis=1
+        )
+        merged["away_win_prob"] = 1 - merged["home_win_prob"]
 
     # assign market fair lines
     merged["fair_spread_market"] = merged.home_spread_consensus
@@ -598,13 +649,14 @@ def apply_market_ensemble(
         axis=1
     )
 
-    merged["fair_total"] = merged.apply(
-        lambda r:
-            (1 - r.market_weight) * r.fair_total_model + r.market_weight * r.fair_total_market
-            if pd.notna(r.fair_total_market)
-            else r.fair_total_model,
-        axis=1
-    )
+    if "fair_total_model" in merged.columns:
+        merged["fair_total"] = merged.apply(
+            lambda r:
+                (1 - r.market_weight) * r.fair_total_model + r.market_weight * r.fair_total_market
+                if pd.notna(r.fair_total_market)
+                else r.fair_total_model,
+            axis=1
+        )
 
     # Backward compatibility aliases
     merged["consensus_close"] = merged.home_spread_consensus
@@ -621,4 +673,3 @@ def apply_market_ensemble(
 def apply_market_ensemble_from_csv(preds_csv: str, odds_csv: str) -> pd.DataFrame:
     """Convenience wrapper to apply market ensemble from CSV file paths."""
     return apply_market_ensemble(pd.read_csv(preds_csv), pd.read_csv(odds_csv))
-
