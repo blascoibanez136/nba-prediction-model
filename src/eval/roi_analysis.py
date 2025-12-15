@@ -33,10 +33,10 @@ import pandas as pd
 from src.model.calibration import load_calibrator, apply_calibrator
 from src.model.market_relative_calibration import (
     load_delta_calibrator,
-    apply_delta_calibrator,  # <-- correct function name
+    apply_delta_calibrator,  # signature: (delta, ml_home_odds, calibrator)
 )
 
-ROI_ANALYSIS_VERSION = "roi_analysis_v7_prob_ev_evcal_ml_policy_away_only_optional_american_only_bet_gated_2025-12-15_fix_import"
+ROI_ANALYSIS_VERSION = "roi_analysis_v7_prob_ev_evcal_ml_policy_away_only_optional_american_only_bet_gated_2025-12-15_fix_signature"
 REQUIRED_ODDS_COLS = ["ml_home_consensus", "ml_away_consensus"]
 
 
@@ -254,13 +254,13 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
             raise RuntimeError("[roi] mode=ev_cal requires --delta-calibrator")
         cal_obj = load_delta_calibrator(cfg.delta_calibrator_path)
 
-        # Apply on HOME side; away is complement
+        # compute delta and apply calibrator using its real signature
+        df["delta_home"] = df["model_prob_home_raw"] - df["market_prob_home"]
         df["model_prob_home_cal"] = df.apply(
             lambda r: apply_delta_calibrator(
+                delta=(float(r["delta_home"]) if pd.notna(r["delta_home"]) else None),
+                ml_home_odds=(float(r["ml_home_consensus"]) if pd.notna(r["ml_home_consensus"]) else None),
                 calibrator=cal_obj,
-                model_prob=(float(r["model_prob_home_raw"]) if pd.notna(r["model_prob_home_raw"]) else None),
-                market_prob=(float(r["market_prob_home"]) if pd.notna(r["market_prob_home"]) else None),
-                ml_home=(float(r["ml_home_consensus"]) if pd.notna(r["ml_home_consensus"]) else None),
             ),
             axis=1,
         )
