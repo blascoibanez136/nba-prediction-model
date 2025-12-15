@@ -4,6 +4,7 @@ ATS (spread) ROI analysis with fixed -110 pricing.
 Adds:
 - --eval-start / --eval-end date window filtering
 - overlap warning if calibrator train window overlaps eval window (metadata-driven)
+- --side selection (both/home_only/away_only) for policy testing
 
 Assumptions:
 - pricing is fixed -110 (ppu=0.9090909)
@@ -60,7 +61,9 @@ def _get_date_col(df: pd.DataFrame) -> str:
 
 def _get_residual(df: pd.DataFrame) -> pd.Series:
     if "fair_spread_model" in df.columns and "home_spread_consensus" in df.columns:
-        return pd.to_numeric(df["fair_spread_model"], errors="coerce") - pd.to_numeric(df["home_spread_consensus"], errors="coerce")
+        return pd.to_numeric(df["fair_spread_model"], errors="coerce") - pd.to_numeric(
+            df["home_spread_consensus"], errors="coerce"
+        )
     if "spread_error" in df.columns:
         return pd.to_numeric(df["spread_error"], errors="coerce")
     raise RuntimeError("[ats_roi] Need fair_spread_model+home_spread_consensus OR spread_error.")
@@ -89,6 +92,9 @@ class ATSConfig:
     eval_end: Optional[str] = None
     fail_on_overlap: bool = False
 
+    # NEW: policy side gating (default keeps existing behavior)
+    side: str = "both"  # "both" | "home_only" | "away_only"
+
     out_dir: str = "outputs"
 
 
@@ -102,7 +108,9 @@ def summarize(bets: pd.DataFrame) -> Dict[str, Any]:
     return {"bets": int(len(bets)), "stake": stake, "profit": profit, "roi": roi, "win_rate": win_rate}
 
 
-def _warn_or_fail_overlap(cal_meta: Dict[str, Any], eval_start: pd.Timestamp, eval_end: pd.Timestamp, fail: bool) -> None:
+def _warn_or_fail_overlap(
+    cal_meta: Dict[str, Any], eval_start: pd.Timestamp, eval_end: pd.Timestamp, fail: bool
+) -> None:
     ts = cal_meta.get("train_start")
     te = cal_meta.get("train_end")
     if not ts or not te:
@@ -116,12 +124,31 @@ def _warn_or_fail_overlap(cal_meta: Dict[str, Any], eval_start: pd.Timestamp, ev
 
     overlaps = not (eval_end < t0 or eval_start > t1)
     if overlaps:
-        msg = f"[ats] {'ERROR' if fail else 'WARNING'}: calibrator train window {t0.date()}..{t1.date()} overlaps eval window {eval_start.date()}..{eval_end.date()} (leakage risk)."
+        msg = (
+            f"[ats] {'ERROR' if fail else 'WARNING'}: calibrator train window "
+            f"{t0.date()}..{t1.date()} overlaps eval window {eval_start.date()}..{eval_end.date()} (leakage risk)."
+        )
         if fail:
             raise RuntimeError(msg)
         print(msg)
     else:
         print(f"[ats] overlap_check: OK (train {t0.date()}..{t1.date()} vs eval {eval_start.date()}..{eval_end.date()})")
+
+
+def _apply_side_policy(bets: pd.DataFrame, side: str) -> pd.DataFrame:
+    """
+    Apply ATS side policy gating. Default 'both' keeps existing behavior unchanged.
+    """
+    s = str(side).lower().strip()
+    if bets is None or bets.empty:
+        return bets
+    if s == "both":
+        return bets
+    if s == "home_only":
+        return bets[bets["bet_side"].astype(str).str.lower() == "home"].copy()
+    if s == "away_only":
+        return bets[bets["bet_side"].astype(str).str.lower() == "away"].copy()
+    raise ValueError(f"[ats] Invalid side policy: {side}")
 
 
 def main() -> None:
@@ -140,6 +167,14 @@ def main() -> None:
     ap.add_argument("--eval-end", default=None, help="Eval window end inclusive (YYYY-MM-DD)")
     ap.add_argument("--fail-on-overlap", action="store_true", help="Fail loudly if calibrator overlaps eval window")
 
+    # NEW: policy side selection
+    ap.add_argument(
+        "--side",
+        default="both",
+        choices=["both", "home_only", "away_only"],
+        help="ATS side policy gating (default: both; preserves existing behavior).",
+    )
+
     args = ap.parse_args()
 
     cfg = ATSConfig(
@@ -153,6 +188,7 @@ def main() -> None:
         eval_start=args.eval_start,
         eval_end=args.eval_end,
         fail_on_overlap=bool(args.fail_on_overlap),
+        side=str(args.side),
         out_dir="outputs",
     )
 
@@ -165,6 +201,7 @@ def main() -> None:
     print(f"[ats] dispersion<= {cfg.max_dispersion:.2f} require={cfg.require_dispersion}")
     print(f"[ats] guards: max_profit_abs={cfg.max_profit_abs} max_bet_rate={cfg.max_bet_rate}")
     print(f"[ats] pricing: fixed -110 ppu={PPU_ATS_MINUS_110:.6f}")
+    print(f"[ats] side_policy={cfg.side}")
 
     if not os.path.exists(cfg.per_game_path):
         raise FileNotFoundError(f"[ats] per_game not found: {cfg.per_game_path}")
@@ -211,7 +248,11 @@ def main() -> None:
     if "home_spread_dispersion" in df.columns:
         df["home_spread_dispersion"] = pd.to_numeric(df["home_spread_dispersion"], errors="coerce")
         disp_gate = df["home_spread_dispersion"].le(cfg.max_dispersion)
-        eligible = disp_gate & df["home_spread_dispersion"].notna() if cfg.require_dispersion else (disp_gate | df["home_spread_dispersion"].isna())
+        eligible = (
+            disp_gate & df["home_spread_dispersion"].notna()
+            if cfg.require_dispersion
+            else (disp_gate | df["home_spread_dispersion"].isna())
+        )
     else:
         if cfg.require_dispersion:
             raise RuntimeError("[ats] require_dispersion=True but home_spread_dispersion column missing")
@@ -252,16 +293,21 @@ def main() -> None:
     df["bet_side"] = chosen[1]
     df["ev_used"] = chosen[2]
 
+    # Build bets, then apply policy gating BEFORE bet-rate guard
     bets = df[df["bet"]].copy()
+    bets = _apply_side_policy(bets, cfg.side)
+
     total_games = int(df["merge_key"].nunique()) if "merge_key" in df.columns else int(len(df))
     bet_rate = float(len(bets) / max(total_games, 1))
 
     if bet_rate > cfg.max_bet_rate:
-        raise RuntimeError(f"[ats] Bet-rate too high: bets={len(bets)} total_games={total_games} bet_rate={bet_rate:.3f} cap={cfg.max_bet_rate}")
+        raise RuntimeError(
+            f"[ats] Bet-rate too high: bets={len(bets)} total_games={total_games} bet_rate={bet_rate:.3f} cap={cfg.max_bet_rate}"
+        )
 
     if bets.empty:
         print("[ats] No bets selected.")
-        metrics = {"version": ATS_ROI_VERSION, "bets": 0, "bet_rate": bet_rate}
+        metrics = {"version": ATS_ROI_VERSION, "bets": 0, "bet_rate": bet_rate, "side_policy": cfg.side}
         os.makedirs(cfg.out_dir, exist_ok=True)
         with open(os.path.join(cfg.out_dir, "ats_roi_metrics.json"), "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
@@ -273,7 +319,9 @@ def main() -> None:
     bets["stake"] = 1.0
 
     def ats_result(r) -> str:
-        hs = float(r[hcol]); aw = float(r[acol]); line = float(r["home_spread_consensus"])
+        hs = float(r[hcol])
+        aw = float(r[acol])
+        line = float(r["home_spread_consensus"])
         adj_home = hs + line
         if adj_home == aw:
             return "push"
@@ -321,6 +369,7 @@ def main() -> None:
         "home_only": home_sum,
         "away_only": away_sum,
         "bet_rate": bet_rate,
+        "side_policy": cfg.side,
         "ev_threshold": cfg.ev_threshold,
         "eval_window": {"start": str(es.date()), "end": str(ee.date()), "date_col": date_col},
         "dispersion": {"max_dispersion": cfg.max_dispersion, "require_dispersion": cfg.require_dispersion},
