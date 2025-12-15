@@ -6,26 +6,22 @@ This module assumes upstream has enforced an American-only contract for:
   - ml_away_consensus (American odds)
 
 Key principles (Elite discipline):
-- Selection uses RAW model probability (pre-calibration).
-- Optional calibrator is applied for diagnostics only.
+- Selection can run in two modes:
+    * prob: probability edge vs de-vig market (legacy behavior)
+    * ev:   expected value in units (odds-aware, preferred)
 - Market probability is computed by de-vigging implied probs from BOTH sides.
 - Bet selection is gated to prevent overtrading and reduce noise:
     * require both ML odds valid (abs >= 100)
     * require market weight within [min_market_weight, max_market_weight] if available
     * require spread dispersion <= max_dispersion if available
-    * edge threshold required
+    * threshold required (prob-edge or EV)
     * optional max_bet_rate cap (fail loud)
+    * optional payout sanity gate to reject absurd odds
 
 Outputs:
 - outputs/roi_metrics.json
 - outputs/roi_buckets.csv
 - outputs/roi_bets.csv
-
-Run:
-  PYTHONPATH=. python -m src.eval.roi_analysis \
-    --per_game outputs/backtest_per_game.csv \
-    --edge 0.04 \
-    --calibrator models/calibrator_winprob_isotonic.joblib
 """
 
 from __future__ import annotations
@@ -41,7 +37,7 @@ import pandas as pd
 
 from src.model.calibration import load_calibrator, apply_calibrator
 
-ROI_ANALYSIS_VERSION = "roi_analysis_v4_american_only_bet_gated_2025-12-15"
+ROI_ANALYSIS_VERSION = "roi_analysis_v5_ev_mode_optional_american_only_bet_gated_2025-12-14"
 
 REQUIRED_ODDS_COLS = ["ml_home_consensus", "ml_away_consensus"]
 
@@ -63,7 +59,7 @@ def clean_american_ml(x) -> Optional[float]:
     """
     Strict American-only sanitizer:
     - numeric, finite, non-zero
-    - abs(x) >= 100
+    - abs(x) >= 100  (reject decimal-like odds)
     """
     v = _to_float(x)
     if v is None:
@@ -116,6 +112,28 @@ def win_profit_per_unit_american(o: Optional[float]) -> Optional[float]:
     return 100.0 / abs(float(o))
 
 
+def expected_value_units(p_win: Optional[float], american_odds: Optional[float]) -> Optional[float]:
+    """
+    EV in units for a 1u stake.
+      EV = p * profit_if_win - (1-p) * 1
+    Returns None if inputs invalid.
+    """
+    if p_win is None:
+        return None
+    try:
+        p = float(p_win)
+    except Exception:
+        return None
+    if not (0.0 < p < 1.0) or math.isnan(p) or math.isinf(p):
+        return None
+
+    ppu = win_profit_per_unit_american(american_odds)
+    if ppu is None:
+        return None
+
+    return p * float(ppu) - (1.0 - p) * 1.0
+
+
 def pick_model_prob_col(df: pd.DataFrame) -> str:
     """
     Prefer raw model probability for selection.
@@ -124,7 +142,7 @@ def pick_model_prob_col(df: pd.DataFrame) -> str:
     candidates = [
         "home_win_prob_model_raw",
         "home_win_prob_model",
-        "home_win_prob",          # blended or model depending on upstream
+        "home_win_prob",  # blended or model depending on upstream
     ]
     for c in candidates:
         if c in df.columns:
@@ -155,8 +173,17 @@ def _col_exists(df: pd.DataFrame, col: str) -> bool:
 @dataclass(frozen=True)
 class ROIConfig:
     per_game_path: str
-    edge_threshold: float
-    calibrator_path: Optional[str]
+
+    # Selection mode:
+    #   prob: select by probability edge vs de-vig market
+    #   ev:   select by expected value in units (odds-aware)
+    mode: str = "prob"
+
+    # Thresholds by mode
+    prob_edge_threshold: float = 0.04
+    ev_threshold: float = 0.01
+
+    calibrator_path: Optional[str] = None
     out_dir: str = "outputs"
 
     # Bet gating (Elite discipline)
@@ -167,8 +194,11 @@ class ROIConfig:
     require_dispersion: bool = False
 
     # Fail-loud guardrails
-    max_profit_abs: float = 10.0   # per 1u stake, ML profit > 10u is suspicious
+    max_profit_abs: float = 10.0   # per 1u stake, realized profit > 10u is suspicious
     max_bet_rate: float = 0.35     # fail loud if betting > 35% of games (regression detector)
+
+    # Pre-bet odds sanity (prevents extreme payout lines becoming candidates)
+    enforce_max_profit_per_unit_gate: bool = True
 
 
 def write_json(path: str, obj: Dict[str, Any]) -> None:
@@ -191,10 +221,8 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
     df = ensure_home_win_actual(per_game)
 
     # Sanitize odds upstream contract again (belt + suspenders)
-    df["ml_home_consensus"] = pd.to_numeric(df["ml_home_consensus"], errors="coerce")
-    df["ml_away_consensus"] = pd.to_numeric(df["ml_away_consensus"], errors="coerce")
-    df["ml_home_consensus"] = df["ml_home_consensus"].apply(clean_american_ml)
-    df["ml_away_consensus"] = df["ml_away_consensus"].apply(clean_american_ml)
+    df["ml_home_consensus"] = pd.to_numeric(df["ml_home_consensus"], errors="coerce").apply(clean_american_ml)
+    df["ml_away_consensus"] = pd.to_numeric(df["ml_away_consensus"], errors="coerce").apply(clean_american_ml)
 
     # Compute market prob (devig) and method
     probs = df.apply(
@@ -214,20 +242,22 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
     # Optional calibrator for diagnostics only (NOT used for selection)
     if cfg.calibrator_path:
         cal = load_calibrator(cfg.calibrator_path)
-        # Apply to whichever column exists for diagnostics (prefer home_win_prob if present)
         diag_target = "home_win_prob" if "home_win_prob" in df.columns else model_col
         df[diag_target] = pd.to_numeric(df[diag_target], errors="coerce")
         df[f"{diag_target}_calibrated"] = apply_calibrator(df[diag_target], cal)
         print(f"[roi_analysis] Applied calibrator from {cfg.calibrator_path} to column '{diag_target}'.")
 
-    # Edges vs de-vig market
-    df["home_edge"] = df["model_prob_home_raw"] - df["market_prob_home"]
-    df["away_edge"] = df["model_prob_away_raw"] - (1.0 - df["market_prob_home"])
+    # Legacy edges vs de-vig market (keep for diagnostics even in EV mode)
+    df["home_edge_prob"] = df["model_prob_home_raw"] - df["market_prob_home"]
+    df["away_edge_prob"] = df["model_prob_away_raw"] - (1.0 - df["market_prob_home"])
+
+    # EV edges (units) for both sides (odds-aware)
+    df["home_ev"] = df.apply(lambda r: expected_value_units(r["model_prob_home_raw"], r["ml_home_consensus"]), axis=1)
+    df["away_ev"] = df.apply(lambda r: expected_value_units(r["model_prob_away_raw"], r["ml_away_consensus"]), axis=1)
 
     # -------------------------
     # Bet gating
     # -------------------------
-    # Gate: require market prob and both odds
     base_gate = (
         df["model_prob_home_raw"].between(0, 1, inclusive="neither")
         & df["market_prob_home"].notna()
@@ -246,7 +276,9 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
         df["gate_market_weight_ok"] = pd.NA
 
     # Optional gate: dispersion threshold
-    dispersion_col = "home_spread_dispersion" if _col_exists(df, "home_spread_dispersion") else ("book_dispersion" if _col_exists(df, "book_dispersion") else None)
+    dispersion_col = "home_spread_dispersion" if _col_exists(df, "home_spread_dispersion") else (
+        "book_dispersion" if _col_exists(df, "book_dispersion") else None
+    )
     if dispersion_col:
         disp = pd.to_numeric(df[dispersion_col], errors="coerce")
         disp_gate = disp.le(cfg.max_dispersion) | disp.isna()  # allow missing dispersion by default
@@ -258,26 +290,58 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
         df["gate_dispersion_ok"] = pd.NA
         df["dispersion_used_col"] = pd.NA
 
+    # Pre-bet payout sanity: exclude absurd odds from becoming candidates
+    if cfg.enforce_max_profit_per_unit_gate:
+        home_ppu = df["ml_home_consensus"].apply(win_profit_per_unit_american)
+        away_ppu = df["ml_away_consensus"].apply(win_profit_per_unit_american)
+        # if ppu is missing, keep row eligible (it will be filtered elsewhere); if present, must be <= max_profit_abs
+        ppu_gate = (
+            (home_ppu.isna() | (home_ppu <= cfg.max_profit_abs))
+            & (away_ppu.isna() | (away_ppu <= cfg.max_profit_abs))
+        )
+        df["gate_ppu_ok"] = ppu_gate
+        base_gate = base_gate & ppu_gate
+    else:
+        df["gate_ppu_ok"] = pd.NA
+
     df["eligible"] = base_gate
 
-    # Choose side: take the larger edge above threshold
-    def choose_side(r) -> Tuple[bool, Optional[str], Optional[float]]:
+    mode = str(cfg.mode).strip().lower()
+    if mode not in ("prob", "ev"):
+        raise RuntimeError(f"[roi] Invalid mode='{cfg.mode}'. Expected 'prob' or 'ev'.")
+
+    # Choose side: take best metric above threshold
+    def choose_side(r) -> Tuple[bool, Optional[str], Optional[float], Optional[str]]:
         if not bool(r["eligible"]):
-            return False, None, None
-        he = r["home_edge"]
-        ae = r["away_edge"]
-        if pd.isna(he) or pd.isna(ae):
-            return False, None, None
-        if he >= cfg.edge_threshold and he >= ae:
-            return True, "home", float(he)
-        if ae >= cfg.edge_threshold and ae > he:
-            return True, "away", float(ae)
-        return False, None, None
+            return False, None, None, None
+
+        if mode == "prob":
+            he = r["home_edge_prob"]
+            ae = r["away_edge_prob"]
+            if pd.isna(he) or pd.isna(ae):
+                return False, None, None, None
+            if he >= cfg.prob_edge_threshold and he >= ae:
+                return True, "home", float(he), "prob_edge"
+            if ae >= cfg.prob_edge_threshold and ae > he:
+                return True, "away", float(ae), "prob_edge"
+            return False, None, None, None
+
+        # EV mode
+        hev = r["home_ev"]
+        aev = r["away_ev"]
+        if pd.isna(hev) or pd.isna(aev):
+            return False, None, None, None
+        if hev >= cfg.ev_threshold and hev >= aev:
+            return True, "home", float(hev), "ev_units"
+        if aev >= cfg.ev_threshold and aev > hev:
+            return True, "away", float(aev), "ev_units"
+        return False, None, None, None
 
     chosen = df.apply(choose_side, axis=1, result_type="expand")
     df["bet"] = chosen[0].astype(bool)
     df["bet_side"] = chosen[1]
-    df["edge_used"] = chosen[2]
+    df["metric_used"] = chosen[2]
+    df["metric_type"] = chosen[3]
 
     bets = df[df["bet"]].copy()
     if bets.empty:
@@ -293,15 +357,18 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
     bets["odds_price"] = pd.to_numeric(bets["odds_price"], errors="coerce")
 
     # Contract assertion: any bet must have valid American odds
-    invalid_bet_odds = bets["odds_price"].apply(lambda x: (x is not None) and (not math.isnan(float(x))) and (abs(float(x)) < 100) and (abs(float(x)) > 0))
+    invalid_bet_odds = bets["odds_price"].apply(
+        lambda x: (x is not None) and (not math.isnan(float(x))) and (abs(float(x)) < 100) and (abs(float(x)) > 0)
+    )
     if bool(invalid_bet_odds.any()):
-        sample = bets.loc[invalid_bet_odds, ["game_date", "home_team", "away_team", "bet_side", "odds_price", "ml_home_consensus", "ml_away_consensus"]].head(10)
+        sample = bets.loc[invalid_bet_odds, ["game_date", "home_team", "away_team", "bet_side", "odds_price",
+                                            "ml_home_consensus", "ml_away_consensus"]].head(10)
         raise RuntimeError(
             "[roi] American-only ML contract violation: found bet rows with 0 < abs(odds) < 100. Sample:\n"
             + sample.to_string(index=False)
         )
 
-    # Result label (string) + boolean win flag
+    # Result label + boolean win flag
     def settle_result(r) -> str:
         side = str(r["bet_side"]).lower()
         hwa = r["home_win_actual"]
@@ -326,22 +393,21 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
             return -stake
         ppu = win_profit_per_unit_american(_to_float(r["odds_price"]))
         if ppu is None:
-            # should not happen if contract holds, but keep deterministic
             return 0.0
         return stake * float(ppu)
 
     bets["profit"] = bets.apply(profit_units, axis=1)
     bets["market"] = "moneyline"
 
-    # Fail-loud: profit sanity
+    # Fail-loud: realized profit sanity
     max_abs = float(pd.to_numeric(bets["profit"], errors="coerce").abs().max())
     if max_abs > cfg.max_profit_abs:
         sample = bets.sort_values("profit", ascending=False).head(10)[
-            ["game_date", "home_team", "away_team", "bet_side", "odds_price", "result", "stake", "profit", "edge_used"]
+            ["game_date", "home_team", "away_team", "bet_side", "odds_price", "result", "stake", "profit", "metric_used", "metric_type"]
         ]
         raise RuntimeError(
             f"[roi] Profit sanity failure: max |profit|={max_abs}u (limit={cfg.max_profit_abs}). "
-            "This indicates corrupted odds or wrong settlement. Sample high-profit rows:\n"
+            "This indicates corrupted odds or wrong settlement (or extreme odds slipped through). Sample:\n"
             + sample.to_string(index=False)
         )
 
@@ -358,10 +424,12 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
     front = [
         "game_date", "home_team", "away_team", "merge_key",
         "bet_side", "odds_price", "stake", "result", "result_win", "profit",
-        "edge_used", "home_edge", "away_edge",
+        "metric_type", "metric_used",
+        "home_edge_prob", "away_edge_prob",
+        "home_ev", "away_ev",
         "model_prob_home_raw", "market_prob_home", "market_prob_method",
         "market_weight", "home_spread_dispersion", "book_dispersion",
-        "gate_market_weight_ok", "gate_dispersion_ok", "eligible",
+        "gate_market_weight_ok", "gate_dispersion_ok", "gate_ppu_ok", "eligible",
         "market",
     ]
     front = [c for c in front if c in bets.columns]
@@ -383,30 +451,27 @@ def summarize(bets: pd.DataFrame) -> Dict[str, Any]:
     return {"bets": int(len(bets)), "stake": stake, "profit": profit, "roi": roi, "win_rate": win_rate}
 
 
-def bucketize(bets: pd.DataFrame) -> pd.DataFrame:
+def bucketize(bets: pd.DataFrame, metric_col: str) -> pd.DataFrame:
     if bets is None or bets.empty:
-        return pd.DataFrame(columns=["bucket", "bets", "stake", "profit", "roi", "win_rate", "avg_edge", "avg_odds"])
+        return pd.DataFrame(columns=["bucket", "bets", "stake", "profit", "roi", "win_rate", "avg_metric", "avg_odds"])
 
     b = bets.copy()
-    b["edge_used"] = pd.to_numeric(b["edge_used"], errors="coerce")
+    b[metric_col] = pd.to_numeric(b[metric_col], errors="coerce")
 
-    # Default buckets (tune later once spread/totals ROI is added)
-    bins = [0.0, 0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 10.0]
-    labels = ["<0.02", "0.02-0.03", "0.03-0.04", "0.04-0.05", "0.05-0.06", "0.06-0.08", "0.08-0.10", ">=0.10"]
-    b["bucket"] = pd.cut(b["edge_used"].fillna(-1.0), bins=bins, labels=labels, right=False, include_lowest=True)
+    # Buckets tuned for EV mode defaults (still works for prob mode)
+    bins = [-10.0, -0.05, 0.00, 0.01, 0.02, 0.04, 0.06, 0.10, 10.0]
+    labels = ["<-0.05", "-0.05-0.00", "0.00-0.01", "0.01-0.02", "0.02-0.04", "0.04-0.06", "0.06-0.10", ">=0.10"]
+    b["bucket"] = pd.cut(b[metric_col].fillna(-999.0), bins=bins, labels=labels, right=False, include_lowest=True)
 
-    # observed=False to avoid pandas FutureWarning behavior changes
     g = b.groupby("bucket", dropna=False, observed=False)
-
     out = g.agg(
         bets=("profit", "size"),
         stake=("stake", "sum"),
         profit=("profit", "sum"),
         win_rate=("result_win", "mean") if "result_win" in b.columns else ("result", lambda s: (s.astype(str).str.lower() == "win").mean()),
-        avg_edge=("edge_used", "mean"),
+        avg_metric=(metric_col, "mean"),
         avg_odds=("odds_price", lambda s: pd.to_numeric(s, errors="coerce").mean()),
     ).reset_index()
-
     out["roi"] = out.apply(lambda r: (r["profit"] / r["stake"]) if r["stake"] else None, axis=1)
     return out
 
@@ -417,7 +482,11 @@ def bucketize(bets: pd.DataFrame) -> pd.DataFrame:
 def main() -> None:
     ap = argparse.ArgumentParser("roi_analysis.py (American-only, bet-gated)")
     ap.add_argument("--per_game", required=True, help="Path to outputs/backtest_per_game.csv")
-    ap.add_argument("--edge", required=True, type=float, help="Edge threshold (e.g., 0.04)")
+
+    ap.add_argument("--mode", default="prob", choices=["prob", "ev"], help="Selection mode: prob (legacy) or ev (odds-aware)")
+
+    ap.add_argument("--edge", type=float, default=0.04, help="Probability-edge threshold (prob mode).")
+    ap.add_argument("--ev", type=float, default=0.01, help="EV threshold in units (ev mode).")
 
     ap.add_argument("--calibrator", default=None, help="Optional calibrator joblib (diagnostics only)")
 
@@ -432,11 +501,16 @@ def main() -> None:
     ap.add_argument("--max-profit-abs", type=float, default=10.0)
     ap.add_argument("--max-bet-rate", type=float, default=0.35)
 
+    # Pre-bet payout sanity
+    ap.add_argument("--no-ppu-gate", action="store_true", help="Disable pre-bet profit-per-unit gate (not recommended)")
+
     args = ap.parse_args()
 
     cfg = ROIConfig(
         per_game_path=args.per_game,
-        edge_threshold=float(args.edge),
+        mode=str(args.mode),
+        prob_edge_threshold=float(args.edge),
+        ev_threshold=float(args.ev),
         calibrator_path=args.calibrator if args.calibrator else None,
         out_dir="outputs",
         min_market_weight=float(args.min_market_weight),
@@ -446,15 +520,16 @@ def main() -> None:
         require_dispersion=bool(args.require_dispersion),
         max_profit_abs=float(args.max_profit_abs),
         max_bet_rate=float(args.max_bet_rate),
+        enforce_max_profit_per_unit_gate=(not bool(args.no_ppu_gate)),
     )
 
     print(f"[roi] version={ROI_ANALYSIS_VERSION}")
     print(f"[roi] __file__={__file__}")
     print(f"[roi] cwd={os.getcwd()}")
     print(f"[roi] per_game={cfg.per_game_path}")
-    print(f"[roi] edge_threshold={cfg.edge_threshold:.4f}")
+    print(f"[roi] mode={cfg.mode} prob_edge_threshold={cfg.prob_edge_threshold:.4f} ev_threshold={cfg.ev_threshold:.4f}")
     print(f"[roi] gating: market_weight in [{cfg.min_market_weight:.2f},{cfg.max_market_weight:.2f}] require={cfg.require_market_weight} "
-          f"dispersion<= {cfg.max_dispersion:.2f} require={cfg.require_dispersion}")
+          f"dispersion<= {cfg.max_dispersion:.2f} require={cfg.require_dispersion} ppu_gate={cfg.enforce_max_profit_per_unit_gate}")
     print(f"[roi] guards: max_profit_abs={cfg.max_profit_abs} max_bet_rate={cfg.max_bet_rate}")
 
     if not os.path.exists(cfg.per_game_path):
@@ -479,7 +554,6 @@ def main() -> None:
     home_sum = summarize(home_bets)
     away_sum = summarize(away_bets)
 
-    # Metrics
     total_games = int(df["merge_key"].nunique()) if "merge_key" in df.columns else int(len(df))
     bet_rate = float(len(bets) / max(total_games, 1)) if total_games else None
 
@@ -488,11 +562,14 @@ def main() -> None:
     print(f"[roi] away_only: {away_sum}")
     print(f"[roi] bet_rate: {bet_rate:.3f}" if bet_rate is not None else "[roi] bet_rate: n/a")
 
-    buckets = bucketize(bets)
+    metric_col = "metric_used" if not bets.empty and "metric_used" in bets.columns else ("home_edge_prob" if cfg.mode == "prob" else "home_ev")
+    buckets = bucketize(bets, metric_col=metric_col)
 
     metrics: Dict[str, Any] = {
         "version": ROI_ANALYSIS_VERSION,
-        "edge_threshold": cfg.edge_threshold,
+        "mode": cfg.mode,
+        "prob_edge_threshold": cfg.prob_edge_threshold,
+        "ev_threshold": cfg.ev_threshold,
         "overall": overall,
         "home_only": home_sum,
         "away_only": away_sum,
@@ -509,6 +586,7 @@ def main() -> None:
             "max_dispersion": cfg.max_dispersion,
             "require_market_weight": cfg.require_market_weight,
             "require_dispersion": cfg.require_dispersion,
+            "ppu_gate_enabled": cfg.enforce_max_profit_per_unit_gate,
         },
         "guards": {
             "max_profit_abs": cfg.max_profit_abs,
