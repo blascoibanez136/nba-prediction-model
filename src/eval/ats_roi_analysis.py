@@ -1,24 +1,14 @@
 """
-ATS (spread) ROI analysis.
+ATS (spread) ROI analysis with fixed -110 pricing.
 
-Contracts / assumptions:
-- Spread prices are implicit (fixed -110)
-- Profit per 1u if win = +0.9090909
-- Loss per 1u if lose = -1.0
-- Push = 0.0
+Adds:
+- --eval-start / --eval-end date window filtering
+- overlap warning if calibrator train window overlaps eval window (metadata-driven)
 
-Signal:
-- residual = fair_spread_model - home_spread_consensus  (or spread_error fallback)
+Assumptions:
+- pricing is fixed -110 (ppu=0.9090909)
+- residual = fair_spread_model - home_spread_consensus (or spread_error fallback)
 - calibrator maps residual -> P(home_covers)
-- P(away_covers) = 1 - P(home_covers)
-
-Selection:
-- Choose side with best EV, if EV >= threshold
-- Optional dispersion gating via home_spread_dispersion
-
-Outputs:
-- outputs/ats_roi_metrics.json
-- outputs/ats_roi_bets.csv
 """
 
 from __future__ import annotations
@@ -34,8 +24,7 @@ import pandas as pd
 
 from src.model.spread_relative_calibration import load_spread_calibrator, apply_spread_calibrator
 
-ATS_ROI_VERSION = "ats_roi_v1_ev_cal_fixed_110_dispersion_gated_2025-12-15"
-
+ATS_ROI_VERSION = "ats_roi_v2_ev_cal_fixed_110_oos_eval_window_2025-12-15"
 PPU_ATS_MINUS_110 = 100.0 / 110.0  # 0.9090909
 
 
@@ -62,6 +51,13 @@ def _find_score_cols(df: pd.DataFrame) -> Tuple[str, str]:
     raise RuntimeError("[ats_roi] Missing score columns (home_score/away_score or equivalent).")
 
 
+def _get_date_col(df: pd.DataFrame) -> str:
+    for c in ["game_date", "date", "gamedate"]:
+        if c in df.columns:
+            return c
+    raise RuntimeError("[ats_roi] Missing game_date/date column; required for eval windows.")
+
+
 def _get_residual(df: pd.DataFrame) -> pd.Series:
     if "fair_spread_model" in df.columns and "home_spread_consensus" in df.columns:
         return pd.to_numeric(df["fair_spread_model"], errors="coerce") - pd.to_numeric(df["home_spread_consensus"], errors="coerce")
@@ -71,8 +67,6 @@ def _get_residual(df: pd.DataFrame) -> pd.Series:
 
 
 def expected_value_ats(p_win: Optional[float]) -> Optional[float]:
-    if p_win is None:
-        return None
     p = _to_float(p_win)
     if p is None or not (0.0 < p < 1.0):
         return None
@@ -83,13 +77,17 @@ def expected_value_ats(p_win: Optional[float]) -> Optional[float]:
 class ATSConfig:
     per_game_path: str
     calibrator_path: str
-    ev_threshold: float = 0.01
+    ev_threshold: float = 0.02
 
     max_dispersion: float = 2.0
     require_dispersion: bool = True
 
-    max_bet_rate: float = 0.35
+    max_bet_rate: float = 0.30
     max_profit_abs: float = 10.0
+
+    eval_start: Optional[str] = None
+    eval_end: Optional[str] = None
+    fail_on_overlap: bool = False
 
     out_dir: str = "outputs"
 
@@ -104,17 +102,43 @@ def summarize(bets: pd.DataFrame) -> Dict[str, Any]:
     return {"bets": int(len(bets)), "stake": stake, "profit": profit, "roi": roi, "win_rate": win_rate}
 
 
+def _warn_or_fail_overlap(cal_meta: Dict[str, Any], eval_start: pd.Timestamp, eval_end: pd.Timestamp, fail: bool) -> None:
+    ts = cal_meta.get("train_start")
+    te = cal_meta.get("train_end")
+    if not ts or not te:
+        print("[ats] WARNING: calibrator meta missing train_start/train_end; cannot check overlap.")
+        return
+    t0 = pd.to_datetime(ts, errors="coerce")
+    t1 = pd.to_datetime(te, errors="coerce")
+    if pd.isna(t0) or pd.isna(t1):
+        print("[ats] WARNING: calibrator meta train_start/train_end unparsable; cannot check overlap.")
+        return
+
+    overlaps = not (eval_end < t0 or eval_start > t1)
+    if overlaps:
+        msg = f"[ats] {'ERROR' if fail else 'WARNING'}: calibrator train window {t0.date()}..{t1.date()} overlaps eval window {eval_start.date()}..{eval_end.date()} (leakage risk)."
+        if fail:
+            raise RuntimeError(msg)
+        print(msg)
+    else:
+        print(f"[ats] overlap_check: OK (train {t0.date()}..{t1.date()} vs eval {eval_start.date()}..{eval_end.date()})")
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser("ats_roi_analysis.py")
-    ap.add_argument("--per_game", required=True, help="Path to outputs/backtest_per_game.csv")
-    ap.add_argument("--calibrator", required=True, help="Path to artifacts/spread_calibrator.joblib")
-    ap.add_argument("--ev", type=float, default=0.01, help="EV threshold (units) for ATS selection")
+    ap = argparse.ArgumentParser("ats_roi_analysis.py (OOS eval capable)")
+    ap.add_argument("--per_game", required=True)
+    ap.add_argument("--calibrator", required=True)
+    ap.add_argument("--ev", type=float, default=0.02)
 
     ap.add_argument("--max-dispersion", type=float, default=2.0)
-    ap.add_argument("--no-require-dispersion", action="store_true", help="If set, dispersion gate becomes optional")
+    ap.add_argument("--no-require-dispersion", action="store_true")
 
-    ap.add_argument("--max-bet-rate", type=float, default=0.35)
+    ap.add_argument("--max-bet-rate", type=float, default=0.30)
     ap.add_argument("--max-profit-abs", type=float, default=10.0)
+
+    ap.add_argument("--eval-start", default=None, help="Eval window start (YYYY-MM-DD)")
+    ap.add_argument("--eval-end", default=None, help="Eval window end inclusive (YYYY-MM-DD)")
+    ap.add_argument("--fail-on-overlap", action="store_true", help="Fail loudly if calibrator overlaps eval window")
 
     args = ap.parse_args()
 
@@ -126,6 +150,9 @@ def main() -> None:
         require_dispersion=(not bool(args.no_require_dispersion)),
         max_bet_rate=float(args.max_bet_rate),
         max_profit_abs=float(args.max_profit_abs),
+        eval_start=args.eval_start,
+        eval_end=args.eval_end,
+        fail_on_overlap=bool(args.fail_on_overlap),
         out_dir="outputs",
     )
 
@@ -148,6 +175,29 @@ def main() -> None:
     if df.empty:
         raise RuntimeError("[ats] per_game is empty")
 
+    date_col = _get_date_col(df)
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    if df[date_col].isna().any():
+        raise RuntimeError("[ats] Found NaT in game_date; cannot filter safely.")
+
+    # apply eval window filter
+    if cfg.eval_start or cfg.eval_end:
+        if not (cfg.eval_start and cfg.eval_end):
+            raise ValueError("[ats] Provide both --eval-start and --eval-end")
+        es = pd.to_datetime(cfg.eval_start, errors="coerce")
+        ee = pd.to_datetime(cfg.eval_end, errors="coerce")
+        if pd.isna(es) or pd.isna(ee):
+            raise ValueError("[ats] Invalid eval window dates.")
+        df = df[(df[date_col] >= es) & (df[date_col] <= ee)].copy()
+        print(f"[ats] eval_window: {es.date()}..{ee.date()} rows={len(df)}")
+    else:
+        es = pd.to_datetime(df[date_col].min())
+        ee = pd.to_datetime(df[date_col].max())
+        print(f"[ats] eval_window: ALL ({es.date()}..{ee.date()}) rows={len(df)}")
+
+    if df.empty:
+        raise RuntimeError("[ats] No rows after eval window filtering.")
+
     if "home_spread_consensus" not in df.columns:
         raise RuntimeError("[ats] Missing required column: home_spread_consensus")
 
@@ -155,31 +205,24 @@ def main() -> None:
     df[hcol] = pd.to_numeric(df[hcol], errors="coerce")
     df[acol] = pd.to_numeric(df[acol], errors="coerce")
     df["home_spread_consensus"] = pd.to_numeric(df["home_spread_consensus"], errors="coerce")
-
-    # residual
     df["spread_residual"] = _get_residual(df)
 
-    # dispersion
+    # dispersion gate
     if "home_spread_dispersion" in df.columns:
         df["home_spread_dispersion"] = pd.to_numeric(df["home_spread_dispersion"], errors="coerce")
         disp_gate = df["home_spread_dispersion"].le(cfg.max_dispersion)
+        eligible = disp_gate & df["home_spread_dispersion"].notna() if cfg.require_dispersion else (disp_gate | df["home_spread_dispersion"].isna())
     else:
-        df["home_spread_dispersion"] = pd.NA
-        disp_gate = pd.Series([True] * len(df))
+        if cfg.require_dispersion:
+            raise RuntimeError("[ats] require_dispersion=True but home_spread_dispersion column missing")
+        eligible = pd.Series([True] * len(df))
 
-    if cfg.require_dispersion and "home_spread_dispersion" in df.columns:
-        eligible = disp_gate & df["home_spread_dispersion"].notna()
-    elif cfg.require_dispersion and "home_spread_dispersion" not in df.columns:
-        raise RuntimeError("[ats] require_dispersion=True but home_spread_dispersion column is missing")
-    else:
-        eligible = disp_gate | df["home_spread_dispersion"].isna()
-
-    # require core fields
     eligible = eligible & df["spread_residual"].notna() & df["home_spread_consensus"].notna() & df[hcol].notna() & df[acol].notna()
-
     df["eligible"] = eligible
 
     cal = load_spread_calibrator(cfg.calibrator_path)
+    _warn_or_fail_overlap(cal.get("meta", {}), es, ee, cfg.fail_on_overlap)
+
     df["p_home_cover"] = df.apply(
         lambda r: apply_spread_calibrator(
             residual=_to_float(r["spread_residual"]),
@@ -189,27 +232,19 @@ def main() -> None:
         axis=1,
     )
     df["p_away_cover"] = 1.0 - pd.to_numeric(df["p_home_cover"], errors="coerce")
-
     df["home_ev"] = df["p_home_cover"].apply(expected_value_ats)
     df["away_ev"] = df["p_away_cover"].apply(expected_value_ats)
 
-    def choose_side(r) -> Tuple[bool, Optional[str], Optional[float]]:
+    def choose_side(r):
         if not bool(r["eligible"]):
             return False, None, None
-        hev = r.get("home_ev", None)
-        aev = r.get("away_ev", None)
+        hev, aev = r.get("home_ev"), r.get("away_ev")
         if pd.isna(hev) and pd.isna(aev):
             return False, None, None
-
-        # best-of; tie -> no bet (strict)
-        if pd.notna(hev) and pd.notna(aev) and float(hev) == float(aev):
-            return False, None, None
-
         if pd.notna(hev) and float(hev) >= cfg.ev_threshold and (pd.isna(aev) or float(hev) > float(aev)):
             return True, "home", float(hev)
         if pd.notna(aev) and float(aev) >= cfg.ev_threshold and (pd.isna(hev) or float(aev) > float(hev)):
             return True, "away", float(aev)
-
         return False, None, None
 
     chosen = df.apply(choose_side, axis=1, result_type="expand")
@@ -221,35 +256,24 @@ def main() -> None:
     total_games = int(df["merge_key"].nunique()) if "merge_key" in df.columns else int(len(df))
     bet_rate = float(len(bets) / max(total_games, 1))
 
-    # Fail-loud bet-rate regression detector
     if bet_rate > cfg.max_bet_rate:
-        raise RuntimeError(
-            f"[ats] Bet-rate too high: bets={len(bets)} total_games={total_games} bet_rate={bet_rate:.3f} cap={cfg.max_bet_rate}"
-        )
+        raise RuntimeError(f"[ats] Bet-rate too high: bets={len(bets)} total_games={total_games} bet_rate={bet_rate:.3f} cap={cfg.max_bet_rate}")
 
     if bets.empty:
         print("[ats] No bets selected.")
-        out_metrics = {
-            "version": ATS_ROI_VERSION,
-            "bets": 0,
-            "bet_rate": bet_rate,
-            "note": "No bets met EV threshold / gating.",
-        }
+        metrics = {"version": ATS_ROI_VERSION, "bets": 0, "bet_rate": bet_rate}
         os.makedirs(cfg.out_dir, exist_ok=True)
         with open(os.path.join(cfg.out_dir, "ats_roi_metrics.json"), "w", encoding="utf-8") as f:
-            json.dump(out_metrics, f, indent=2)
+            json.dump(metrics, f, indent=2)
         bets.to_csv(os.path.join(cfg.out_dir, "ats_roi_bets.csv"), index=False)
-        print(f"[ats] wrote: {os.path.join(cfg.out_dir, 'ats_roi_metrics.json')}")
-        print(f"[ats] wrote: {os.path.join(cfg.out_dir, 'ats_roi_bets.csv')}")
+        print(f"[ats] wrote: outputs/ats_roi_metrics.json")
+        print(f"[ats] wrote: outputs/ats_roi_bets.csv")
         return
 
     bets["stake"] = 1.0
 
-    # settle ATS result
     def ats_result(r) -> str:
-        hs = float(r[hcol])
-        aw = float(r[acol])
-        line = float(r["home_spread_consensus"])
+        hs = float(r[hcol]); aw = float(r[acol]); line = float(r["home_spread_consensus"])
         adj_home = hs + line
         if adj_home == aw:
             return "push"
@@ -274,16 +298,13 @@ def main() -> None:
     bets["profit"] = bets.apply(profit_units, axis=1)
     bets["market"] = "spread"
 
-    # Profit sanity
     max_abs = float(pd.to_numeric(bets["profit"], errors="coerce").abs().max())
     if max_abs > cfg.max_profit_abs:
         raise RuntimeError(f"[ats] Profit sanity failure: max |profit|={max_abs}u limit={cfg.max_profit_abs}")
 
     overall = summarize(bets)
-    home_bets = bets[bets["bet_side"].astype(str).str.lower() == "home"].copy()
-    away_bets = bets[bets["bet_side"].astype(str).str.lower() == "away"].copy()
-    home_sum = summarize(home_bets)
-    away_sum = summarize(away_bets)
+    home_sum = summarize(bets[bets["bet_side"].astype(str).str.lower() == "home"])
+    away_sum = summarize(bets[bets["bet_side"].astype(str).str.lower() == "away"])
 
     print(f"[ats] overall: {overall}")
     print(f"[ats] home_only: {home_sum}")
@@ -301,17 +322,10 @@ def main() -> None:
         "away_only": away_sum,
         "bet_rate": bet_rate,
         "ev_threshold": cfg.ev_threshold,
-        "dispersion": {
-            "max_dispersion": cfg.max_dispersion,
-            "require_dispersion": cfg.require_dispersion,
-            "col": "home_spread_dispersion" if "home_spread_dispersion" in df.columns else None,
-        },
+        "eval_window": {"start": str(es.date()), "end": str(ee.date()), "date_col": date_col},
+        "dispersion": {"max_dispersion": cfg.max_dispersion, "require_dispersion": cfg.require_dispersion},
         "pricing": {"assumed": "-110", "ppu": PPU_ATS_MINUS_110},
-        "calibrator": cfg.calibrator_path,
-        "schema_contract": {
-            "required_cols": ["home_spread_consensus", "fair_spread_model|spread_error", hcol, acol],
-            "merge_key_present": ("merge_key" in df.columns),
-        },
+        "calibrator_meta": cal.get("meta", {}),
     }
 
     with open(metrics_path, "w", encoding="utf-8") as f:
