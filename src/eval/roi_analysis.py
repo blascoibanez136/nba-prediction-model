@@ -158,7 +158,7 @@ def build_bets(per_game: pd.DataFrame, edge_threshold: float, calibrator_path: O
         cal = load_calibrator(calibrator_path)
         target = "home_win_prob" if "home_win_prob" in df.columns else model_col
         df[target] = pd.to_numeric(df[target], errors="coerce")
-        df[f"{target}_calibrated"] = apply_calibrator(cal, df[target])
+        df[f"{target}_calibrated"] = apply_calibrator(df[target], cal)
         print(f"[roi_analysis] Applied calibrator from {calibrator_path} to column '{target}'.")
 
     # Edges
