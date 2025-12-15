@@ -11,12 +11,15 @@ import pandas as pd
 
 from src.model.calibration import load_calibrator, apply_calibrator
 
-ROI_ANALYSIS_VERSION = "roi_analysis_v3_hybrid_odds_2025-12-15"
+ROI_ANALYSIS_VERSION = "roi_analysis_v3_1_hybrid_odds_guard_2025-12-15"
 
 
 # -----------------------------
-# Odds parsing (HYBRID)
+# Odds parsing (HYBRID + GUARDS)
 # -----------------------------
+AMERICAN_MIN_ABS = 50.0  # guardrail: prevents near-zero "american odds" causing payout explosions
+
+
 def _to_float(x) -> Optional[float]:
     try:
         v = float(x)
@@ -40,20 +43,28 @@ def detect_odds_format(o: Optional[float]) -> Optional[str]:
         return "american"
     if 1.01 <= o < 20.0:
         return "decimal"
-    # 0 < o < 1.01 is invalid; treat as unknown
     if 0 < o < 1.01:
         return "invalid"
     return "american"
+
+
+def _american_valid(o: float) -> bool:
+    # American odds magnitude should never be near zero; this guard blocks corrupted values like -0.857...
+    return abs(o) >= AMERICAN_MIN_ABS
 
 
 def implied_prob_from_odds(o: Optional[float]) -> Optional[float]:
     fmt = detect_odds_format(o)
     if fmt is None or fmt == "invalid":
         return None
+
     if fmt == "decimal":
-        # implied prob (vigged)
         return 1.0 / o if o and o > 1.0 else None
+
     # american
+    if not _american_valid(o):
+        return None
+
     if o > 0:
         return 100.0 / (o + 100.0)
     return abs(o) / (abs(o) + 100.0)
@@ -74,10 +85,14 @@ def win_profit_per_unit(o: Optional[float]) -> Optional[float]:
     fmt = detect_odds_format(o)
     if fmt is None or fmt == "invalid":
         return None
+
     if fmt == "decimal":
-        # Decimal odds: profit on win per 1u stake is (odds - 1)
         return float(o) - 1.0
-    # American odds
+
+    # american
+    if not _american_valid(o):
+        return None
+
     if o > 0:
         return float(o) / 100.0
     return 100.0 / abs(float(o))
@@ -95,12 +110,6 @@ class ROIConfig:
 
 
 REQUIRED_ODDS_COLS = ["ml_home_consensus", "ml_away_consensus"]
-
-
-def write_json(path: str, obj: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, sort_keys=False)
 
 
 def pick_model_prob_col(df: pd.DataFrame) -> str:
@@ -139,42 +148,51 @@ def build_bets(per_game: pd.DataFrame, edge_threshold: float, calibrator_path: O
 
     df = ensure_home_win_actual(per_game)
 
-    # Parse odds
     df["ml_home_consensus"] = pd.to_numeric(df["ml_home_consensus"], errors="coerce")
     df["ml_away_consensus"] = pd.to_numeric(df["ml_away_consensus"], errors="coerce")
 
-    # Market probs (devig)
     mh, ma, mm, hf, af = [], [], [], [], []
+    invalid_american_ct = 0
+
     for ho, ao in zip(df["ml_home_consensus"].tolist(), df["ml_away_consensus"].tolist()):
         ho_f = _to_float(ho)
         ao_f = _to_float(ao)
         hf.append(detect_odds_format(ho_f))
         af.append(detect_odds_format(ao_f))
+
+        # count invalid american cases for diagnostics
+        if ho_f is not None and detect_odds_format(ho_f) == "american" and not _american_valid(ho_f):
+            invalid_american_ct += 1
+        if ao_f is not None and detect_odds_format(ao_f) == "american" and not _american_valid(ao_f):
+            invalid_american_ct += 1
+
         ph, pa = devig_probs(ho_f, ao_f)
         if ph is None or pa is None:
             mh.append(None); ma.append(None); mm.append("missing_or_invalid")
         else:
             mh.append(ph); ma.append(pa); mm.append("devig_rowwise")
+
     df["market_prob_home"] = mh
     df["market_prob_away"] = ma
     df["market_prob_method"] = mm
     df["home_odds_format"] = hf
     df["away_odds_format"] = af
 
+    if invalid_american_ct > 0:
+        print(f"[roi] invalid_american_odds_count={invalid_american_ct} (abs < {AMERICAN_MIN_ABS})")
+
     model_col = pick_model_prob_col(df)
     df[model_col] = pd.to_numeric(df[model_col], errors="coerce")
     df["model_prob_home_raw"] = df[model_col]
     df["model_prob_away_raw"] = 1.0 - df["model_prob_home_raw"]
 
-    # Optional calibrator for diagnostics only
     if calibrator_path:
         cal = load_calibrator(calibrator_path)
         target = "home_win_prob" if "home_win_prob" in df.columns else model_col
         df[target] = pd.to_numeric(df[target], errors="coerce")
-        df[f"{target}_calibrated"] = apply_calibrator(df[target], cal)  # NOTE: (probs, calibrator)
+        df[f"{target}_calibrated"] = apply_calibrator(df[target], cal)  # (probs, calibrator)
         print(f"[roi_analysis] Applied calibrator from {calibrator_path} to column '{target}'.")
 
-    # Edges vs devig market
     df["home_edge"] = df["model_prob_home_raw"] - df["market_prob_home"]
     df["away_edge"] = df["model_prob_away_raw"] - df["market_prob_away"]
 
@@ -199,14 +217,12 @@ def build_bets(per_game: pd.DataFrame, edge_threshold: float, calibrator_path: O
         return bets
 
     bets["stake"] = 1.0
-
     bets["odds_price"] = bets.apply(
         lambda r: r["ml_home_consensus"] if str(r["bet_side"]).lower() == "home" else r["ml_away_consensus"],
         axis=1,
     )
     bets["odds_price"] = pd.to_numeric(bets["odds_price"], errors="coerce")
 
-    # Result label
     def settle_result(r) -> str:
         side = str(r["bet_side"]).lower()
         hwa = r["home_win_actual"]
@@ -220,7 +236,6 @@ def build_bets(per_game: pd.DataFrame, edge_threshold: float, calibrator_path: O
 
     bets["result"] = bets.apply(settle_result, axis=1).astype(str)
 
-    # Profit
     def profit_units(r) -> float:
         stake = float(r["stake"])
         res = str(r["result"]).lower()
@@ -236,20 +251,18 @@ def build_bets(per_game: pd.DataFrame, edge_threshold: float, calibrator_path: O
     bets["profit"] = bets.apply(profit_units, axis=1)
     bets["market"] = "moneyline"
 
-    # Fail-loud sanity: if profit is exploding, odds are still malformed.
-    # With hybrid handling, a truly extreme profit (e.g., >50u) is suspicious for NBA ML.
     max_abs = float(pd.to_numeric(bets["profit"], errors="coerce").abs().max())
     if max_abs > 50.0:
         sample = bets.sort_values("profit").head(5)[
-            ["game_date", "home_team", "away_team", "bet_side", "odds_price", "home_odds_format", "away_odds_format", "result", "stake", "profit"]
+            ["game_date", "home_team", "away_team", "bet_side", "odds_price",
+             "home_odds_format", "away_odds_format", "result", "stake", "profit"]
         ]
         raise RuntimeError(
             f"[roi] Profit sanity failure: max |profit|={max_abs}u. "
-            "Likely malformed odds values (near 0, invalid decimals, etc.). Sample worst rows:\n"
+            "Odds still malformed or misparsed. Sample worst rows:\n"
             + sample.to_string(index=False)
         )
 
-    # Summary-friendly column order
     front = [
         "game_date", "home_team", "away_team", "merge_key",
         "bet_side", "odds_price", "stake", "result", "profit",
@@ -337,7 +350,6 @@ def main() -> None:
     print(f"[roi] home_only: {home_sum}")
     print(f"[roi] away_only: {away_sum}")
 
-    # Extra diagnostics: format mix
     if not bets.empty and "home_odds_format" in bets.columns and "away_odds_format" in bets.columns:
         fmt_counts = pd.concat([bets["home_odds_format"], bets["away_odds_format"]]).value_counts(dropna=False).to_dict()
         print(f"[roi] odds_format_counts (home+away columns): {fmt_counts}")
@@ -352,6 +364,7 @@ def main() -> None:
         "away_only": away_sum,
         "calibrator": cfg.calibrator_path,
         "schema_contract": {"required_odds_cols": REQUIRED_ODDS_COLS, "model_prob_col_used": pick_model_prob_col(df)},
+        "american_min_abs_guard": AMERICAN_MIN_ABS,
     }
 
     metrics_path = os.path.join(cfg.out_dir, "roi_metrics.json")
