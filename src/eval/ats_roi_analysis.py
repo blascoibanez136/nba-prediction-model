@@ -4,7 +4,8 @@ ATS (spread) ROI analysis with fixed -110 pricing.
 Adds:
 - --eval-start / --eval-end date window filtering
 - overlap warning if calibrator train window overlaps eval window (metadata-driven)
-- --side selection (both/home_only/away_only) for policy testing
+- --side selection (both/home_only/away_only) for policy testing (default: both)
+- --min-abs-residual: residual magnitude gating (default: 0.0 => disabled)
 
 Assumptions:
 - pricing is fixed -110 (ppu=0.9090909)
@@ -25,7 +26,7 @@ import pandas as pd
 
 from src.model.spread_relative_calibration import load_spread_calibrator, apply_spread_calibrator
 
-ATS_ROI_VERSION = "ats_roi_v2_ev_cal_fixed_110_oos_eval_window_2025-12-15"
+ATS_ROI_VERSION = "ats_roi_v3_ev_cal_fixed_110_oos_eval_window_residual_gated_2025-12-15"
 PPU_ATS_MINUS_110 = 100.0 / 110.0  # 0.9090909
 
 
@@ -85,6 +86,9 @@ class ATSConfig:
     max_dispersion: float = 2.0
     require_dispersion: bool = True
 
+    # NEW: residual magnitude gate (abs(residual) >= min_abs_residual)
+    min_abs_residual: float = 0.0
+
     max_bet_rate: float = 0.30
     max_profit_abs: float = 10.0
 
@@ -92,7 +96,7 @@ class ATSConfig:
     eval_end: Optional[str] = None
     fail_on_overlap: bool = False
 
-    # NEW: policy side gating (default keeps existing behavior)
+    # Policy side gating (default keeps existing behavior unchanged)
     side: str = "both"  # "both" | "home_only" | "away_only"
 
     out_dir: str = "outputs"
@@ -108,9 +112,7 @@ def summarize(bets: pd.DataFrame) -> Dict[str, Any]:
     return {"bets": int(len(bets)), "stake": stake, "profit": profit, "roi": roi, "win_rate": win_rate}
 
 
-def _warn_or_fail_overlap(
-    cal_meta: Dict[str, Any], eval_start: pd.Timestamp, eval_end: pd.Timestamp, fail: bool
-) -> None:
+def _warn_or_fail_overlap(cal_meta: Dict[str, Any], eval_start: pd.Timestamp, eval_end: pd.Timestamp, fail: bool) -> None:
     ts = cal_meta.get("train_start")
     te = cal_meta.get("train_end")
     if not ts or not te:
@@ -136,9 +138,6 @@ def _warn_or_fail_overlap(
 
 
 def _apply_side_policy(bets: pd.DataFrame, side: str) -> pd.DataFrame:
-    """
-    Apply ATS side policy gating. Default 'both' keeps existing behavior unchanged.
-    """
     s = str(side).lower().strip()
     if bets is None or bets.empty:
         return bets
@@ -160,6 +159,14 @@ def main() -> None:
     ap.add_argument("--max-dispersion", type=float, default=2.0)
     ap.add_argument("--no-require-dispersion", action="store_true")
 
+    # NEW: residual magnitude gating (disabled by default)
+    ap.add_argument(
+        "--min-abs-residual",
+        type=float,
+        default=0.0,
+        help="Require abs(spread_residual) >= this value (default: 0.0 = disabled).",
+    )
+
     ap.add_argument("--max-bet-rate", type=float, default=0.30)
     ap.add_argument("--max-profit-abs", type=float, default=10.0)
 
@@ -167,12 +174,12 @@ def main() -> None:
     ap.add_argument("--eval-end", default=None, help="Eval window end inclusive (YYYY-MM-DD)")
     ap.add_argument("--fail-on-overlap", action="store_true", help="Fail loudly if calibrator overlaps eval window")
 
-    # NEW: policy side selection
+    # side policy exists, but default is BOTH (reverted)
     ap.add_argument(
         "--side",
         default="both",
         choices=["both", "home_only", "away_only"],
-        help="ATS side policy gating (default: both; preserves existing behavior).",
+        help="ATS side policy gating (default: both; preserves standard behavior).",
     )
 
     args = ap.parse_args()
@@ -183,6 +190,7 @@ def main() -> None:
         ev_threshold=float(args.ev),
         max_dispersion=float(args.max_dispersion),
         require_dispersion=(not bool(args.no_require_dispersion)),
+        min_abs_residual=float(args.min_abs_residual),
         max_bet_rate=float(args.max_bet_rate),
         max_profit_abs=float(args.max_profit_abs),
         eval_start=args.eval_start,
@@ -198,6 +206,7 @@ def main() -> None:
     print(f"[ats] per_game={cfg.per_game_path}")
     print(f"[ats] calibrator={cfg.calibrator_path}")
     print(f"[ats] ev_threshold={cfg.ev_threshold:.4f}")
+    print(f"[ats] min_abs_residual={cfg.min_abs_residual:.3f}")
     print(f"[ats] dispersion<= {cfg.max_dispersion:.2f} require={cfg.require_dispersion}")
     print(f"[ats] guards: max_profit_abs={cfg.max_profit_abs} max_bet_rate={cfg.max_bet_rate}")
     print(f"[ats] pricing: fixed -110 ppu={PPU_ATS_MINUS_110:.6f}")
@@ -248,15 +257,16 @@ def main() -> None:
     if "home_spread_dispersion" in df.columns:
         df["home_spread_dispersion"] = pd.to_numeric(df["home_spread_dispersion"], errors="coerce")
         disp_gate = df["home_spread_dispersion"].le(cfg.max_dispersion)
-        eligible = (
-            disp_gate & df["home_spread_dispersion"].notna()
-            if cfg.require_dispersion
-            else (disp_gate | df["home_spread_dispersion"].isna())
-        )
+        eligible = disp_gate & df["home_spread_dispersion"].notna() if cfg.require_dispersion else (disp_gate | df["home_spread_dispersion"].isna())
     else:
         if cfg.require_dispersion:
             raise RuntimeError("[ats] require_dispersion=True but home_spread_dispersion column missing")
         eligible = pd.Series([True] * len(df))
+
+    # residual magnitude gate (abs(residual) >= threshold), only if enabled
+    if cfg.min_abs_residual and cfg.min_abs_residual > 0:
+        abs_res = pd.to_numeric(df["spread_residual"], errors="coerce").abs()
+        eligible = eligible & abs_res.ge(cfg.min_abs_residual)
 
     eligible = eligible & df["spread_residual"].notna() & df["home_spread_consensus"].notna() & df[hcol].notna() & df[acol].notna()
     df["eligible"] = eligible
@@ -293,7 +303,6 @@ def main() -> None:
     df["bet_side"] = chosen[1]
     df["ev_used"] = chosen[2]
 
-    # Build bets, then apply policy gating BEFORE bet-rate guard
     bets = df[df["bet"]].copy()
     bets = _apply_side_policy(bets, cfg.side)
 
@@ -301,13 +310,11 @@ def main() -> None:
     bet_rate = float(len(bets) / max(total_games, 1))
 
     if bet_rate > cfg.max_bet_rate:
-        raise RuntimeError(
-            f"[ats] Bet-rate too high: bets={len(bets)} total_games={total_games} bet_rate={bet_rate:.3f} cap={cfg.max_bet_rate}"
-        )
+        raise RuntimeError(f"[ats] Bet-rate too high: bets={len(bets)} total_games={total_games} bet_rate={bet_rate:.3f} cap={cfg.max_bet_rate}")
 
     if bets.empty:
         print("[ats] No bets selected.")
-        metrics = {"version": ATS_ROI_VERSION, "bets": 0, "bet_rate": bet_rate, "side_policy": cfg.side}
+        metrics = {"version": ATS_ROI_VERSION, "bets": 0, "bet_rate": bet_rate, "side_policy": cfg.side, "min_abs_residual": cfg.min_abs_residual}
         os.makedirs(cfg.out_dir, exist_ok=True)
         with open(os.path.join(cfg.out_dir, "ats_roi_metrics.json"), "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
@@ -319,9 +326,7 @@ def main() -> None:
     bets["stake"] = 1.0
 
     def ats_result(r) -> str:
-        hs = float(r[hcol])
-        aw = float(r[acol])
-        line = float(r["home_spread_consensus"])
+        hs = float(r[hcol]); aw = float(r[acol]); line = float(r["home_spread_consensus"])
         adj_home = hs + line
         if adj_home == aw:
             return "push"
@@ -371,6 +376,7 @@ def main() -> None:
         "bet_rate": bet_rate,
         "side_policy": cfg.side,
         "ev_threshold": cfg.ev_threshold,
+        "min_abs_residual": cfg.min_abs_residual,
         "eval_window": {"start": str(es.date()), "end": str(ee.date()), "date_col": date_col},
         "dispersion": {"max_dispersion": cfg.max_dispersion, "require_dispersion": cfg.require_dispersion},
         "pricing": {"assumed": "-110", "ppu": PPU_ATS_MINUS_110},
