@@ -1,10 +1,10 @@
 """
 Enhanced moneyline ROI and edge bucket analysis with bet‑side support.
 
-This module fixes the previous limitation where only home bets were considered.  It
-computes vig‑free implied probabilities from moneylines, compares the model's raw
-win probability to the market, and supports betting either the home or away
-team based on whichever side has a sufficiently large positive edge.
+This module fixes the previous limitation where only home bets were considered.
+It computes vig‑free implied probabilities from moneylines, compares the model's
+raw win probability to the market, and supports betting either the home or
+away team based on whichever side has a sufficiently large positive edge.
 
 Key features:
 
