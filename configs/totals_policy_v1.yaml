@@ -1,1 +1,12 @@
+policy_name: totals_policy_v1
+version_tag: v1
+
+ev_threshold: 0.03
+max_dispersion: 8.0
+
+side_policy: both  # over | under | both
+
+guards:
+  max_bet_rate: 0.12
+  max_profit_abs: 10.0
 
