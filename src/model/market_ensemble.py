@@ -58,7 +58,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-MARKET_ENSEMBLE_VERSION = "market_ensemble_ml_contract_v1_2025-12-14"
+MARKET_ENSEMBLE_VERSION = "market_ensemble_ml_contract_v1_ATS_safe_fair_spread_model_v2_2025-12-15"
 
 
 # ---------------------------------------------------------------------
@@ -266,6 +266,8 @@ def _safe_to_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return df
 
 
+# ------------------------------ ATS SAFE PATCH ------------------------------
+
 def _detect_pred_points_cols(df: pd.DataFrame) -> tuple[Optional[str], Optional[str]]:
     """Best-effort detection of predicted home/away points columns."""
     home_candidates = [
@@ -296,8 +298,8 @@ def _compute_fair_spread_model_from_points(df: pd.DataFrame) -> Optional[pd.Seri
     Compute fair_spread_model from predicted points.
 
     Convention:
-    predicted_margin = pred_home_pts - pred_away_pts
-    fair_spread_model (home line) = -predicted_margin
+      predicted_margin = pred_home_pts - pred_away_pts
+      fair_spread_model (home line) = -predicted_margin
     """
     hcol, acol = _detect_pred_points_cols(df)
     if not hcol or not acol:
@@ -540,7 +542,6 @@ def _aggregate_from_wide(df: pd.DataFrame) -> pd.DataFrame:
     out = out.merge(ml_stats, on="merge_key", how="outer")
 
     out = _sanitize_ml_columns(out, context="aggregate_from_wide")
-
     logger.info("[market_ensemble] Wide aggregation produced %d games.", out.merge_key.nunique() if "merge_key" in out.columns else len(out))
     return out
 
@@ -615,11 +616,14 @@ def apply_market_ensemble(
     if "fair_total" in merged.columns:
         merged["fair_total_model"] = merged["fair_total"]
 
-    # ---- FIX: COMPUTE fair_spread_model ROBUSTLY ----
-    # Preference order:
-    #   1) predicted points (best)
-    #   2) inverse-logistic from model win prob (Pro-Lite correct fallback)
-    #   3) fallback to fair_spread only if not constant
+    # -----------------------------------------------------------------
+    # ATS SAFE PATCH: compute fair_spread_model robustly
+    # Order:
+    #   1) predicted points -> margin -> spread
+    #   2) invert model win prob -> spread
+    #   3) fallback to fair_spread ONLY if not constant
+    # -----------------------------------------------------------------
+
     spread_from_points = _compute_fair_spread_model_from_points(merged)
     if spread_from_points is not None:
         merged["fair_spread_model"] = spread_from_points
