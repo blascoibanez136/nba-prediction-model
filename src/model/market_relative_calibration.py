@@ -1,62 +1,42 @@
 """
-Market-relative calibration utilities for NBA Pro‑Lite/Elite models.
+Market-relative calibration utilities for NBA Pro-Lite/Elite models.
 
-This module provides helpers to train and apply a calibration model on the
-delta between the model’s raw win probability and the de‑vigged market
-probability.  The intent is to anchor a model’s probability to market
-efficiency rather than calibrating absolute probabilities in isolation.
+Fix (CRITICAL):
+- Training and inference must use the SAME delta transform.
+- We train isotonic on x = (clip(delta,[-1,1]) + 1) / 2 in [0,1],
+  and apply the same transform at inference.
 
-The primary functions are:
+This prevents a scale mismatch where training used raw delta but inference
+used mapped delta, which silently breaks calibration.
 
-* ``fit_delta_calibrator`` – Fit isotonic regression calibrators on
-  ``delta = p_model - p_market`` separately for buckets of moneyline odds.
-* ``save_delta_calibrator`` / ``load_delta_calibrator`` – Serialize and
-  deserialize the calibrator to disk via ``joblib``.
-* ``apply_delta_calibrator`` – Given a delta and the home moneyline odds,
-  return a calibrated home win probability.
-
-The calibrator is stored as a dictionary mapping bucket names to fitted
-``IsotonicRegression`` instances.  Buckets are determined by the sign and
-magnitude of American odds (e.g. favourite/dog and small/medium/big).
-``fallback`` is reserved for future extensions (e.g. global calibrator).
-
-Example usage:
-
-    from src.model.market_relative_calibration import (
-        fit_delta_calibrator, save_delta_calibrator, load_delta_calibrator,
-        apply_delta_calibrator,
-    )
-
-    # Train calibrator from per-game historical data
-    calibrator = fit_delta_calibrator(df)
-    save_delta_calibrator(calibrator, "artifacts/delta_calibrator.joblib")
-
-    # Later, load and apply calibrator
-    calib = load_delta_calibrator("artifacts/delta_calibrator.joblib")
-    p_cal = apply_delta_calibrator(delta=0.05, ml_home=-150, calibrator=calib)
-
+The calibrator is stored as:
+{
+  "calibrators": {bucket_name: IsotonicRegression, ...},
+  "min_samples": int,
+  "meta": {...}
+}
 """
 
 from __future__ import annotations
 
 import os
+from datetime import datetime
+from typing import Dict, Optional
+
 import joblib
 import numpy as np
 import pandas as pd
 
-from typing import Dict, Optional
-
 from src.model.calibration import fit_isotonic, apply_calibrator
+
+PROB_EPS = 1e-6
+
 
 ###############################################################################
 # Bucketing logic
 ###############################################################################
-
 def _bucket_from_odds(odds: Optional[float]) -> Optional[str]:
     """Compute a bucket label from American odds.
-
-    We divide odds into favourite vs underdog and then into magnitude bands.
-    If odds is None or invalid, return None (which callers should handle).
 
     Buckets:
         fav_small : -100 >= odds > -200
@@ -65,12 +45,6 @@ def _bucket_from_odds(odds: Optional[float]) -> Optional[str]:
         dog_small : 100 <= odds < 200
         dog_medium: 200 <= odds < 400
         dog_big   : odds >= 400
-
-    Args:
-        odds: American moneyline odds (signed value, >=100 or <=-100).
-
-    Returns:
-        Bucket name string or None.
     """
     if odds is None:
         return None
@@ -80,7 +54,7 @@ def _bucket_from_odds(odds: Optional[float]) -> Optional[str]:
         return None
     if np.isnan(o) or np.isinf(o) or abs(o) < 100:
         return None
-    # Favourite if negative
+
     if o < 0:
         mag = abs(o)
         if mag <= 200:
@@ -88,7 +62,6 @@ def _bucket_from_odds(odds: Optional[float]) -> Optional[str]:
         if mag <= 400:
             return "fav_medium"
         return "fav_big"
-    # Underdog if positive
     else:
         mag = o
         if mag < 200:
@@ -99,53 +72,87 @@ def _bucket_from_odds(odds: Optional[float]) -> Optional[str]:
 
 
 ###############################################################################
+# Shared transforms (MUST match training and inference)
+###############################################################################
+def _clip_prob(v: float) -> float:
+    return float(np.clip(v, PROB_EPS, 1.0 - PROB_EPS))
+
+
+def _delta_to_x(delta: float) -> float:
+    """
+    Map delta in [-1,1] to x in [0,1] with clipping.
+    This is the ONLY representation we train/apply isotonic on.
+    """
+    d = float(np.clip(delta, -1.0, 1.0))
+    return (d + 1.0) / 2.0
+
+
+###############################################################################
 # Training and saving calibrators
 ###############################################################################
-
 def fit_delta_calibrator(df: pd.DataFrame, *, min_samples: int = 25) -> Dict[str, object]:
     """Fit per-bucket isotonic calibrators on model vs market probability delta.
 
-    Args:
-        df: DataFrame with columns ``model_prob_home_raw``, ``market_prob_home``,
-            ``home_win_actual``, and ``ml_home_consensus``.
-        min_samples: Minimum number of samples required to fit a calibrator for a
-            bucket.  Buckets with fewer samples will be skipped.
+    Required columns:
+      model_prob_home_raw, market_prob_home, home_win_actual, ml_home_consensus
 
-    Returns:
-        Dictionary with keys:
-            'calibrators': mapping bucket -> IsotonicRegression
-            'min_samples': min_samples used
+    IMPORTANT:
+      We fit isotonic on x = (clip(delta)+1)/2 in [0,1],
+      not on raw delta, so inference can use the same mapping.
     """
     required_cols = {"model_prob_home_raw", "market_prob_home", "home_win_actual", "ml_home_consensus"}
     missing = required_cols - set(df.columns)
     if missing:
         raise RuntimeError(f"[delta_calibrator] Missing required columns: {missing}")
 
-    # Compute delta and bucket
-    df = df.copy()
-    df["model_prob_home_raw"] = pd.to_numeric(df["model_prob_home_raw"], errors="coerce")
-    df["market_prob_home"] = pd.to_numeric(df["market_prob_home"], errors="coerce")
-    df["home_win_actual"] = pd.to_numeric(df["home_win_actual"], errors="coerce")
-    df["ml_home_consensus"] = pd.to_numeric(df["ml_home_consensus"], errors="coerce")
-    df["delta"] = df["model_prob_home_raw"] - df["market_prob_home"]
-    df["bucket"] = df["ml_home_consensus"].apply(_bucket_from_odds)
+    work = df.copy()
+
+    work["model_prob_home_raw"] = pd.to_numeric(work["model_prob_home_raw"], errors="coerce")
+    work["market_prob_home"] = pd.to_numeric(work["market_prob_home"], errors="coerce")
+    work["home_win_actual"] = pd.to_numeric(work["home_win_actual"], errors="coerce")
+    work["ml_home_consensus"] = pd.to_numeric(work["ml_home_consensus"], errors="coerce")
+
+    # clip probabilities to sane bounds before delta
+    work = work.dropna(subset=["model_prob_home_raw", "market_prob_home", "home_win_actual", "ml_home_consensus"]).copy()
+    if work.empty:
+        raise RuntimeError("[delta_calibrator] No valid rows after dropping NaNs")
+
+    work["model_prob_home_raw"] = work["model_prob_home_raw"].clip(PROB_EPS, 1.0 - PROB_EPS)
+    work["market_prob_home"] = work["market_prob_home"].clip(PROB_EPS, 1.0 - PROB_EPS)
+
+    work["delta"] = work["model_prob_home_raw"] - work["market_prob_home"]
+    work["x"] = work["delta"].apply(_delta_to_x)
+    work["bucket"] = work["ml_home_consensus"].apply(_bucket_from_odds)
 
     calibrators: Dict[str, object] = {}
+    bucket_counts: Dict[str, int] = {}
 
-    for bucket, group in df.groupby("bucket"):
+    for bucket, group in work.groupby("bucket"):
         if bucket is None:
             continue
-        # Drop rows with NaNs
-        mask = (~group["delta"].isna()) & (~group["home_win_actual"].isna())
-        sub = group.loc[mask, ["delta", "home_win_actual"]]
-        if len(sub) < min_samples:
-            # Not enough samples; skip bucket
-            continue
-        # Fit isotonic regression calibrator on delta -> win probability
-        calib = fit_isotonic(sub["home_win_actual"].values, sub["delta"].values)
-        calibrators[bucket] = calib
 
-    return {"calibrators": calibrators, "min_samples": min_samples}
+        sub = group.loc[:, ["x", "home_win_actual"]].dropna()
+        n = int(len(sub))
+        bucket_counts[str(bucket)] = n
+
+        if n < min_samples:
+            continue
+
+        # Fit isotonic regression calibrator on x -> win probability
+        calib = fit_isotonic(sub["home_win_actual"].values, sub["x"].values)
+        calibrators[str(bucket)] = calib
+
+    return {
+        "calibrators": calibrators,
+        "min_samples": int(min_samples),
+        "meta": {
+            "created_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "transform": "x=(clip(delta,[-1,1])+1)/2",
+            "prob_clip_eps": PROB_EPS,
+            "bucket_counts": bucket_counts,
+            "buckets_fitted": sorted(list(calibrators.keys())),
+        },
+    }
 
 
 def save_delta_calibrator(calibrator: Dict[str, object], path: str) -> None:
@@ -162,19 +169,15 @@ def load_delta_calibrator(path: str) -> Dict[str, object]:
 ###############################################################################
 # Applying calibrators
 ###############################################################################
-
-def apply_delta_calibrator(delta: Optional[float], ml_home_odds: Optional[float], calibrator: Dict[str, object]) -> Optional[float]:
+def apply_delta_calibrator(
+    delta: Optional[float],
+    ml_home_odds: Optional[float],
+    calibrator: Dict[str, object],
+) -> Optional[float]:
     """Apply a delta calibrator to produce a calibrated home win probability.
 
-    Args:
-        delta: The difference ``p_model - p_market``.
-        ml_home_odds: The home moneyline odds used to determine bucket.
-        calibrator: Dictionary returned by ``fit_delta_calibrator`` or
-            loaded via ``load_delta_calibrator``.
-
     Returns:
-        Calibrated home win probability in [0, 1], or None if calibration is
-        unavailable for the given bucket or inputs are invalid.
+        Calibrated home win probability in [0,1], or None if unavailable.
     """
     if delta is None or ml_home_odds is None:
         return None
@@ -183,21 +186,19 @@ def apply_delta_calibrator(delta: Optional[float], ml_home_odds: Optional[float]
         o = float(ml_home_odds)
     except Exception:
         return None
-    # Guard against NaNs or values outside (0,1) for p_market or p_model
     if np.isnan(d) or np.isinf(d):
         return None
+
     bucket = _bucket_from_odds(o)
     calibrators = calibrator.get("calibrators", {})
     if bucket is None or bucket not in calibrators:
         return None
+
     iso = calibrators[bucket]
-    # Use the delta as the 'probability' input for isotonic.
-    # We must clip the delta into a small range to avoid extreme extrapolation.
-    # Clip delta to [-1, 1] (model probs minus market probs cannot exceed this).
-    d_clipped = max(min(d, 1.0), -1.0)
-    # Normalise delta to [0,1] as isotonic expects probabilities.
-    # We'll map -1 -> 0, +1 -> 1.
-    x = (d_clipped + 1.0) / 2.0
-    p_cal = apply_calibrator(np.array([x]), iso)[0]
+
+    # Apply the SAME transform used in training
+    x = _delta_to_x(d)
+    p_cal = apply_calibrator(np.array([x], dtype=float), iso)[0]
+
     # Ensure within [0,1]
-    return max(0.0, min(1.0, float(p_cal)))
+    return float(np.clip(p_cal, 0.0, 1.0))
