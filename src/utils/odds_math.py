@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 from typing import Optional, Tuple
 
+PROB_EPS = 1e-6
+
 
 def _to_float(x) -> Optional[float]:
     try:
@@ -91,3 +93,21 @@ def expected_value_units(p_win: Optional[float], american_odds: Optional[float])
         return None
 
     return p * float(ppu) - (1.0 - p) * 1.0
+
+
+def clip_prob(p: Optional[float], eps: float = PROB_EPS) -> Optional[float]:
+    """
+    Clip probability into (eps, 1-eps). Returns None if invalid.
+    This is a shared hardening helper used by calibrators and ROI analysis.
+    """
+    if p is None:
+        return None
+    try:
+        v = float(p)
+    except Exception:
+        return None
+    if math.isnan(v) or math.isinf(v):
+        return None
+    if not (0.0 < v < 1.0):
+        return None
+    return max(eps, min(1.0 - eps, v))
