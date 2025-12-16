@@ -14,7 +14,7 @@ import argparse
 import json
 import math
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import pandas as pd
 import joblib
@@ -62,16 +62,17 @@ def summarize(bets: pd.DataFrame) -> Dict[str, Any]:
 
 def main() -> None:
     ap = argparse.ArgumentParser("totals_roi_analysis.py")
+
     ap.add_argument("--per-game", required=True)
     ap.add_argument("--calibrator", required=True)
     ap.add_argument("--ev", type=float, default=0.03)
 
-    ap.add_argument("--max-dispersion", type=float, default=8.0)
     ap.add_argument("--side", default="both", choices=["both", "over", "under"])
 
     ap.add_argument("--eval-start", required=True)
     ap.add_argument("--eval-end", required=True)
 
+    # PROFESSIONAL GUARDS
     ap.add_argument("--max-bet-rate", type=float, default=0.15)
     ap.add_argument("--max-profit-abs", type=float, default=10.0)
 
@@ -79,11 +80,14 @@ def main() -> None:
 
     args = ap.parse_args()
 
+    max_bet_rate = float(args.max_bet_rate)
+
     print(f"[totals] version={TOTALS_ROI_VERSION}")
     print(f"[totals] per_game={args.per_game}")
     print(f"[totals] calibrator={args.calibrator}")
     print(f"[totals] ev_threshold={args.ev}")
     print(f"[totals] side_policy={args.side}")
+    print(f"[totals] max_bet_rate={max_bet_rate}")
 
     df = pd.read_csv(args.per_game)
     if df.empty:
@@ -152,8 +156,10 @@ def main() -> None:
     total_games = int(df["merge_key"].nunique()) if "merge_key" in df.columns else len(df)
     bet_rate = len(bets) / max(total_games, 1)
 
-    if bet_rate > args.max_bet_rate:
-        raise RuntimeError(f"[totals] Bet-rate too high: {bet_rate:.3f}")
+    if bet_rate > max_bet_rate:
+        raise RuntimeError(
+            f"[totals] Bet-rate too high: {bet_rate:.3f} (cap={max_bet_rate})"
+        )
 
     if bets.empty:
         print("[totals] No bets selected")
@@ -206,6 +212,10 @@ def main() -> None:
         "ev_threshold": args.ev,
         "eval_window": {"start": str(es.date()), "end": str(ee.date())},
         "pricing": {"assumed": "-110", "ppu": PPU_TOTAL_MINUS_110},
+        "guards": {
+            "max_bet_rate": max_bet_rate,
+            "max_profit_abs": args.max_profit_abs,
+        },
         "calibrator_meta": cal,
     }
 
@@ -218,4 +228,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
