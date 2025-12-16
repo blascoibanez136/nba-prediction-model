@@ -27,16 +27,6 @@ PPU_TOTAL_MINUS_110 = 100.0 / 110.0
 
 # ---------- helpers ----------
 
-def _to_float(x) -> Optional[float]:
-    try:
-        v = float(x)
-    except Exception:
-        return None
-    if math.isnan(v) or math.isinf(v):
-        return None
-    return v
-
-
 def _get_date_col(df: pd.DataFrame) -> str:
     for c in ["game_date", "date", "gamedate"]:
         if c in df.columns:
@@ -112,29 +102,17 @@ def main() -> None:
     if df.empty:
         raise RuntimeError("[totals] No rows in eval window")
 
-    required = [
-        "fair_total_model",
-        "total_consensus",
-        "home_score",
-        "away_score",
-    ]
-    for c in required:
-        if c not in df.columns:
-            raise RuntimeError(f"[totals] missing column: {c}")
-
     # ---------- core math ----------
     df["actual_total"] = df["home_score"] + df["away_score"]
     df["total_residual"] = df["fair_total_model"] - df["total_consensus"]
     df["abs_residual"] = df["total_residual"].abs()
 
-    # residual magnitude gate
     eligible = df["abs_residual"] >= args.min_abs_residual
 
-    # dispersion gate (optional)
     if "total_dispersion" in df.columns:
         df["total_dispersion"] = pd.to_numeric(df["total_dispersion"], errors="coerce")
-        disp_ok = df["total_dispersion"] <= args.max_dispersion
-        eligible = eligible & disp_ok if args.require_dispersion else eligible
+        if args.require_dispersion:
+            eligible &= df["total_dispersion"] <= args.max_dispersion
     elif args.require_dispersion:
         raise RuntimeError("[totals] require-dispersion=True but total_dispersion missing")
 
@@ -154,9 +132,6 @@ def main() -> None:
 
     # ---------- EV × residual funnel ----------
     def ev_required(abs_res: float) -> float:
-        """
-        Larger residual → lower EV requirement
-        """
         if abs_res >= 6.0:
             return max(0.03, args.ev - 0.02)
         if abs_res >= 4.0:
@@ -183,26 +158,25 @@ def main() -> None:
 
     bets = df[df["bet"]].copy()
 
-    # side policy
     if args.side != "both":
         bets = bets[bets["bet_side"] == args.side]
 
-   total_games = int(df["merge_key"].nunique()) if "merge_key" in df.columns else len(df)
-max_bets = max(1, int(math.floor(args.max_bet_rate * total_games)))
-
-# Rank by EV strength (descending)
-bets = bets.sort_values("ev_used", ascending=False)
-
-if len(bets) > max_bets:
-    print(
-        f"[totals] Bet-rate capped: trimming {len(bets)} → {max_bets} "
-        f"(cap={args.max_bet_rate:.2f})"
+    # ---------- hard bet-rate throttle ----------
+    total_games = (
+        int(df["merge_key"].nunique()) if "merge_key" in df.columns else len(df)
     )
-    bets = bets.head(max_bets)
+    max_bets = max(1, int(math.floor(args.max_bet_rate * total_games)))
 
-bet_rate = len(bets) / max(total_games, 1)
+    bets = bets.sort_values("ev_used", ascending=False)
 
+    if len(bets) > max_bets:
+        print(
+            f"[totals] Bet-rate capped: trimming {len(bets)} → {max_bets} "
+            f"(cap={args.max_bet_rate:.2f})"
         )
+        bets = bets.head(max_bets)
+
+    bet_rate = len(bets) / max(total_games, 1)
 
     if bets.empty:
         print("[totals] No bets selected")
@@ -249,6 +223,7 @@ bet_rate = len(bets) / max(total_games, 1)
         "bet_rate": bet_rate,
         "base_ev": args.ev,
         "min_abs_residual": args.min_abs_residual,
+        "ev_funnel": True,
         "eval_window": {"start": str(es.date()), "end": str(ee.date())},
         "pricing": {"assumed": "-110", "ppu": PPU_TOTAL_MINUS_110},
     }
