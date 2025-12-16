@@ -13,6 +13,12 @@ Policy controls:
     - away_only: DISABLE home ML bets entirely
     - home_only: DISABLE away ML bets entirely
 
+Hardening added:
+- eval window filtering + NaT drop
+- probability clipping to (1e-6, 1-1e-6)
+- ML odds coverage diagnostics (warn <95%, fail <80%)
+- ML-specific output filenames (avoid collisions)
+
 Critical invariants preserved:
 - American-only moneyline contract (abs(odds) >= 100, no decimals)
 - Fail-loud bet-rate and profit sanity guards
@@ -33,119 +39,41 @@ import pandas as pd
 from src.model.calibration import load_calibrator, apply_calibrator
 from src.model.market_relative_calibration import (
     load_delta_calibrator,
-    apply_delta_calibrator,  # signature: (delta, ml_home_odds, calibrator)
+    apply_delta_calibrator,
+)
+from src.utils.odds_math import (
+    clean_american_ml,
+    devig_home_prob,
+    win_profit_per_unit_american,
+    expected_value_units,
 )
 
-ROI_ANALYSIS_VERSION = "roi_analysis_v7_prob_ev_evcal_ml_policy_away_only_optional_american_only_bet_gated_2025-12-15_fix_signature"
+ML_ROI_VERSION = "ml_roi_v8_prob_ev_evcal_ml_policy_optional_eval_window_outputs_coverage_2025-12-16"
 REQUIRED_ODDS_COLS = ["ml_home_consensus", "ml_away_consensus"]
+
+PROB_EPS = 1e-6
 
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def _to_float(x) -> Optional[float]:
-    try:
-        v = float(x)
-    except Exception:
-        return None
-    if math.isnan(v) or math.isinf(v) or v == 0.0:
-        return None
-    return v
+def _get_date_col(df: pd.DataFrame) -> Optional[str]:
+    for c in ["game_date", "date", "gamedate"]:
+        if c in df.columns:
+            return c
+    return None
 
 
-def clean_american_ml(x) -> Optional[float]:
-    """
-    Strict American-only sanitizer:
-    - numeric, finite, non-zero
-    - abs(x) >= 100  (reject decimal-like odds)
-    """
-    v = _to_float(x)
-    if v is None:
-        return None
-    if abs(v) < 100:
-        return None
-    return v
-
-
-def american_to_prob(o: Optional[float]) -> Optional[float]:
-    """
-    Implied probability from American odds.
-    Returns None for invalid odds.
-    """
-    o = clean_american_ml(o)
-    if o is None:
-        return None
-    if o > 0:
-        return 100.0 / (o + 100.0)
-    return abs(o) / (abs(o) + 100.0)
-
-
-def devig_home_prob(ml_home: Optional[float], ml_away: Optional[float]) -> Tuple[Optional[float], str]:
-    """
-    De-vig using both sides:
-      p_home = ph / (ph + pa)
-    Returns (p_home, method).
-    """
-    ph = american_to_prob(ml_home)
-    pa = american_to_prob(ml_away)
-    if ph is None or pa is None:
-        return None, "missing_or_invalid"
-    s = ph + pa
-    if s <= 0:
-        return None, "missing_or_invalid"
-    return ph / s, "devig_two_sided"
-
-
-def win_profit_per_unit_american(o: Optional[float]) -> Optional[float]:
-    """
-    For 1u stake, profit if win:
-      +odds: odds/100
-      -odds: 100/abs(odds)
-    """
-    o = clean_american_ml(o)
-    if o is None:
-        return None
-    if o > 0:
-        return float(o) / 100.0
-    return 100.0 / abs(float(o))
-
-
-def expected_value_units(p_win: Optional[float], american_odds: Optional[float]) -> Optional[float]:
-    """
-    EV in units for a 1u stake.
-      EV = p * profit_if_win - (1-p) * 1
-    Returns None if inputs invalid.
-    """
-    if p_win is None:
-        return None
-    try:
-        p = float(p_win)
-    except Exception:
-        return None
-    if not (0.0 < p < 1.0) or math.isnan(p) or math.isinf(p):
-        return None
-
-    ppu = win_profit_per_unit_american(american_odds)
-    if ppu is None:
-        return None
-
-    return p * float(ppu) - (1.0 - p) * 1.0
+def _clip_prob(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").clip(PROB_EPS, 1.0 - PROB_EPS)
 
 
 def pick_model_prob_col(df: pd.DataFrame) -> str:
-    """
-    Prefer raw model probability for selection.
-    Falls back through known columns.
-    """
-    candidates = [
-        "home_win_prob_model_raw",
-        "home_win_prob_model",
-        "home_win_prob",
-    ]
+    candidates = ["home_win_prob_model_raw", "home_win_prob_model", "home_win_prob"]
     for c in candidates:
         if c in df.columns:
             return c
-    raise RuntimeError(f"[roi] No model prob column found. Tried: {candidates}")
+    raise RuntimeError(f"[ml_roi] No model prob column found. Tried: {candidates}")
 
 
 def ensure_home_win_actual(df: pd.DataFrame) -> pd.DataFrame:
@@ -158,11 +86,27 @@ def ensure_home_win_actual(df: pd.DataFrame) -> pd.DataFrame:
         aw = pd.to_numeric(out["away_score"], errors="coerce")
         out["home_win_actual"] = (hs > aw).astype(float)
         return out
-    raise RuntimeError("[roi] Missing home_win_actual and cannot infer from scores.")
+    raise RuntimeError("[ml_roi] Missing home_win_actual and cannot infer from scores.")
 
 
 def _col_exists(df: pd.DataFrame, col: str) -> bool:
     return col in df.columns
+
+
+def _write_json(path: str, obj: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, sort_keys=False)
+
+
+def summarize(bets: pd.DataFrame) -> Dict[str, Any]:
+    if bets is None or bets.empty:
+        return {"bets": 0, "stake": 0.0, "profit": 0.0, "roi": None, "win_rate": None}
+    stake = float(pd.to_numeric(bets["stake"], errors="coerce").fillna(0.0).sum())
+    profit = float(pd.to_numeric(bets["profit"], errors="coerce").fillna(0.0).sum())
+    roi = (profit / stake) if stake > 0 else None
+    win_rate = float((bets["result"].astype(str).str.lower() == "win").mean())
+    return {"bets": int(len(bets)), "stake": stake, "profit": profit, "roi": roi, "win_rate": win_rate}
 
 
 # -----------------------------
@@ -193,29 +137,44 @@ class ROIConfig:
 
     enforce_max_profit_per_unit_gate: bool = True
 
-
-def write_json(path: str, obj: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, sort_keys=False)
+    # Integrity thresholds
+    warn_coverage: float = 0.95
+    fail_coverage: float = 0.80
 
 
 # -----------------------------
 # Core: build bets
 # -----------------------------
-def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
+def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     if per_game is None or per_game.empty:
-        raise RuntimeError("[roi] per_game is empty")
+        raise RuntimeError("[ml_roi] per_game is empty")
 
     missing = [c for c in REQUIRED_ODDS_COLS if c not in per_game.columns]
     if missing:
-        raise RuntimeError(f"[roi] Missing required odds columns: {missing}")
+        raise RuntimeError(f"[ml_roi] Missing required odds columns: {missing}")
 
     df = ensure_home_win_actual(per_game)
 
     # Sanitize odds again (belt + suspenders)
     df["ml_home_consensus"] = pd.to_numeric(df["ml_home_consensus"], errors="coerce").apply(clean_american_ml)
     df["ml_away_consensus"] = pd.to_numeric(df["ml_away_consensus"], errors="coerce").apply(clean_american_ml)
+
+    # Coverage diagnostics (both sides valid)
+    valid_ml = df["ml_home_consensus"].notna() & df["ml_away_consensus"].notna()
+    total_games = int(df["merge_key"].nunique()) if "merge_key" in df.columns else int(len(df))
+    valid_ml_games = int(valid_ml.sum()) if "merge_key" not in df.columns else int(df.loc[valid_ml, "merge_key"].nunique())
+    coverage = float(valid_ml_games) / max(total_games, 1)
+
+    diag: Dict[str, Any] = {
+        "total_games": total_games,
+        "valid_ml_games": valid_ml_games,
+        "ml_coverage": coverage,
+    }
+
+    if coverage < cfg.fail_coverage:
+        raise RuntimeError(f"[ml_roi] ML odds coverage too low: {coverage:.3f} (<{cfg.fail_coverage:.2f})")
+    if coverage < cfg.warn_coverage:
+        print(f"[ml_roi] WARNING: ML odds coverage {coverage:.3f} (<{cfg.warn_coverage:.2f})")
 
     # Market prob (devig)
     probs = df.apply(
@@ -225,11 +184,12 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
     )
     df["market_prob_home"] = probs[0]
     df["market_prob_method"] = probs[1]
+    df["market_prob_home"] = _clip_prob(df["market_prob_home"])
 
     # Raw model probability
     model_col = pick_model_prob_col(df)
     df[model_col] = pd.to_numeric(df[model_col], errors="coerce")
-    df["model_prob_home_raw"] = df[model_col]
+    df["model_prob_home_raw"] = _clip_prob(df[model_col])
     df["model_prob_away_raw"] = 1.0 - df["model_prob_home_raw"]
 
     # Optional absolute calibrator for diagnostics only
@@ -237,8 +197,8 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
         cal = load_calibrator(cfg.calibrator_path)
         diag_target = "home_win_prob" if "home_win_prob" in df.columns else model_col
         df[diag_target] = pd.to_numeric(df[diag_target], errors="coerce")
-        df[f"{diag_target}_calibrated"] = apply_calibrator(df[diag_target], cal)
-        print(f"[roi_analysis] Applied calibrator from {cfg.calibrator_path} to column '{diag_target}' (diagnostics only).")
+        df[f"{diag_target}_calibrated"] = _clip_prob(apply_calibrator(df[diag_target], cal))
+        print(f"[ml_roi] Applied calibrator from {cfg.calibrator_path} to column '{diag_target}' (diagnostics only).")
 
     # Prob edges vs market (diagnostics + prob mode)
     df["home_edge_prob"] = df["model_prob_home_raw"] - df["market_prob_home"]
@@ -251,10 +211,9 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
     # ev_cal: calibrated probabilities via delta calibrator (market-relative)
     if str(cfg.mode).strip().lower() == "ev_cal":
         if not cfg.delta_calibrator_path:
-            raise RuntimeError("[roi] mode=ev_cal requires --delta-calibrator")
+            raise RuntimeError("[ml_roi] mode=ev_cal requires --delta-calibrator")
         cal_obj = load_delta_calibrator(cfg.delta_calibrator_path)
 
-        # compute delta and apply calibrator using its real signature
         df["delta_home"] = df["model_prob_home_raw"] - df["market_prob_home"]
         df["model_prob_home_cal"] = df.apply(
             lambda r: apply_delta_calibrator(
@@ -264,7 +223,8 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
             ),
             axis=1,
         )
-        df["model_prob_away_cal"] = 1.0 - pd.to_numeric(df["model_prob_home_cal"], errors="coerce")
+        df["model_prob_home_cal"] = _clip_prob(df["model_prob_home_cal"])
+        df["model_prob_away_cal"] = 1.0 - df["model_prob_home_cal"]
 
         df["home_ev_cal"] = df.apply(lambda r: expected_value_units(r["model_prob_home_cal"], r["ml_home_consensus"]), axis=1)
         df["away_ev_cal"] = df.apply(lambda r: expected_value_units(r["model_prob_away_cal"], r["ml_away_consensus"]), axis=1)
@@ -289,7 +249,7 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
     else:
         df["gate_market_weight_ok"] = pd.NA
 
-    # dispersion gate (optional)
+    # dispersion gate (optional; uses existing columns if present)
     dispersion_col = "home_spread_dispersion" if _col_exists(df, "home_spread_dispersion") else (
         "book_dispersion" if _col_exists(df, "book_dispersion") else None
     )
@@ -318,14 +278,15 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
         df["gate_ppu_ok"] = pd.NA
 
     df["eligible"] = base_gate
+    diag["eligible_rows"] = int(df["eligible"].sum())
 
     mode = str(cfg.mode).strip().lower()
     if mode not in ("prob", "ev", "ev_cal"):
-        raise RuntimeError(f"[roi] Invalid mode='{cfg.mode}'. Expected 'prob', 'ev', or 'ev_cal'.")
+        raise RuntimeError(f"[ml_roi] Invalid mode='{cfg.mode}'. Expected 'prob', 'ev', or 'ev_cal'.")
 
     ml_side = str(cfg.ml_side).strip().lower()
     if ml_side not in ("both", "away_only", "home_only"):
-        raise RuntimeError(f"[roi] Invalid ml_side='{cfg.ml_side}'. Expected 'both', 'away_only', or 'home_only'.")
+        raise RuntimeError(f"[ml_roi] Invalid ml_side='{cfg.ml_side}'. Expected 'both', 'away_only', or 'home_only'.")
 
     # Select score columns based on mode
     if mode == "prob":
@@ -366,10 +327,9 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
 
     bets = df[df["bet"]].copy()
     if bets.empty:
-        return bets.reset_index(drop=True)
+        return bets.reset_index(drop=True), diag
 
     bets["stake"] = 1.0
-
     bets["odds_price"] = bets.apply(
         lambda r: r["ml_home_consensus"] if str(r["bet_side"]).lower() == "home" else r["ml_away_consensus"],
         axis=1,
@@ -378,13 +338,16 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
 
     # Contract assertion on bet odds
     invalid_bet_odds = bets["odds_price"].apply(
-        lambda x: (x is not None) and (not math.isnan(float(x))) and (abs(float(x)) < 100) and (abs(float(x)) > 0)
+        lambda x: (x is not None)
+        and (not math.isnan(float(x)))
+        and (abs(float(x)) < 100)
+        and (abs(float(x)) > 0)
     )
     if bool(invalid_bet_odds.any()):
         sample = bets.loc[invalid_bet_odds, ["game_date", "home_team", "away_team", "bet_side", "odds_price",
                                             "ml_home_consensus", "ml_away_consensus"]].head(10)
         raise RuntimeError(
-            "[roi] American-only ML contract violation: found bet rows with 0 < abs(odds) < 100. Sample:\n"
+            "[ml_roi] American-only ML contract violation: found bet rows with 0 < abs(odds) < 100. Sample:\n"
             + sample.to_string(index=False)
         )
 
@@ -400,7 +363,6 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
         return "unknown"
 
     bets["result"] = bets.apply(settle_result, axis=1).astype(str)
-    bets["result_win"] = bets["result"].astype(str).str.lower().eq("win")
 
     def profit_units(r) -> float:
         stake = float(r["stake"])
@@ -409,7 +371,7 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
             return 0.0
         if res != "win":
             return -stake
-        ppu = win_profit_per_unit_american(_to_float(r["odds_price"]))
+        ppu = win_profit_per_unit_american(r["odds_price"])
         if ppu is None:
             return 0.0
         return stake * float(ppu)
@@ -424,34 +386,26 @@ def build_bets(per_game: pd.DataFrame, cfg: ROIConfig) -> pd.DataFrame:
             ["game_date", "home_team", "away_team", "bet_side", "odds_price", "result", "stake", "profit", "metric_used", "metric_type"]
         ]
         raise RuntimeError(
-            f"[roi] Profit sanity failure: max |profit|={max_abs}u (limit={cfg.max_profit_abs}). Sample:\n"
+            f"[ml_roi] Profit sanity failure: max |profit|={max_abs}u (limit={cfg.max_profit_abs}). Sample:\n"
             + sample.to_string(index=False)
         )
 
     # Fail-loud: bet-rate regression detector
-    total_games = int(df["merge_key"].nunique()) if "merge_key" in df.columns else int(len(df))
     bet_rate = float(len(bets) / max(total_games, 1))
+    diag["bets"] = int(len(bets))
+    diag["bet_rate"] = bet_rate
     if bet_rate > cfg.max_bet_rate:
         raise RuntimeError(
-            f"[roi] Bet-rate too high: bets={len(bets)} total_games={total_games} bet_rate={bet_rate:.3f} "
+            f"[ml_roi] Bet-rate too high: bets={len(bets)} total_games={total_games} bet_rate={bet_rate:.3f} "
             f"(cap={cfg.max_bet_rate})."
         )
 
-    return bets.reset_index(drop=True)
-
-
-def summarize(bets: pd.DataFrame) -> Dict[str, Any]:
-    if bets is None or bets.empty:
-        return {"bets": 0, "stake": 0.0, "profit": 0.0, "roi": None, "win_rate": None}
-    stake = float(pd.to_numeric(bets["stake"], errors="coerce").fillna(0).sum())
-    profit = float(pd.to_numeric(bets["profit"], errors="coerce").fillna(0).sum())
-    roi = (profit / stake) if stake > 0 else None
-    win_rate = float(pd.to_numeric(bets.get("result_win", False), errors="coerce").fillna(0).mean()) if "result_win" in bets.columns else float((bets["result"].astype(str).str.lower() == "win").mean())
-    return {"bets": int(len(bets)), "stake": stake, "profit": profit, "roi": roi, "win_rate": win_rate}
+    return bets.reset_index(drop=True), diag
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("roi_analysis.py (American-only, bet-gated, optional ML side policy)")
+    ap = argparse.ArgumentParser("ml_roi_analysis.py (American-only, bet-gated, optional ML side policy)")
+
     ap.add_argument("--per_game", required=True, help="Path to outputs/backtest_per_game.csv")
 
     ap.add_argument("--mode", default="prob", choices=["prob", "ev", "ev_cal"], help="Selection mode: prob | ev | ev_cal")
@@ -474,6 +428,10 @@ def main() -> None:
 
     ap.add_argument("--no-ppu-gate", action="store_true", help="Disable pre-bet profit-per-unit gate (not recommended)")
 
+    # New: eval window filtering
+    ap.add_argument("--eval-start", default=None, help="Filter eval window start (YYYY-MM-DD). Optional.")
+    ap.add_argument("--eval-end", default=None, help="Filter eval window end (YYYY-MM-DD). Optional.")
+
     args = ap.parse_args()
 
     cfg = ROIConfig(
@@ -495,27 +453,56 @@ def main() -> None:
         enforce_max_profit_per_unit_gate=(not bool(args.no_ppu_gate)),
     )
 
-    print(f"[roi] version={ROI_ANALYSIS_VERSION}")
-    print(f"[roi] __file__={__file__}")
-    print(f"[roi] cwd={os.getcwd()}")
-    print(f"[roi] per_game={cfg.per_game_path}")
-    print(f"[roi] mode={cfg.mode} ml_side={cfg.ml_side} prob_edge_threshold={cfg.prob_edge_threshold:.4f} ev_threshold={cfg.ev_threshold:.4f}")
-    print(f"[roi] gating: market_weight in [{cfg.min_market_weight:.2f},{cfg.max_market_weight:.2f}] require={cfg.require_market_weight} "
-          f"dispersion<= {cfg.max_dispersion:.2f} require={cfg.require_dispersion} ppu_gate={cfg.enforce_max_profit_per_unit_gate}")
-    print(f"[roi] guards: max_profit_abs={cfg.max_profit_abs} max_bet_rate={cfg.max_bet_rate}")
+    print(f"[ml_roi] version={ML_ROI_VERSION}")
+    print(f"[ml_roi] __file__={__file__}")
+    print(f"[ml_roi] cwd={os.getcwd()}")
+    print(f"[ml_roi] per_game={cfg.per_game_path}")
+    print(f"[ml_roi] mode={cfg.mode} ml_side={cfg.ml_side} prob_edge_threshold={cfg.prob_edge_threshold:.4f} ev_threshold={cfg.ev_threshold:.4f}")
+    print(f"[ml_roi] guards: max_profit_abs={cfg.max_profit_abs} max_bet_rate={cfg.max_bet_rate}")
 
     if not os.path.exists(cfg.per_game_path):
-        raise FileNotFoundError(f"[roi] per_game not found: {cfg.per_game_path}")
+        raise FileNotFoundError(f"[ml_roi] per_game not found: {cfg.per_game_path}")
 
     df = pd.read_csv(cfg.per_game_path)
+    if df.empty:
+        raise RuntimeError("[ml_roi] per_game is empty")
 
+    # Optional eval window filtering
+    date_col = _get_date_col(df)
+    eval_meta: Dict[str, Any] = {"enabled": False, "date_col": date_col}
+    if (args.eval_start or args.eval_end) and not date_col:
+        raise RuntimeError("[ml_roi] eval-start/eval-end provided but no date column found (game_date/date/gamedate)")
+
+    if date_col and (args.eval_start or args.eval_end):
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.dropna(subset=[date_col]).copy()
+        es = pd.to_datetime(args.eval_start, errors="coerce") if args.eval_start else None
+        ee = pd.to_datetime(args.eval_end, errors="coerce") if args.eval_end else None
+        if args.eval_start and pd.isna(es):
+            raise RuntimeError("[ml_roi] invalid eval-start")
+        if args.eval_end and pd.isna(ee):
+            raise RuntimeError("[ml_roi] invalid eval-end")
+        if es is not None:
+            df = df[df[date_col] >= es].copy()
+        if ee is not None:
+            df = df[df[date_col] <= ee].copy()
+        eval_meta = {
+            "enabled": True,
+            "date_col": date_col,
+            "start": str(es.date()) if es is not None else None,
+            "end": str(ee.date()) if ee is not None else None,
+            "rows": int(len(df)),
+        }
+        print(f"[ml_roi] eval_window: {eval_meta}")
+
+    # Contract check (diagnostics)
     for c in REQUIRED_ODDS_COLS:
         if c in df.columns:
             s = pd.to_numeric(df[c], errors="coerce")
             decimal_like = int(((s.abs() < 100) & (s.abs() > 0)).sum())
-            print(f"[roi] input_contract_check {c}: decimal_like_count={decimal_like}")
+            print(f"[ml_roi] input_contract_check {c}: decimal_like_count={decimal_like}")
 
-    bets = build_bets(df, cfg)
+    bets, diag = build_bets(df, cfg)
 
     overall = summarize(bets)
     home_bets = bets[bets["bet_side"].astype(str).str.lower() == "home"].copy() if not bets.empty else bets
@@ -523,20 +510,20 @@ def main() -> None:
     home_sum = summarize(home_bets)
     away_sum = summarize(away_bets)
 
-    total_games = int(df["merge_key"].nunique()) if "merge_key" in df.columns else int(len(df))
-    bet_rate = float(len(bets) / max(total_games, 1)) if total_games else None
+    total_games = diag.get("total_games", int(df["merge_key"].nunique()) if "merge_key" in df.columns else int(len(df)))
+    bet_rate = diag.get("bet_rate", float(len(bets) / max(total_games, 1)))
 
-    print(f"[roi] overall: {overall}")
-    print(f"[roi] home_only: {home_sum}")
-    print(f"[roi] away_only: {away_sum}")
-    print(f"[roi] bet_rate: {bet_rate:.3f}" if bet_rate is not None else "[roi] bet_rate: n/a")
+    print(f"[ml_roi] overall: {overall}")
+    print(f"[ml_roi] home_only: {home_sum}")
+    print(f"[ml_roi] away_only: {away_sum}")
+    print(f"[ml_roi] bet_rate: {bet_rate:.3f}")
 
     os.makedirs(cfg.out_dir, exist_ok=True)
-    metrics_path = os.path.join(cfg.out_dir, "roi_metrics.json")
-    bets_path = os.path.join(cfg.out_dir, "roi_bets.csv")
+    metrics_path = os.path.join(cfg.out_dir, "ml_roi_metrics.json")
+    bets_path = os.path.join(cfg.out_dir, "ml_roi_bets.csv")
 
     metrics: Dict[str, Any] = {
-        "version": ROI_ANALYSIS_VERSION,
+        "version": ML_ROI_VERSION,
         "mode": cfg.mode,
         "ml_side": cfg.ml_side,
         "prob_edge_threshold": cfg.prob_edge_threshold,
@@ -563,14 +550,18 @@ def main() -> None:
         "guards": {
             "max_profit_abs": cfg.max_profit_abs,
             "max_bet_rate": cfg.max_bet_rate,
+            "coverage_warn_lt": cfg.warn_coverage,
+            "coverage_fail_lt": cfg.fail_coverage,
         },
+        "eval_window": eval_meta,
+        "diagnostics": diag,
     }
 
-    write_json(metrics_path, metrics)
+    _write_json(metrics_path, metrics)
     bets.to_csv(bets_path, index=False)
 
-    print(f"[roi] wrote: {metrics_path}")
-    print(f"[roi] wrote: {bets_path}")
+    print(f"[ml_roi] wrote: {metrics_path}")
+    print(f"[ml_roi] wrote: {bets_path}")
 
 
 if __name__ == "__main__":
