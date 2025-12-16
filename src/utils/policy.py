@@ -39,8 +39,15 @@ def policy_hash(policy_obj: Dict[str, Any]) -> str:
     Deterministic hash:
       dict -> canonical JSON (sorted keys) -> sha256
     """
-    canonical = json.dumps(policy_obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    canonical = json.dumps(
+        policy_obj,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        default=str,  # date/datetime → ISO string
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
 
 def load_policy_and_hash(path: str) -> Tuple[Dict[str, Any], str]:
     obj = load_yaml_policy(path)
