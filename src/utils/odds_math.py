@@ -75,6 +75,7 @@ def expected_value_units(p_win: Optional[float], american_odds: Optional[float])
     """
     EV in units for a 1u stake.
       EV = p * profit_if_win - (1-p) * 1
+    Returns None if inputs invalid.
     """
     if p_win is None:
         return None
@@ -89,4 +90,4 @@ def expected_value_units(p_win: Optional[float], american_odds: Optional[float])
     if ppu is None:
         return None
 
-    return p * float(ppu) - (1.0 - p)
+    return p * float(ppu) - (1.0 - p) * 1.0
