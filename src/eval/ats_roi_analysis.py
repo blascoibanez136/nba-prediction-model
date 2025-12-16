@@ -13,6 +13,13 @@ PACKET 1 ADDITIONS (Elite Hardening):
 - policy hash + policy object written into outputs/ats_roi_metrics.json
 - best-effort git commit captured for reproducibility
 
+PACKET 2 ADDITIONS (Regression Tripwires):
+- --strict: promote selected validation warnings to errors
+- Early per_game validation summary block after eval-window filtering
+- Degeneracy guards (nunique thresholds) for key columns (warn by default; fail in --strict)
+- Coverage stats logging (nonnull rates)
+- Bet-rate warn band (warn only; does not change selection logic)
+
 Assumptions:
 - pricing is fixed -110 (ppu=0.9090909)
 - residual = fair_spread_model - home_spread_consensus (or spread_error fallback)
@@ -91,6 +98,85 @@ def expected_value_ats(p_win: Optional[float]) -> Optional[float]:
     if p is None or not (0.0 < p < 1.0):
         return None
     return p * PPU_ATS_MINUS_110 - (1.0 - p) * 1.0
+
+
+# --------------------------
+# PACKET 2: validation helpers
+# --------------------------
+def _nunique_nonnull(s: pd.Series) -> int:
+    return int(s.dropna().nunique())
+
+
+def _nonnull_rate(s: pd.Series) -> float:
+    denom = max(int(len(s)), 1)
+    return float(s.notna().sum() / denom)
+
+
+def _warn_or_raise(msg: str, strict: bool) -> None:
+    if strict:
+        raise RuntimeError(msg)
+    print(msg)
+
+
+def _validate_per_game_inputs(df: pd.DataFrame, strict: bool) -> None:
+    """
+    Packet 2: Regression tripwires + input integrity checks.
+
+    - Hard fails on missing critical columns.
+    - Warns by default (fails in --strict) on degeneracy / collapse patterns.
+    """
+    if df is None or df.empty:
+        raise RuntimeError("[ats][validate] per_game dataframe is empty after eval window filtering.")
+
+    # Hard requirements
+    if "home_spread_consensus" not in df.columns:
+        raise RuntimeError("[ats][validate] Missing required column: home_spread_consensus")
+
+    has_pair = ("fair_spread_model" in df.columns and "home_spread_consensus" in df.columns)
+    has_err = ("spread_error" in df.columns)
+    if not (has_pair or has_err):
+        raise RuntimeError("[ats][validate] Need fair_spread_model+home_spread_consensus OR spread_error for residuals.")
+
+    # Ensure score columns exist (structure check; numeric coercion happens later)
+    _find_score_cols(df)
+
+    n = int(len(df))
+    min_unique = max(10, int(0.25 * n))  # conservative threshold to catch collapse without false positives
+
+    lines = ["[ats][validate] ---- per_game validation summary ----"]
+    lines.append(f"[ats][validate] rows={n} min_unique_threshold={min_unique} strict={strict}")
+
+    # home_spread_consensus sanity
+    hs = pd.to_numeric(df["home_spread_consensus"], errors="coerce")
+    hs_nu = _nunique_nonnull(hs)
+    lines.append(f"[ats][validate] home_spread_consensus: nonnull_rate={_nonnull_rate(hs):.3f} nunique={hs_nu}")
+    if hs_nu < min_unique:
+        _warn_or_raise(
+            f"[ats][validate] {'ERROR' if strict else 'WARNING'}: home_spread_consensus appears degenerate "
+            f"(nunique={hs_nu} < {min_unique}).",
+            strict,
+        )
+
+    # fair_spread_model sanity (if present)
+    if "fair_spread_model" in df.columns:
+        fsm = pd.to_numeric(df["fair_spread_model"], errors="coerce")
+        fsm_nu = _nunique_nonnull(fsm)
+        lines.append(f"[ats][validate] fair_spread_model: nonnull_rate={_nonnull_rate(fsm):.3f} nunique={fsm_nu}")
+        if fsm_nu < min_unique:
+            _warn_or_raise(
+                f"[ats][validate] {'ERROR' if strict else 'WARNING'}: fair_spread_model appears degenerate "
+                f"(nunique={fsm_nu} < {min_unique}).",
+                strict,
+            )
+
+    # dispersion sanity (if present)
+    if "home_spread_dispersion" in df.columns:
+        hd = pd.to_numeric(df["home_spread_dispersion"], errors="coerce")
+        lines.append(f"[ats][validate] home_spread_dispersion: nonnull_rate={_nonnull_rate(hd):.3f} nunique={_nunique_nonnull(hd)}")
+
+    lines.append("[ats][validate] ------------------------------------")
+    for ln in lines:
+        print(ln)
 
 
 @dataclass(frozen=True)
@@ -185,6 +271,13 @@ def main() -> None:
 
     ap.add_argument("--max-bet-rate", type=float, default=0.30)
     ap.add_argument("--max-profit-abs", type=float, default=10.0)
+
+    # PACKET 2: strict mode promotes selected warnings to hard failures
+    ap.add_argument(
+        "--strict",
+        action="store_true",
+        help="Enable strict validation mode (promote regression warnings to errors).",
+    )
 
     # PACKET 1: policy artifact + hash guard (opt-in)
     ap.add_argument(
@@ -312,6 +405,9 @@ def main() -> None:
     if df.empty:
         raise RuntimeError("[ats] No rows after eval window filtering.")
 
+    # PACKET 2: early validation / regression tripwires (warn by default; fail in --strict)
+    _validate_per_game_inputs(df, strict=bool(args.strict))
+
     if "home_spread_consensus" not in df.columns:
         raise RuntimeError("[ats] Missing required column: home_spread_consensus")
 
@@ -386,6 +482,12 @@ def main() -> None:
 
     total_games = int(df["merge_key"].nunique()) if "merge_key" in df.columns else int(len(df))
     bet_rate = float(len(bets) / max(total_games, 1))
+
+    # PACKET 2: bet-rate warn band (does not change selection logic)
+    if bet_rate < 0.08:
+        print(f"[ats][validate] WARNING: bet_rate unusually LOW ({bet_rate:.3f}).")
+    if bet_rate > 0.28:
+        print(f"[ats][validate] WARNING: bet_rate unusually HIGH ({bet_rate:.3f}).")
 
     if bet_rate > cfg.max_bet_rate:
         raise RuntimeError(
