@@ -413,7 +413,7 @@ def main() -> None:
         }
         os.makedirs(cfg.out_dir, exist_ok=True)
         with open(os.path.join(cfg.out_dir, "ats_roi_metrics.json"), "w", encoding="utf-8") as f:
-            json.dump(metrics, f, indent=2)
+            json.dump(metrics, f, indent=2, default=str)
         bets.to_csv(os.path.join(cfg.out_dir, "ats_roi_bets.csv"), index=False)
         print(f"[ats] wrote: outputs/ats_roi_metrics.json")
         print(f"[ats] wrote: outputs/ats_roi_bets.csv")
@@ -491,7 +491,7 @@ def main() -> None:
     }
 
     with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(metrics, f, indent=2, default=str)
     bets.to_csv(bets_path, index=False)
 
     print(f"[ats] wrote: {metrics_path}")
