@@ -14,6 +14,12 @@ PACKET 4B:
     - bucket (A/B/C stakes)
     - kelly_lite (fractional Kelly with caps)
 - Exposure guard on total stake
+
+Hardening tweaks (applied):
+1) Drop NaT dates after parsing
+2) Coerce fair_total_model + total_consensus to numeric + drop NaNs
+3) Clip calibrator probabilities to (1e-6, 1-1e-6)
+4) Add --disable-bet-cap flag (default keeps exact v3 behavior)
 """
 
 from __future__ import annotations
@@ -137,6 +143,13 @@ def main() -> None:
     # selection-rate guard (count-based)
     ap.add_argument("--max-bet-rate", type=float, default=0.15)
 
+    # Hardening tweak #4: allow diagnostic runs without trimming
+    ap.add_argument(
+        "--disable-bet-cap",
+        action="store_true",
+        help="If set, do NOT trim by --max-bet-rate (diagnostic mode). Default: trimming enabled.",
+    )
+
     # exposure guard (stake-sum-based)
     ap.add_argument(
         "--max-stake-rate",
@@ -178,6 +191,7 @@ def main() -> None:
     print(f"[totals] stake_mode={args.stake_mode}")
     print(f"[totals] max_bet_rate={args.max_bet_rate}")
     print(f"[totals] max_stake_rate={max_stake_rate}")
+    print(f"[totals] disable_bet_cap={bool(args.disable_bet_cap)}")
 
     # ---------- load ----------
     df = pd.read_csv(args.per_game)
@@ -186,6 +200,9 @@ def main() -> None:
 
     date_col = _get_date_col(df)
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+
+    # Hardening tweak #1: drop NaT dates
+    df = df.dropna(subset=[date_col]).copy()
 
     es = pd.to_datetime(args.eval_start)
     ee = pd.to_datetime(args.eval_end)
@@ -200,6 +217,13 @@ def main() -> None:
     for c in required:
         if c not in df.columns:
             raise RuntimeError(f"[totals] missing column: {c}")
+
+    # Hardening tweak #2: coerce numerics + drop invalid
+    df["fair_total_model"] = pd.to_numeric(df["fair_total_model"], errors="coerce")
+    df["total_consensus"] = pd.to_numeric(df["total_consensus"], errors="coerce")
+    df = df.dropna(subset=["fair_total_model", "total_consensus"]).copy()
+    if df.empty:
+        raise RuntimeError("[totals] No valid rows after numeric coercion for totals columns")
 
     # ---------- core math ----------
     df["actual_total"] = df["home_score"] + df["away_score"]
@@ -228,6 +252,10 @@ def main() -> None:
 
     # Predict P(over) from residual
     df["p_over"] = iso.predict(df["total_residual"].astype(float))
+
+    # Hardening tweak #3: clip to sane probability bounds
+    df["p_over"] = pd.to_numeric(df["p_over"], errors="coerce").clip(1e-6, 1.0 - 1e-6)
+
     df["p_under"] = 1.0 - df["p_over"]
 
     # EV at -110
@@ -270,14 +298,15 @@ def main() -> None:
     total_games = int(df["merge_key"].nunique()) if "merge_key" in df.columns else len(df)
 
     # ---------- Packet 4A: bet-rate cap via trimming by EV ----------
-    max_bets = max(1, int(math.floor(args.max_bet_rate * total_games)))
-    bets = bets.sort_values("ev_used", ascending=False)
-    if len(bets) > max_bets:
-        print(
-            f"[totals] Bet-rate capped: trimming {len(bets)} → {max_bets} "
-            f"(cap={args.max_bet_rate:.2f})"
-        )
-        bets = bets.head(max_bets)
+    if not args.disable_bet_cap:
+        max_bets = max(1, int(math.floor(args.max_bet_rate * total_games)))
+        bets = bets.sort_values("ev_used", ascending=False)
+        if len(bets) > max_bets:
+            print(
+                f"[totals] Bet-rate capped: trimming {len(bets)} → {max_bets} "
+                f"(cap={args.max_bet_rate:.2f})"
+            )
+            bets = bets.head(max_bets)
 
     if bets.empty:
         print("[totals] No bets selected")
@@ -360,16 +389,16 @@ def main() -> None:
     over_sum = summarize(bets[bets["bet_side"] == "over"])
     under_sum = summarize(bets[bets["bet_side"] == "under"])
 
-    bucket_summaries = {
-        b: summarize(bets[bets["bucket"] == b]) for b in ["A", "B", "C"]
-    }
+    bucket_summaries = {b: summarize(bets[bets["bucket"] == b]) for b in ["A", "B", "C"]}
 
     print(f"[totals] overall: {overall}")
     print(f"[totals] over_only: {over_sum}")
     print(f"[totals] under_only: {under_sum}")
     print(f"[totals] bet_rate: {bet_rate:.3f}")
     print(f"[totals] stake_rate: {stake_rate:.3f}")
-    print(f"[totals] buckets: A={bucket_summaries['A']} B={bucket_summaries['B']} C={bucket_summaries['C']}")
+    print(
+        f"[totals] buckets: A={bucket_summaries['A']} B={bucket_summaries['B']} C={bucket_summaries['C']}"
+    )
 
     os.makedirs(args.out_dir, exist_ok=True)
     bets.to_csv(os.path.join(args.out_dir, "totals_roi_bets.csv"), index=False)
@@ -393,8 +422,9 @@ def main() -> None:
             "odds_assumed": "-110",
             "ppu": PPU_TOTAL_MINUS_110,
         },
-        "eval_window": {"start": str(es.date()), "end": str(ee.date())},
+        "eval_window": {"start": str(es.date()), "end": str(ee.date()),},
         "pricing": {"assumed": "-110", "ppu": PPU_TOTAL_MINUS_110},
+        "disable_bet_cap": bool(args.disable_bet_cap),
     }
 
     with open(os.path.join(args.out_dir, "totals_roi_metrics.json"), "w") as f:
