@@ -187,12 +187,21 @@ def main() -> None:
     if args.side != "both":
         bets = bets[bets["bet_side"] == args.side]
 
-    total_games = int(df["merge_key"].nunique()) if "merge_key" in df.columns else len(df)
-    bet_rate = len(bets) / max(total_games, 1)
+   total_games = int(df["merge_key"].nunique()) if "merge_key" in df.columns else len(df)
+max_bets = max(1, int(math.floor(args.max_bet_rate * total_games)))
 
-    if bet_rate > args.max_bet_rate:
-        raise RuntimeError(
-            f"[totals] Bet-rate too high: {bet_rate:.3f} (cap={args.max_bet_rate})"
+# Rank by EV strength (descending)
+bets = bets.sort_values("ev_used", ascending=False)
+
+if len(bets) > max_bets:
+    print(
+        f"[totals] Bet-rate capped: trimming {len(bets)} → {max_bets} "
+        f"(cap={args.max_bet_rate:.2f})"
+    )
+    bets = bets.head(max_bets)
+
+bet_rate = len(bets) / max(total_games, 1)
+
         )
 
     if bets.empty:
