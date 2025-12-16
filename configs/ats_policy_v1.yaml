@@ -1,0 +1,29 @@
+policy_name: ats_policy_v1
+version_tag: 2025-12-15_oos_verified
+
+# Locked OOS windows (documentation + provenance)
+oos_train_window:
+  start: 2023-10-24
+  end: 2024-03-10
+oos_eval_window:
+  start: 2024-03-11
+  end: 2024-04-14
+oos_observed:
+  roi: 0.145
+  bets_approx: 60
+  bet_rate_approx: 0.22
+
+# Policy parameters (LOCKED v1)
+side_policy: both
+ev_threshold: 0.03
+max_dispersion: 2.0
+pricing: fixed_-110
+
+# Explicitly disabled in v1 (by design)
+min_abs_residual: 0.0
+
+# Guards
+guards:
+  max_bet_rate: 0.30
+  max_profit_abs: 10.0
+  fail_on_overlap: false
