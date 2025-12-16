@@ -1,21 +1,22 @@
 """
-Train a market-relative calibrator for NBA Pro‑Lite/Elite models.
+Train a market-relative calibrator for NBA Pro-Lite/Elite models.
 
-This script reads a per-game backtest CSV (e.g. ``outputs/backtest_per_game.csv``),
-computes the delta between the model’s raw probability and the de‑vigged market
-probability, buckets games by moneyline odds magnitude, and fits isotonic
-regression calibrators per bucket.  The resulting calibrator dictionary is
-saved to disk via ``joblib``.
+Reads per-game backtest CSV, computes:
+  delta = p_model_raw - p_market_devig
 
-Usage (from repository root):
+Buckets by ML odds magnitude and fits isotonic calibrators per bucket.
+Saves a dict artifact via joblib.
 
+Hardening:
+- Optional train window filtering (--train-start/--train-end) with NaT drop
+- Uses shared odds devig helper (src.utils.odds_math) to avoid circular imports
+- Clips model probs to (1e-6, 1-1e-6) before fitting
+
+Usage:
     PYTHONPATH=. python -m src.eval.train_delta_calibrator \
         --per_game outputs/backtest_per_game.csv \
-        --out artifacts/delta_calibrator.joblib
-
-You can then pass the saved ``delta_calibrator.joblib`` to the ROI analysis
-module when running in ``ev_cal`` mode to produce calibrated expected-value
-bet selection.
+        --out artifacts/delta_calibrator.joblib \
+        --train-start 2023-10-24 --train-end 2024-03-10
 """
 
 from __future__ import annotations
@@ -30,18 +31,13 @@ from src.model.market_relative_calibration import (
     fit_delta_calibrator,
     save_delta_calibrator,
 )
+from src.utils.odds_math import devig_home_prob
+
+PROB_EPS = 1e-6
 
 
 def _infer_model_prob_column(df: pd.DataFrame) -> str:
-    """Infer the model probability column to use.
-
-    Preference order:
-        1. ``home_win_prob_model_raw``
-        2. ``home_win_prob_model``
-        3. ``home_win_prob``
-
-    Raises if none are found.
-    """
+    """Infer the model probability column to use."""
     candidates = [
         "home_win_prob_model_raw",
         "home_win_prob_model",
@@ -55,12 +51,23 @@ def _infer_model_prob_column(df: pd.DataFrame) -> str:
     )
 
 
+def _get_date_col(df: pd.DataFrame) -> Optional[str]:
+    for c in ["game_date", "date", "gamedate"]:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _clip_prob(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").clip(PROB_EPS, 1.0 - PROB_EPS)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser("train_delta_calibrator.py")
     ap.add_argument(
         "--per_game",
         required=True,
-        help="Path to per-game backtest CSV (must include model and market probabilities and scores).",
+        help="Path to per-game backtest CSV (must include model probs, ML odds, and scores).",
     )
     ap.add_argument(
         "--out",
@@ -73,6 +80,11 @@ def main() -> None:
         default=25,
         help="Minimum number of samples per bucket to fit a calibrator. Buckets with fewer samples are skipped.",
     )
+
+    # Hardening: train window filtering (optional)
+    ap.add_argument("--train-start", default=None, help="Filter training start date (YYYY-MM-DD). Optional.")
+    ap.add_argument("--train-end", default=None, help="Filter training end date (YYYY-MM-DD). Optional.")
+
     args = ap.parse_args()
 
     per_game_path: str = args.per_game
@@ -83,49 +95,78 @@ def main() -> None:
         raise FileNotFoundError(f"[train_delta_calibrator] per_game file not found: {per_game_path}")
 
     df = pd.read_csv(per_game_path)
+    if df.empty:
+        raise RuntimeError("[train_delta_calibrator] per_game is empty")
 
-    # Ensure required columns exist
-    # Determine model probability column
+    # Optional train window filter
+    date_col = _get_date_col(df)
+    if (args.train_start or args.train_end) and not date_col:
+        raise RuntimeError("[train_delta_calibrator] train-start/train-end provided but no date column found")
+
+    if date_col and (args.train_start or args.train_end):
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.dropna(subset=[date_col]).copy()
+
+        ts = pd.to_datetime(args.train_start, errors="coerce") if args.train_start else None
+        te = pd.to_datetime(args.train_end, errors="coerce") if args.train_end else None
+        if args.train_start and pd.isna(ts):
+            raise RuntimeError("[train_delta_calibrator] invalid train-start")
+        if args.train_end and pd.isna(te):
+            raise RuntimeError("[train_delta_calibrator] invalid train-end")
+
+        if ts is not None:
+            df = df[df[date_col] >= ts].copy()
+        if te is not None:
+            df = df[df[date_col] <= te].copy()
+
+        print(
+            f"[train_delta_calibrator] train_window: start={str(ts.date()) if ts is not None else None} "
+            f"end={str(te.date()) if te is not None else None} rows={len(df)}"
+        )
+
+    if df.empty:
+        raise RuntimeError("[train_delta_calibrator] No rows after train window filtering")
+
+    # Determine model probability column and normalize to expected name
     model_prob_col = _infer_model_prob_column(df)
-    # Copy to expected column names
     df = df.copy()
-    df["model_prob_home_raw"] = pd.to_numeric(df[model_prob_col], errors="coerce")
-    # Use market probability column if present (home_ml_prob_consensus) else compute from ML odds
-    if "market_prob_home" not in df.columns:
-        # Attempt to compute from ml_home_consensus and ml_away_consensus
-        if "ml_home_consensus" in df.columns and "ml_away_consensus" in df.columns:
-            from src.eval.roi_analysis import devig_home_prob  # type: ignore
+    df["model_prob_home_raw"] = _clip_prob(df[model_prob_col])
 
-            df["market_prob_home"], _method = zip(
-                *df.apply(
-                    lambda r: devig_home_prob(r.get("ml_home_consensus"), r.get("ml_away_consensus")),
-                    axis=1,
-                )
+    # Ensure market_prob_home exists or compute from ML odds
+    if "market_prob_home" not in df.columns:
+        if "ml_home_consensus" in df.columns and "ml_away_consensus" in df.columns:
+            dev = df.apply(
+                lambda r: devig_home_prob(r.get("ml_home_consensus"), r.get("ml_away_consensus")),
+                axis=1,
+                result_type="expand",
             )
+            df["market_prob_home"] = dev[0]
         else:
             raise RuntimeError(
-                "[train_delta_calibrator] market_prob_home column missing and cannot compute from ML odds"
+                "[train_delta_calibrator] market_prob_home missing and cannot compute (ml_home_consensus/ml_away_consensus missing)"
             )
+
+    df["market_prob_home"] = _clip_prob(df["market_prob_home"])
 
     # Ensure home_win_actual exists; compute if needed
     if "home_win_actual" not in df.columns:
         if "home_score" in df.columns and "away_score" in df.columns:
-            df["home_win_actual"] = (
-                pd.to_numeric(df["home_score"], errors="coerce")
-                > pd.to_numeric(df["away_score"], errors="coerce")
-            ).astype(float)
+            df["home_score"] = pd.to_numeric(df["home_score"], errors="coerce")
+            df["away_score"] = pd.to_numeric(df["away_score"], errors="coerce")
+            df = df.dropna(subset=["home_score", "away_score"]).copy()
+            df["home_win_actual"] = (df["home_score"] > df["away_score"]).astype(float)
         else:
-            raise RuntimeError(
-                "[train_delta_calibrator] home_win_actual missing and cannot infer from scores"
-            )
+            raise RuntimeError("[train_delta_calibrator] home_win_actual missing and cannot infer from scores")
+
+    if df.empty:
+        raise RuntimeError("[train_delta_calibrator] No valid rows after score coercion")
 
     # Fit calibrator
     calibrator = fit_delta_calibrator(df, min_samples=min_samples)
     save_delta_calibrator(calibrator, out_path)
-    print(
-        f"[train_delta_calibrator] Saved delta calibrator with {len(calibrator.get('calibrators', {}))} buckets "
-        f"to {out_path}"
-    )
+
+    n_buckets = len(calibrator.get("calibrators", {}))
+    print(f"[train_delta_calibrator] Saved delta calibrator with {n_buckets} buckets to {out_path}")
 
 
 if __name__ == "__main__":
