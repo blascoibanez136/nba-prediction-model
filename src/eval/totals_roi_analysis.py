@@ -6,6 +6,14 @@ PACKET 4A-3:
 - Optional dispersion gating
 - EV × residual interaction (funnel)
 - Hard bet-rate + profit guards
+
+PACKET 4B:
+- Confidence score + buckets (A/B/C)
+- Optional stake sizing:
+    - flat (default)
+    - bucket (A/B/C stakes)
+    - kelly_lite (fractional Kelly with caps)
+- Exposure guard on total stake
 """
 
 from __future__ import annotations
@@ -14,15 +22,15 @@ import argparse
 import json
 import math
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
-import pandas as pd
 import joblib
+import pandas as pd
 
 from src.model.total_ev import expected_value_total
 
-TOTALS_ROI_VERSION = "totals_roi_v2_ev_residual_funnel_2025-12-16"
-PPU_TOTAL_MINUS_110 = 100.0 / 110.0
+TOTALS_ROI_VERSION = "totals_roi_v3_buckets_kellylite_2025-12-16"
+PPU_TOTAL_MINUS_110 = 100.0 / 110.0  # profit per 1u stake at -110
 
 
 # ---------- helpers ----------
@@ -52,6 +60,61 @@ def summarize(bets: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
+def _parse_bucket_stakes(s: str) -> Dict[str, float]:
+    """
+    Format: "A=1.0,B=0.6,C=0.3"
+    """
+    out: Dict[str, float] = {}
+    if not s:
+        return out
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    for p in parts:
+        if "=" not in p:
+            continue
+        k, v = p.split("=", 1)
+        k = k.strip().upper()
+        v = float(v.strip())
+        out[k] = v
+    return out
+
+
+def _assign_buckets_by_quantiles(bets: pd.DataFrame, score_col: str) -> pd.Series:
+    """
+    A = top 20%
+    B = next 30%
+    C = remaining 50%
+    """
+    s = bets[score_col].astype(float)
+    q80 = s.quantile(0.80)
+    q50 = s.quantile(0.50)
+
+    def lab(x: float) -> str:
+        if x >= q80:
+            return "A"
+        if x >= q50:
+            return "B"
+        return "C"
+
+    return s.apply(lab)
+
+
+def _kelly_fraction(p: float, b: float) -> float:
+    """
+    Kelly for binary bet with:
+      win profit = b (per 1 stake)
+      lose loss  = 1 (per 1 stake)
+    f* = (b*p - (1-p)) / b
+    """
+    if p is None or math.isnan(p) or math.isinf(p):
+        return 0.0
+    p = float(p)
+    if p <= 0.0 or p >= 1.0:
+        return 0.0
+    q = 1.0 - p
+    f = (b * p - q) / b
+    return max(0.0, f)
+
+
 # ---------- main ----------
 
 def main() -> None:
@@ -71,12 +134,40 @@ def main() -> None:
     ap.add_argument("--eval-start", required=True)
     ap.add_argument("--eval-end", required=True)
 
+    # selection-rate guard (count-based)
     ap.add_argument("--max-bet-rate", type=float, default=0.15)
+
+    # exposure guard (stake-sum-based)
+    ap.add_argument(
+        "--max-stake-rate",
+        type=float,
+        default=None,
+        help="Cap total stake exposure as (sum stake) / total_games. Default: equals --max-bet-rate.",
+    )
+
     ap.add_argument("--max-profit-abs", type=float, default=10.0)
+
+    # Packet 4B: sizing + buckets
+    ap.add_argument(
+        "--stake-mode",
+        default="flat",
+        choices=["flat", "bucket", "kelly_lite"],
+        help="flat=1u each, bucket=use A/B/C stakes, kelly_lite=fractional Kelly with caps",
+    )
+    ap.add_argument("--flat-stake", type=float, default=1.0)
+    ap.add_argument("--bucket-stakes", default="A=1.0,B=0.6,C=0.3")
+    ap.add_argument("--kelly-fraction", type=float, default=0.25, help="e.g., 0.25 = quarter Kelly")
+    ap.add_argument("--kelly-max-unit", type=float, default=1.0)
+    ap.add_argument("--kelly-min-unit", type=float, default=0.0)
 
     ap.add_argument("--out-dir", default="outputs")
 
     args = ap.parse_args()
+
+    max_stake_rate = args.max_stake_rate if args.max_stake_rate is not None else args.max_bet_rate
+    bucket_stakes = _parse_bucket_stakes(args.bucket_stakes)
+    if not bucket_stakes:
+        bucket_stakes = {"A": 1.0, "B": 0.6, "C": 0.3}
 
     print(f"[totals] version={TOTALS_ROI_VERSION}")
     print(f"[totals] per_game={args.per_game}")
@@ -84,6 +175,9 @@ def main() -> None:
     print(f"[totals] ev_base={args.ev}")
     print(f"[totals] min_abs_residual={args.min_abs_residual}")
     print(f"[totals] side_policy={args.side}")
+    print(f"[totals] stake_mode={args.stake_mode}")
+    print(f"[totals] max_bet_rate={args.max_bet_rate}")
+    print(f"[totals] max_stake_rate={max_stake_rate}")
 
     # ---------- load ----------
     df = pd.read_csv(args.per_game)
@@ -102,17 +196,25 @@ def main() -> None:
     if df.empty:
         raise RuntimeError("[totals] No rows in eval window")
 
+    required = ["fair_total_model", "total_consensus", "home_score", "away_score"]
+    for c in required:
+        if c not in df.columns:
+            raise RuntimeError(f"[totals] missing column: {c}")
+
     # ---------- core math ----------
     df["actual_total"] = df["home_score"] + df["away_score"]
     df["total_residual"] = df["fair_total_model"] - df["total_consensus"]
     df["abs_residual"] = df["total_residual"].abs()
 
+    # residual magnitude gate
     eligible = df["abs_residual"] >= args.min_abs_residual
 
+    # dispersion gate (optional)
     if "total_dispersion" in df.columns:
         df["total_dispersion"] = pd.to_numeric(df["total_dispersion"], errors="coerce")
+        disp_ok = df["total_dispersion"] <= args.max_dispersion
         if args.require_dispersion:
-            eligible &= df["total_dispersion"] <= args.max_dispersion
+            eligible = eligible & disp_ok
     elif args.require_dispersion:
         raise RuntimeError("[totals] require-dispersion=True but total_dispersion missing")
 
@@ -120,35 +222,38 @@ def main() -> None:
 
     # ---------- calibrator ----------
     cal = joblib.load(args.calibrator)
-    iso = cal.get("model")
+    iso = cal.get("model") if isinstance(cal, dict) else None
     if iso is None:
-        raise RuntimeError("[totals] invalid calibrator artifact")
+        raise RuntimeError("[totals] invalid calibrator artifact (expected dict with key 'model')")
 
+    # Predict P(over) from residual
     df["p_over"] = iso.predict(df["total_residual"].astype(float))
     df["p_under"] = 1.0 - df["p_over"]
 
+    # EV at -110
     df["over_ev"] = df["p_over"].apply(expected_value_total)
     df["under_ev"] = df["p_under"].apply(expected_value_total)
 
     # ---------- EV × residual funnel ----------
     def ev_required(abs_res: float) -> float:
+        # Larger residual → lower EV requirement (slight)
         if abs_res >= 6.0:
             return max(0.03, args.ev - 0.02)
         if abs_res >= 4.0:
             return max(0.035, args.ev - 0.01)
         return args.ev
 
-    def choose_side(r):
-        if not r["eligible"]:
+    def choose_side(r) -> Tuple[bool, Optional[str], Optional[float]]:
+        if not bool(r["eligible"]):
             return False, None, None
 
-        req_ev = ev_required(r["abs_residual"])
+        req_ev = ev_required(float(r["abs_residual"]))
         oe, ue = r["over_ev"], r["under_ev"]
 
-        if pd.notna(oe) and oe >= req_ev and (pd.isna(ue) or oe > ue):
-            return True, "over", oe
-        if pd.notna(ue) and ue >= req_ev and (pd.isna(oe) or ue > oe):
-            return True, "under", ue
+        if pd.notna(oe) and float(oe) >= req_ev and (pd.isna(ue) or float(oe) > float(ue)):
+            return True, "over", float(oe)
+        if pd.notna(ue) and float(ue) >= req_ev and (pd.isna(oe) or float(ue) > float(oe)):
+            return True, "under", float(ue)
         return False, None, None
 
     chosen = df.apply(choose_side, axis=1, result_type="expand")
@@ -158,17 +263,15 @@ def main() -> None:
 
     bets = df[df["bet"]].copy()
 
+    # side policy
     if args.side != "both":
         bets = bets[bets["bet_side"] == args.side]
 
-    # ---------- hard bet-rate throttle ----------
-    total_games = (
-        int(df["merge_key"].nunique()) if "merge_key" in df.columns else len(df)
-    )
+    total_games = int(df["merge_key"].nunique()) if "merge_key" in df.columns else len(df)
+
+    # ---------- Packet 4A: bet-rate cap via trimming by EV ----------
     max_bets = max(1, int(math.floor(args.max_bet_rate * total_games)))
-
     bets = bets.sort_values("ev_used", ascending=False)
-
     if len(bets) > max_bets:
         print(
             f"[totals] Bet-rate capped: trimming {len(bets)} → {max_bets} "
@@ -176,15 +279,60 @@ def main() -> None:
         )
         bets = bets.head(max_bets)
 
-    bet_rate = len(bets) / max(total_games, 1)
-
     if bets.empty:
         print("[totals] No bets selected")
         return
 
-    # ---------- settlement ----------
-    bets["stake"] = 1.0
+    # ---------- Packet 4B: confidence score + buckets ----------
+    # Confidence score (monotone): EV strength × residual magnitude (soft)
+    # This does NOT change which bets are included; it only ranks them.
+    scale = (bets["abs_residual"] / max(args.min_abs_residual, 1e-9)).clip(lower=1.0, upper=2.0)
+    bets["confidence_score"] = bets["ev_used"].astype(float) * scale.astype(float)
 
+    bets["bucket"] = _assign_buckets_by_quantiles(bets, "confidence_score")
+
+    # ---------- Packet 4B: stake sizing ----------
+    def stake_for_row(r) -> float:
+        if args.stake_mode == "flat":
+            return float(args.flat_stake)
+
+        if args.stake_mode == "bucket":
+            b = str(r["bucket"]).upper()
+            return float(bucket_stakes.get(b, 1.0))
+
+        # kelly_lite
+        side = r["bet_side"]
+        p = float(r["p_over"]) if side == "over" else float(r["p_under"])
+        f = _kelly_fraction(p, PPU_TOTAL_MINUS_110)  # fraction of bankroll
+        # fractional Kelly + caps, expressed in "units"
+        u = args.kelly_fraction * f
+        u = max(float(args.kelly_min_unit), min(float(args.kelly_max_unit), float(u)))
+        return float(u)
+
+    bets["stake"] = bets.apply(stake_for_row, axis=1)
+
+    # exposure guard: cap SUM(stake) / total_games
+    max_total_stake = max_stake_rate * max(total_games, 1)
+    if bets["stake"].sum() > max_total_stake:
+        # trim by confidence_score so we keep the “best” exposure
+        bets = bets.sort_values("confidence_score", ascending=False)
+        running = bets["stake"].cumsum()
+        keep = running <= max_total_stake
+        # ensure at least 1 bet survives if any exist
+        if keep.sum() == 0 and len(bets) > 0:
+            keep.iloc[0] = True
+        trimmed = int((~keep).sum())
+        if trimmed > 0:
+            print(
+                f"[totals] Stake-rate capped: trimming {len(bets)} → {int(keep.sum())} "
+                f"(cap={max_stake_rate:.2f})"
+            )
+        bets = bets.loc[keep].copy()
+
+    bet_rate = len(bets) / max(total_games, 1)
+    stake_rate = float(bets["stake"].sum()) / max(total_games, 1)
+
+    # ---------- settlement ----------
     def result(r):
         if r["actual_total"] == r["total_consensus"]:
             return "push"
@@ -194,9 +342,15 @@ def main() -> None:
 
     bets["result"] = bets.apply(result, axis=1)
 
-    bets["profit"] = bets["result"].map(
-        {"win": PPU_TOTAL_MINUS_110, "loss": -1.0, "push": 0.0}
-    )
+    # profit scales with stake
+    def profit(r):
+        if r["result"] == "push":
+            return 0.0
+        if r["result"] == "win":
+            return float(r["stake"]) * PPU_TOTAL_MINUS_110
+        return -float(r["stake"])
+
+    bets["profit"] = bets.apply(profit, axis=1)
 
     if bets["profit"].abs().max() > args.max_profit_abs:
         raise RuntimeError("[totals] Profit sanity failure")
@@ -206,13 +360,18 @@ def main() -> None:
     over_sum = summarize(bets[bets["bet_side"] == "over"])
     under_sum = summarize(bets[bets["bet_side"] == "under"])
 
+    bucket_summaries = {
+        b: summarize(bets[bets["bucket"] == b]) for b in ["A", "B", "C"]
+    }
+
     print(f"[totals] overall: {overall}")
     print(f"[totals] over_only: {over_sum}")
     print(f"[totals] under_only: {under_sum}")
     print(f"[totals] bet_rate: {bet_rate:.3f}")
+    print(f"[totals] stake_rate: {stake_rate:.3f}")
+    print(f"[totals] buckets: A={bucket_summaries['A']} B={bucket_summaries['B']} C={bucket_summaries['C']}")
 
     os.makedirs(args.out_dir, exist_ok=True)
-
     bets.to_csv(os.path.join(args.out_dir, "totals_roi_bets.csv"), index=False)
 
     metrics = {
@@ -220,10 +379,20 @@ def main() -> None:
         "overall": overall,
         "over_only": over_sum,
         "under_only": under_sum,
+        "buckets": bucket_summaries,
         "bet_rate": bet_rate,
+        "stake_rate": stake_rate,
         "base_ev": args.ev,
         "min_abs_residual": args.min_abs_residual,
-        "ev_funnel": True,
+        "stake_mode": args.stake_mode,
+        "bucket_stakes": bucket_stakes,
+        "kelly": {
+            "fraction": args.kelly_fraction,
+            "max_unit": args.kelly_max_unit,
+            "min_unit": args.kelly_min_unit,
+            "odds_assumed": "-110",
+            "ppu": PPU_TOTAL_MINUS_110,
+        },
         "eval_window": {"start": str(es.date()), "end": str(ee.date())},
         "pricing": {"assumed": "-110", "ppu": PPU_TOTAL_MINUS_110},
     }
