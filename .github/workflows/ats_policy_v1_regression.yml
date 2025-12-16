@@ -1,0 +1,35 @@
+name: ATS Policy v1 Regression Gate
+
+on:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch: {}
+
+jobs:
+  ats_policy_v1_gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (if requirements.txt exists)
+        shell: bash
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "No requirements.txt found; continuing."
+          fi
+
+      - name: Run ATS Policy v1 regression gate
+        shell: bash
+        run: |
+          set -e
+          PYTHONPATH=. python -m qa.regression_ats_policy_v1
