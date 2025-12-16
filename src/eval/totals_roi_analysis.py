@@ -20,6 +20,8 @@ Hardening tweaks (applied):
 2) Coerce fair_total_model + total_consensus to numeric + drop NaNs
 3) Clip calibrator probabilities to (1e-6, 1-1e-6)
 4) Add --disable-bet-cap flag (default keeps exact v3 behavior)
+5) ALWAYS write outputs (metrics + bets CSV), even if 0 bets
+6) Coerce home_score/away_score to numeric + drop NaNs
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ import pandas as pd
 
 from src.model.total_ev import expected_value_total
 
-TOTALS_ROI_VERSION = "totals_roi_v3_buckets_kellylite_2025-12-16"
+TOTALS_ROI_VERSION = "totals_roi_v3_buckets_kellylite_2025-12-16_hardened_outputs"
 PPU_TOTAL_MINUS_110 = 100.0 / 110.0  # profit per 1u stake at -110
 
 
@@ -52,10 +54,10 @@ def summarize(bets: pd.DataFrame) -> Dict[str, Any]:
     if bets is None or bets.empty:
         return {"bets": 0, "stake": 0.0, "profit": 0.0, "roi": None, "win_rate": None}
 
-    stake = float(bets["stake"].sum())
-    profit = float(bets["profit"].sum())
+    stake = float(pd.to_numeric(bets["stake"], errors="coerce").fillna(0.0).sum())
+    profit = float(pd.to_numeric(bets["profit"], errors="coerce").fillna(0.0).sum())
     roi = profit / stake if stake > 0 else None
-    win_rate = float((bets["result"] == "win").mean())
+    win_rate = float((bets["result"].astype(str).str.lower() == "win").mean())
 
     return {
         "bets": int(len(bets)),
@@ -90,7 +92,7 @@ def _assign_buckets_by_quantiles(bets: pd.DataFrame, score_col: str) -> pd.Serie
     B = next 30%
     C = remaining 50%
     """
-    s = bets[score_col].astype(float)
+    s = pd.to_numeric(bets[score_col], errors="coerce").astype(float)
     q80 = s.quantile(0.80)
     q50 = s.quantile(0.50)
 
@@ -119,6 +121,12 @@ def _kelly_fraction(p: float, b: float) -> float:
     q = 1.0 - p
     f = (b * p - q) / b
     return max(0.0, f)
+
+
+def _write_json(path: str, obj: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
 
 
 # ---------- main ----------
@@ -177,10 +185,12 @@ def main() -> None:
 
     args = ap.parse_args()
 
+    os.makedirs(args.out_dir, exist_ok=True)
+    bets_path = os.path.join(args.out_dir, "totals_roi_bets.csv")
+    metrics_path = os.path.join(args.out_dir, "totals_roi_metrics.json")
+
     max_stake_rate = args.max_stake_rate if args.max_stake_rate is not None else args.max_bet_rate
-    bucket_stakes = _parse_bucket_stakes(args.bucket_stakes)
-    if not bucket_stakes:
-        bucket_stakes = {"A": 1.0, "B": 0.6, "C": 0.3}
+    bucket_stakes = _parse_bucket_stakes(args.bucket_stakes) or {"A": 1.0, "B": 0.6, "C": 0.3}
 
     print(f"[totals] version={TOTALS_ROI_VERSION}")
     print(f"[totals] per_game={args.per_game}")
@@ -193,21 +203,59 @@ def main() -> None:
     print(f"[totals] max_stake_rate={max_stake_rate}")
     print(f"[totals] disable_bet_cap={bool(args.disable_bet_cap)}")
 
+    # -------- initialize metrics shell (so we ALWAYS write) --------
+    metrics: Dict[str, Any] = {
+        "version": TOTALS_ROI_VERSION,
+        "pricing": {"assumed": "-110", "ppu": PPU_TOTAL_MINUS_110},
+        "eval_window": {"start": str(args.eval_start), "end": str(args.eval_end)},
+        "params": {
+            "base_ev": args.ev,
+            "min_abs_residual": args.min_abs_residual,
+            "max_dispersion": args.max_dispersion,
+            "require_dispersion": bool(args.require_dispersion),
+            "max_bet_rate": args.max_bet_rate,
+            "disable_bet_cap": bool(args.disable_bet_cap),
+            "stake_mode": args.stake_mode,
+            "flat_stake": args.flat_stake,
+            "bucket_stakes": bucket_stakes,
+            "kelly": {
+                "fraction": args.kelly_fraction,
+                "max_unit": args.kelly_max_unit,
+                "min_unit": args.kelly_min_unit,
+            },
+            "max_stake_rate": max_stake_rate,
+            "max_profit_abs": args.max_profit_abs,
+            "side_policy": args.side,
+        },
+        "counts": {},
+        "overall": {"bets": 0, "stake": 0.0, "profit": 0.0, "roi": None, "win_rate": None},
+        "over_only": {"bets": 0, "stake": 0.0, "profit": 0.0, "roi": None, "win_rate": None},
+        "under_only": {"bets": 0, "stake": 0.0, "profit": 0.0, "roi": None, "win_rate": None},
+        "buckets": {"A": {"bets": 0, "stake": 0.0, "profit": 0.0, "roi": None, "win_rate": None},
+                    "B": {"bets": 0, "stake": 0.0, "profit": 0.0, "roi": None, "win_rate": None},
+                    "C": {"bets": 0, "stake": 0.0, "profit": 0.0, "roi": None, "win_rate": None}},
+        "diagnostics": {},
+    }
+
     # ---------- load ----------
     df = pd.read_csv(args.per_game)
     if df.empty:
         raise RuntimeError("[totals] per_game is empty")
+    metrics["counts"]["rows_loaded"] = int(len(df))
 
     date_col = _get_date_col(df)
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
 
     # Hardening tweak #1: drop NaT dates
     df = df.dropna(subset=[date_col]).copy()
+    metrics["counts"]["rows_with_valid_date"] = int(len(df))
 
-    es = pd.to_datetime(args.eval_start)
-    ee = pd.to_datetime(args.eval_end)
-
+    es = pd.to_datetime(args.eval_start, errors="coerce")
+    ee = pd.to_datetime(args.eval_end, errors="coerce")
+    if pd.isna(es) or pd.isna(ee):
+        raise RuntimeError("[totals] invalid eval-start/eval-end date(s)")
     df = df[(df[date_col] >= es) & (df[date_col] <= ee)].copy()
+    metrics["counts"]["rows_in_eval_window"] = int(len(df))
     print(f"[totals] eval_window: {es.date()}..{ee.date()} rows={len(df)}")
 
     if df.empty:
@@ -218,12 +266,21 @@ def main() -> None:
         if c not in df.columns:
             raise RuntimeError(f"[totals] missing column: {c}")
 
-    # Hardening tweak #2: coerce numerics + drop invalid
+    # Hardening tweak #2: coerce numerics + drop invalid totals cols
     df["fair_total_model"] = pd.to_numeric(df["fair_total_model"], errors="coerce")
     df["total_consensus"] = pd.to_numeric(df["total_consensus"], errors="coerce")
-    df = df.dropna(subset=["fair_total_model", "total_consensus"]).copy()
+
+    # Hardening tweak #6: coerce scores + drop invalid score rows
+    df["home_score"] = pd.to_numeric(df["home_score"], errors="coerce")
+    df["away_score"] = pd.to_numeric(df["away_score"], errors="coerce")
+
+    before_drop = len(df)
+    df = df.dropna(subset=["fair_total_model", "total_consensus", "home_score", "away_score"]).copy()
+    metrics["counts"]["rows_after_numeric_coercion"] = int(len(df))
+    metrics["diagnostics"]["rows_dropped_numeric"] = int(before_drop - len(df))
+
     if df.empty:
-        raise RuntimeError("[totals] No valid rows after numeric coercion for totals columns")
+        raise RuntimeError("[totals] No valid rows after numeric coercion")
 
     # ---------- core math ----------
     df["actual_total"] = df["home_score"] + df["away_score"]
@@ -234,15 +291,20 @@ def main() -> None:
     eligible = df["abs_residual"] >= args.min_abs_residual
 
     # dispersion gate (optional)
+    dispersion_used = False
     if "total_dispersion" in df.columns:
+        dispersion_used = True
         df["total_dispersion"] = pd.to_numeric(df["total_dispersion"], errors="coerce")
         disp_ok = df["total_dispersion"] <= args.max_dispersion
         if args.require_dispersion:
             eligible = eligible & disp_ok
+        df["gate_dispersion_ok"] = disp_ok
     elif args.require_dispersion:
         raise RuntimeError("[totals] require-dispersion=True but total_dispersion missing")
 
     df["eligible"] = eligible
+    metrics["counts"]["eligible_games"] = int(df["eligible"].sum())
+    metrics["diagnostics"]["dispersion_used"] = dispersion_used
 
     # ---------- calibrator ----------
     cal = joblib.load(args.calibrator)
@@ -255,10 +317,9 @@ def main() -> None:
 
     # Hardening tweak #3: clip to sane probability bounds
     df["p_over"] = pd.to_numeric(df["p_over"], errors="coerce").clip(1e-6, 1.0 - 1e-6)
-
     df["p_under"] = 1.0 - df["p_over"]
 
-    # EV at -110
+    # EV at -110 (fixed pricing)
     df["over_ev"] = df["p_over"].apply(expected_value_total)
     df["under_ev"] = df["p_under"].apply(expected_value_total)
 
@@ -290,34 +351,46 @@ def main() -> None:
     df["ev_used"] = chosen[2]
 
     bets = df[df["bet"]].copy()
+    metrics["counts"]["bets_pre_side_policy"] = int(len(bets))
 
     # side policy
     if args.side != "both":
-        bets = bets[bets["bet_side"] == args.side]
+        bets = bets[bets["bet_side"] == args.side].copy()
+    metrics["counts"]["bets_post_side_policy"] = int(len(bets))
 
-    total_games = int(df["merge_key"].nunique()) if "merge_key" in df.columns else len(df)
+    total_games = int(df["merge_key"].nunique()) if "merge_key" in df.columns else int(len(df))
+    metrics["counts"]["total_games"] = int(total_games)
 
     # ---------- Packet 4A: bet-rate cap via trimming by EV ----------
-    if not args.disable_bet_cap:
-        max_bets = max(1, int(math.floor(args.max_bet_rate * total_games)))
+    cap_applied = False
+    cap_max_bets = None
+    bets_pre_cap = int(len(bets))
+    if not args.disable_bet_cap and not bets.empty:
+        cap_applied = True
+        cap_max_bets = max(1, int(math.floor(args.max_bet_rate * total_games)))
         bets = bets.sort_values("ev_used", ascending=False)
-        if len(bets) > max_bets:
-            print(
-                f"[totals] Bet-rate capped: trimming {len(bets)} → {max_bets} "
-                f"(cap={args.max_bet_rate:.2f})"
-            )
-            bets = bets.head(max_bets)
+        if len(bets) > cap_max_bets:
+            print(f"[totals] Bet-rate capped: trimming {len(bets)} → {cap_max_bets} (cap={args.max_bet_rate:.2f})")
+            bets = bets.head(cap_max_bets)
 
+    metrics["diagnostics"]["bet_cap_applied"] = bool(cap_applied)
+    metrics["diagnostics"]["cap_max_bets"] = int(cap_max_bets) if cap_max_bets is not None else None
+    metrics["counts"]["bets_pre_cap"] = int(bets_pre_cap)
+    metrics["counts"]["bets_post_cap"] = int(len(bets))
+
+    # ---------- If no bets: still write outputs ----------
     if bets.empty:
         print("[totals] No bets selected")
+        # write empty bets + metrics
+        pd.DataFrame().to_csv(bets_path, index=False)
+        _write_json(metrics_path, metrics)
+        print(f"[totals] wrote {metrics_path}")
+        print(f"[totals] wrote {bets_path}")
         return
 
     # ---------- Packet 4B: confidence score + buckets ----------
-    # Confidence score (monotone): EV strength × residual magnitude (soft)
-    # This does NOT change which bets are included; it only ranks them.
     scale = (bets["abs_residual"] / max(args.min_abs_residual, 1e-9)).clip(lower=1.0, upper=2.0)
-    bets["confidence_score"] = bets["ev_used"].astype(float) * scale.astype(float)
-
+    bets["confidence_score"] = pd.to_numeric(bets["ev_used"], errors="coerce").astype(float) * scale.astype(float)
     bets["bucket"] = _assign_buckets_by_quantiles(bets, "confidence_score")
 
     # ---------- Packet 4B: stake sizing ----------
@@ -330,10 +403,9 @@ def main() -> None:
             return float(bucket_stakes.get(b, 1.0))
 
         # kelly_lite
-        side = r["bet_side"]
+        side = str(r["bet_side"]).lower()
         p = float(r["p_over"]) if side == "over" else float(r["p_under"])
-        f = _kelly_fraction(p, PPU_TOTAL_MINUS_110)  # fraction of bankroll
-        # fractional Kelly + caps, expressed in "units"
+        f = _kelly_fraction(p, PPU_TOTAL_MINUS_110)
         u = args.kelly_fraction * f
         u = max(float(args.kelly_min_unit), min(float(args.kelly_max_unit), float(u)))
         return float(u)
@@ -341,97 +413,74 @@ def main() -> None:
     bets["stake"] = bets.apply(stake_for_row, axis=1)
 
     # exposure guard: cap SUM(stake) / total_games
-    max_total_stake = max_stake_rate * max(total_games, 1)
-    if bets["stake"].sum() > max_total_stake:
-        # trim by confidence_score so we keep the “best” exposure
+    max_total_stake = float(max_stake_rate) * max(total_games, 1)
+    if float(bets["stake"].sum()) > max_total_stake:
         bets = bets.sort_values("confidence_score", ascending=False)
         running = bets["stake"].cumsum()
         keep = running <= max_total_stake
-        # ensure at least 1 bet survives if any exist
         if keep.sum() == 0 and len(bets) > 0:
             keep.iloc[0] = True
         trimmed = int((~keep).sum())
         if trimmed > 0:
-            print(
-                f"[totals] Stake-rate capped: trimming {len(bets)} → {int(keep.sum())} "
-                f"(cap={max_stake_rate:.2f})"
-            )
+            print(f"[totals] Stake-rate capped: trimming {len(bets)} → {int(keep.sum())} (cap={max_stake_rate:.2f})")
         bets = bets.loc[keep].copy()
 
-    bet_rate = len(bets) / max(total_games, 1)
-    stake_rate = float(bets["stake"].sum()) / max(total_games, 1)
+    bet_rate = float(len(bets)) / max(total_games, 1)
+    stake_rate = float(pd.to_numeric(bets["stake"], errors="coerce").fillna(0.0).sum()) / max(total_games, 1)
 
     # ---------- settlement ----------
     def result(r):
-        if r["actual_total"] == r["total_consensus"]:
+        if float(r["actual_total"]) == float(r["total_consensus"]):
             return "push"
-        if r["bet_side"] == "over":
-            return "win" if r["actual_total"] > r["total_consensus"] else "loss"
-        return "win" if r["actual_total"] < r["total_consensus"] else "loss"
+        if str(r["bet_side"]).lower() == "over":
+            return "win" if float(r["actual_total"]) > float(r["total_consensus"]) else "loss"
+        return "win" if float(r["actual_total"]) < float(r["total_consensus"]) else "loss"
 
     bets["result"] = bets.apply(result, axis=1)
 
-    # profit scales with stake
     def profit(r):
-        if r["result"] == "push":
+        stake = float(r["stake"])
+        if str(r["result"]).lower() == "push":
             return 0.0
-        if r["result"] == "win":
-            return float(r["stake"]) * PPU_TOTAL_MINUS_110
-        return -float(r["stake"])
+        if str(r["result"]).lower() == "win":
+            return stake * PPU_TOTAL_MINUS_110
+        return -stake
 
     bets["profit"] = bets.apply(profit, axis=1)
 
-    if bets["profit"].abs().max() > args.max_profit_abs:
-        raise RuntimeError("[totals] Profit sanity failure")
+    max_abs_profit = float(pd.to_numeric(bets["profit"], errors="coerce").abs().max())
+    if max_abs_profit > float(args.max_profit_abs):
+        raise RuntimeError(f"[totals] Profit sanity failure: max |profit|={max_abs_profit} > {args.max_profit_abs}")
 
     # ---------- outputs ----------
     overall = summarize(bets)
     over_sum = summarize(bets[bets["bet_side"] == "over"])
     under_sum = summarize(bets[bets["bet_side"] == "under"])
-
     bucket_summaries = {b: summarize(bets[bets["bucket"] == b]) for b in ["A", "B", "C"]}
+
+    # over/under split diagnostics
+    side_counts = bets["bet_side"].value_counts(dropna=False).to_dict()
+    metrics["diagnostics"]["selected_side_counts"] = side_counts
+
+    metrics["overall"] = overall
+    metrics["over_only"] = over_sum
+    metrics["under_only"] = under_sum
+    metrics["buckets"] = bucket_summaries
+    metrics["bet_rate"] = bet_rate
+    metrics["stake_rate"] = stake_rate
 
     print(f"[totals] overall: {overall}")
     print(f"[totals] over_only: {over_sum}")
     print(f"[totals] under_only: {under_sum}")
     print(f"[totals] bet_rate: {bet_rate:.3f}")
     print(f"[totals] stake_rate: {stake_rate:.3f}")
-    print(
-        f"[totals] buckets: A={bucket_summaries['A']} B={bucket_summaries['B']} C={bucket_summaries['C']}"
-    )
+    print(f"[totals] buckets: A={bucket_summaries['A']} B={bucket_summaries['B']} C={bucket_summaries['C']}")
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    bets.to_csv(os.path.join(args.out_dir, "totals_roi_bets.csv"), index=False)
+    bets.to_csv(bets_path, index=False)
+    _write_json(metrics_path, metrics)
 
-    metrics = {
-        "version": TOTALS_ROI_VERSION,
-        "overall": overall,
-        "over_only": over_sum,
-        "under_only": under_sum,
-        "buckets": bucket_summaries,
-        "bet_rate": bet_rate,
-        "stake_rate": stake_rate,
-        "base_ev": args.ev,
-        "min_abs_residual": args.min_abs_residual,
-        "stake_mode": args.stake_mode,
-        "bucket_stakes": bucket_stakes,
-        "kelly": {
-            "fraction": args.kelly_fraction,
-            "max_unit": args.kelly_max_unit,
-            "min_unit": args.kelly_min_unit,
-            "odds_assumed": "-110",
-            "ppu": PPU_TOTAL_MINUS_110,
-        },
-        "eval_window": {"start": str(es.date()), "end": str(ee.date()),},
-        "pricing": {"assumed": "-110", "ppu": PPU_TOTAL_MINUS_110},
-        "disable_bet_cap": bool(args.disable_bet_cap),
-    }
-
-    with open(os.path.join(args.out_dir, "totals_roi_metrics.json"), "w") as f:
-        json.dump(metrics, f, indent=2)
-
-    print("[totals] wrote outputs/totals_roi_metrics.json")
-    print("[totals] wrote outputs/totals_roi_bets.csv")
+    print(f"[totals] wrote {metrics_path}")
+    print(f"[totals] wrote {bets_path}")
 
 
 if __name__ == "__main__":
