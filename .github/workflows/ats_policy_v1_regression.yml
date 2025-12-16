@@ -17,16 +17,24 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies (if requirements.txt exists)
+      - name: Install dependencies
         shell: bash
         run: |
           set -e
           python -m pip install --upgrade pip
+
+          # If you have a pinned requirements file, use it.
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
-          else
-            echo "No requirements.txt found; continuing."
           fi
+
+          # Always ensure CI-critical deps exist (regression gate needs these).
+          pip install --upgrade \
+            pandas \
+            numpy \
+            joblib \
+            scikit-learn \
+            pyyaml
 
       - name: Run ATS Policy v1 regression gate
         shell: bash
