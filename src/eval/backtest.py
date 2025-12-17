@@ -1,516 +1,315 @@
-"""
-Backtesting engine for NBA Pro-Lite / Elite with merge-coverage hardening.
-
-This module evaluates model and market-blended predictions against
-historical results. It loads prediction CSV files (typically
-``predictions_YYYY-MM-DD_market.csv``), merges them with game results on
-canonical keys, computes standard metrics (Brier score, log loss,
-calibration, spread MAE/RMSE) and writes out summary JSON/CSV files.
-
-Key enhancements compared to earlier versions:
-
-* **Merge coverage enforcement** – After merging predictions and results
-  on normalized keys, the engine computes coverage (games with both
-  predictions and results) versus the total number of games in the
-  results for the specified date range. Coverage <80% raises a
-  ``RuntimeError``; coverage between 80% and 95% triggers a warning.
-  This prevents silent evaluation of incomplete data.
-
-* **Coverage reporting** – The summary metrics now include
-  ``n_games_total`` (total games in results), ``n_games_covered`` (games
-  evaluated) and ``coverage`` (fraction). This contextualizes all
-  performance metrics and aids reproducibility.
-
-* **Transparent logging** – Each major step logs progress using the
-  ``[backtest]`` logger prefix.
-
-Commit 2 additions (behavior-preserving):
-* **Join audit JSON** – Writes `outputs/backtest_join_audit.json` with
-  merge coverage and sample missing keys on both sides of the join.
-"""
-
 from __future__ import annotations
 
 import argparse
 import glob
 import json
-import logging
+import math
 import os
-from dataclasses import asdict, dataclass
+import re
+import sys
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import brier_score_loss, log_loss
 
-from src.utils.team_names import normalize_team_name
-
-logger = logging.getLogger("backtest")
-
-
-# ---------------------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------------------
-
-
-@dataclass
-class BacktestConfig:
-    """
-    Configuration for a backtest run.
-    """
-
-    predictions_dir: str = "outputs"
-    predictions_pattern: str = "predictions_*_market.csv"
-
-    # Historical results file with final scores.
-    # Expected columns:
-    #   - game_date (YYYY-MM-DD)
-    #   - home_team
-    #   - away_team
-    #   - home_score
-    #   - away_score
-    results_path: str = "data/history/games_2019_2024.csv"
-
-    # Date range (inclusive). If None, uses all predictions found.
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-
-    # Which probability and spread columns to evaluate
-    prob_col: str = "home_win_prob"        # can switch to "home_win_prob_market"
-    fair_spread_col: str = "fair_spread"   # can switch to "fair_spread_market"
-
-    # Number of bins to use for calibration
-    n_calibration_bins: int = 10
-
-    # Output files
-    metrics_path: str = os.path.join("outputs", "backtest_metrics.json")
-    calibration_path: str = os.path.join("outputs", "backtest_calibration.csv")
-    per_game_path: str = os.path.join("outputs", "backtest_per_game.csv")
+# ---- Team normalizer (critical for merge-key contract) ----
+# Prefer the canonical location used by ingest.
+try:
+    from src.ingest.team_normalizer import normalize_team_name  # type: ignore
+except Exception:  # pragma: no cover
+    # Fallback (keeps script runnable even if paths change again)
+    def normalize_team_name(x: Any) -> str:
+        if x is None or (isinstance(x, float) and math.isnan(x)):
+            return ""
+        s = str(x).strip().lower()
+        s = re.sub(r"\s+", " ", s)
+        return s
 
 
-@dataclass
-class BacktestMetrics:
-    """
-    Summary metrics for the backtest run.
-    """
-
-    brier_score: float
-    log_loss: float
-    mean_pred_prob: float
-    base_rate_home_win: float
-    spread_mae: float
-    spread_rmse: float
-    avg_margin: float
-
-    n_games_total: int
-    n_games_covered: int
-    coverage: float
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_OUT_DIR = REPO_ROOT / "outputs"
 
 
-# ---------------------------------------------------------------------
-# UTIL: deterministic JSON writer
-# ---------------------------------------------------------------------
+def _parse_date(s: str) -> datetime:
+    return datetime.strptime(s, "%Y-%m-%d")
 
 
-def _write_json(path: Path, payload: dict) -> None:
+def _date_str(d: datetime) -> str:
+    return d.strftime("%Y-%m-%d")
+
+
+def _merge_key(home: str, away: str, game_date: str) -> str:
+    return f"{home.lower()}__{away.lower()}__{game_date}"
+
+
+def _warn(msg: str) -> None:
+    print(f"[backtest][WARN] {msg}")
+
+
+def _info(msg: str) -> None:
+    print(f"[backtest] {msg}")
+
+
+def _hard_fail(msg: str) -> None:
+    raise RuntimeError(f"[backtest] {msg}")
+
+
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        v = float(x)
+        if math.isnan(v):
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
         f.write("\n")
 
 
-# ---------------------------------------------------------------------
-# DATA LOADING / KEYING
-# ---------------------------------------------------------------------
-
-
-def _add_normalized_keys(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["home_team_norm"] = df["home_team"].astype(str).map(normalize_team_name)
-    df["away_team_norm"] = df["away_team"].astype(str).map(normalize_team_name)
-    df["game_date_norm"] = df["game_date"].astype(str)
-    df["merge_key_norm"] = (
-        df["home_team_norm"].astype(str)
-        + "__"
-        + df["away_team_norm"].astype(str)
-        + "__"
-        + df["game_date_norm"].astype(str)
-    )
+def _load_results(results_csv: Path) -> pd.DataFrame:
+    df = pd.read_csv(results_csv)
+    if "game_date" not in df.columns:
+        _hard_fail("results file missing required column: game_date")
+    # Normalize columns (some historical files vary)
+    for col in ["home_team", "away_team"]:
+        if col not in df.columns:
+            _hard_fail(f"results file missing required column: {col}")
     return df
 
 
-def load_predictions_history(cfg: BacktestConfig) -> pd.DataFrame:
-    pred_glob = os.path.join(cfg.predictions_dir, cfg.predictions_pattern)
-    files = sorted(glob.glob(pred_glob))
-    if not files:
-        raise FileNotFoundError(f"No prediction files found matching {pred_glob}")
-
-    rows = []
-    for fp in files:
-        df = pd.read_csv(fp)
-        if df.empty:
-            continue
-        rows.append(df)
-
-    if not rows:
-        raise ValueError("All prediction files were empty.")
-    preds = pd.concat(rows, ignore_index=True)
-
-    # Optional date range filter
-    if cfg.start_date:
-        preds = preds[preds["game_date"].astype(str) >= cfg.start_date]
-    if cfg.end_date:
-        preds = preds[preds["game_date"].astype(str) <= cfg.end_date]
-
-    logger.info("[backtest] Loaded predictions: %d rows from %d files.", len(preds), len(files))
-    return preds
-
-
-def load_results(cfg: BacktestConfig) -> pd.DataFrame:
-    results = pd.read_csv(cfg.results_path)
-    if results.empty:
-        raise ValueError(f"Results file is empty: {cfg.results_path}")
-
-    # Optional date range filter
-    if cfg.start_date:
-        results = results[results["game_date"].astype(str) >= cfg.start_date]
-    if cfg.end_date:
-        results = results[results["game_date"].astype(str) <= cfg.end_date]
-
-    logger.info("[backtest] Loaded results: %d rows from %s.", len(results), cfg.results_path)
-    return results
-
-
-def merge_predictions_and_results(preds: pd.DataFrame, results: pd.DataFrame) -> pd.DataFrame:
-    preds_keyed = _add_normalized_keys(preds)
-    results_keyed = _add_normalized_keys(results)
-
-    merged = preds_keyed.merge(
-        results_keyed[
-            [
-                "merge_key_norm",
-                "home_score",
-                "away_score",
-            ]
-        ],
-        on="merge_key_norm",
-        how="inner",
-    )
-    if merged.empty:
-        raise ValueError(
-            "No overlap between predictions and results after merging on normalized keys. "
-            "Check that team naming and dates are consistent."
-        )
-    logger.info(
-        "[backtest] Merged to %d rows (games with both predictions and results).",
-        len(merged),
-    )
-    return merged
-
-
-def compute_merge_coverage(
-    preds: pd.DataFrame, results: pd.DataFrame
-) -> Tuple[int, int, float]:
-    """
-    Compute merge coverage statistics.
-
-    Returns a tuple: (n_games_covered, n_games_total, coverage_ratio)
-    where:
-      - n_games_covered: number of unique merge keys present in both predictions and results
-      - n_games_total:   number of unique merge keys in the results within the date range
-      - coverage_ratio:  n_games_covered / n_games_total
-
-    Team names and game dates are normalized via ``normalize_team_name``.
-    """
-    preds_keyed = _add_normalized_keys(preds)
-    results_keyed = _add_normalized_keys(results)
-    pred_keys = set(preds_keyed["merge_key_norm"].unique())
-    result_keys = set(results_keyed["merge_key_norm"].unique())
-    n_games_total = len(result_keys)
-    n_games_covered = len(pred_keys & result_keys)
-    coverage_ratio = n_games_covered / n_games_total if n_games_total > 0 else 0.0
-    return n_games_covered, n_games_total, coverage_ratio
-
-
-def _join_audit(preds: pd.DataFrame, results: pd.DataFrame, sample_n: int = 10) -> dict:
-    """
-    Behavior-preserving: computes diagnostics only.
-    """
-    preds_keyed = _add_normalized_keys(preds)
-    results_keyed = _add_normalized_keys(results)
-
-    pred_keys = set(preds_keyed["merge_key_norm"].unique())
-    result_keys = set(results_keyed["merge_key_norm"].unique())
-
-    missing_in_preds = sorted(list(result_keys - pred_keys))[:sample_n]
-    missing_in_results = sorted(list(pred_keys - result_keys))[:sample_n]
-
-    n_cov, n_total, cov = compute_merge_coverage(preds, results)
-
-    return {
-        "n_games_total": int(n_total),
-        "n_games_covered": int(n_cov),
-        "coverage": float(cov),
-        "missing_in_predictions_sample": missing_in_preds,
-        "missing_in_results_sample": missing_in_results,
-    }
-
-
-# ---------------------------------------------------------------------
-# METRICS
-# ---------------------------------------------------------------------
-
-
-def _calibration_bins(
-    probs: np.ndarray, y_true: np.ndarray, n_bins: int
-) -> pd.DataFrame:
-    df = pd.DataFrame({"prob": probs, "y": y_true})
-    df["bin"] = pd.qcut(df["prob"], q=n_bins, duplicates="drop")
-    out = (
-        df.groupby("bin", observed=True)
-        .agg(n=("y", "count"), mean_prob=("prob", "mean"), emp_rate=("y", "mean"))
-        .reset_index(drop=True)
-    )
+def _load_predictions(pred_files: List[Path]) -> pd.DataFrame:
+    parts = []
+    for p in pred_files:
+        df = pd.read_csv(p)
+        if "game_date" not in df.columns:
+            # derive from filename if possible
+            m = re.search(r"(\d{4}-\d{2}-\d{2})", p.name)
+            if m:
+                df["game_date"] = m.group(1)
+            else:
+                _hard_fail(f"prediction file missing game_date and cannot infer date: {p}")
+        parts.append(df)
+    if not parts:
+        return pd.DataFrame()
+    out = pd.concat(parts, ignore_index=True)
     return out
 
 
-def compute_metrics(
-    df: pd.DataFrame,
-    cfg: BacktestConfig,
-) -> Tuple[float, float, float, float, float, float, float, pd.DataFrame, pd.DataFrame]:
-    df = df.copy()
-
-    # Actual home win indicator
-    df["home_win_actual"] = (df["home_score"] > df["away_score"]).astype(int)
-
-    # Predicted probability (clipped for log-loss stability)
-    prob = df[cfg.prob_col].astype(float).clip(1e-6, 1 - 1e-6).to_numpy()
-    y = df["home_win_actual"].to_numpy()
-
-    brier = float(brier_score_loss(y, prob))
-    ll = float(log_loss(y, prob))
-    mean_prob = float(prob.mean())
-    base_rate = float(y.mean())
-
-    # Spread error if columns exist
-    if cfg.fair_spread_col in df.columns:
-        fair_spread = df[cfg.fair_spread_col].astype(float).to_numpy()
-        actual_margin = (df["home_score"] - df["away_score"]).astype(float).to_numpy()
-        spread_err = fair_spread - actual_margin
-        spread_mae = float(np.mean(np.abs(spread_err)))
-        spread_rmse = float(np.sqrt(np.mean(spread_err**2)))
-        avg_margin = float(np.mean(actual_margin))
-    else:
-        spread_mae = float("nan")
-        spread_rmse = float("nan")
-        avg_margin = float("nan")
-
-    calib_df = _calibration_bins(prob, y, cfg.n_calibration_bins)
-
-    # Per-game table for downstream QA and modeling
-    per_game_df = df[
-        [
-            "game_date_norm",
-            "home_team_norm",
-            "away_team_norm",
-            "merge_key_norm",
-            cfg.prob_col,
-            "home_score",
-            "away_score",
-            "home_win_actual",
-        ]
-    ].copy()
-    per_game_df["actual_margin"] = (df["home_score"] - df["away_score"]).astype(float)
-
-    if cfg.fair_spread_col in df.columns:
-        per_game_df[cfg.fair_spread_col] = df[cfg.fair_spread_col].astype(float)
-        per_game_df["spread_error"] = (
-            per_game_df[cfg.fair_spread_col] - per_game_df["actual_margin"]
-        )
-
-    return (
-        brier,
-        ll,
-        mean_prob,
-        base_rate,
-        spread_mae,
-        spread_rmse,
-        avg_margin,
-        calib_df,
-        per_game_df,
-    )
+def _select_pred_files(pred_dir: Path, pattern: str, start: str, end: str) -> List[Path]:
+    files = [Path(x) for x in glob.glob(str(pred_dir / pattern))]
+    if not files:
+        return []
+    s0, s1 = _parse_date(start), _parse_date(end)
+    keep = []
+    for p in files:
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", p.name)
+        if not m:
+            continue
+        d = _parse_date(m.group(1))
+        if s0 <= d <= s1:
+            keep.append(p)
+    keep.sort()
+    return keep
 
 
-# ---------------------------------------------------------------------
-# RUNNER
-# ---------------------------------------------------------------------
+def _add_norm_keys(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["home_team_norm"] = out["home_team"].apply(normalize_team_name)
+    out["away_team_norm"] = out["away_team"].apply(normalize_team_name)
+    out["merge_key"] = out.apply(lambda r: _merge_key(r["home_team_norm"], r["away_team_norm"], str(r["game_date"])), axis=1)
+    return out
 
 
-def run_backtest(cfg: BacktestConfig) -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] [backtest] %(message)s",
-    )
-    logger.info("Starting backtest with config: %s", cfg)
-
-    preds = load_predictions_history(cfg)
-    results = load_results(cfg)
-
-    # Join audit (behavior-preserving): write before enforcing thresholds
-    audit = _join_audit(preds, results, sample_n=10)
-    out_dir = Path(cfg.metrics_path).resolve().parent
-    audit_path = out_dir / "backtest_join_audit.json"
-    audit_payload = {
-        "kind": "backtest_join_audit",
-        "predictions_dir": cfg.predictions_dir,
-        "predictions_pattern": cfg.predictions_pattern,
-        "results_path": cfg.results_path,
-        "start_date": cfg.start_date,
-        "end_date": cfg.end_date,
-        **audit,
-    }
-    _write_json(audit_path, audit_payload)
-    logger.info("Wrote join audit to %s", audit_path)
-
-    merged = merge_predictions_and_results(preds, results)
-
-    # Compute merge coverage and enforce thresholds
-    n_cov, n_total, coverage_ratio = (
-        audit["n_games_covered"],
-        audit["n_games_total"],
-        audit["coverage"],
-    )
-
-    logger.info(
-        "[backtest] Coverage: %d/%d games (%.1f%%).",
-        n_cov,
-        n_total,
-        coverage_ratio * 100.0,
-    )
-
-    if coverage_ratio < 0.80:
-        raise RuntimeError(
-            f"Merge coverage too low: {coverage_ratio:.3f} ({n_cov}/{n_total}). "
-            "Check merge key contract, team normalization, and prediction file completeness. "
-            f"See {audit_path} for missing key samples."
-        )
-    elif coverage_ratio < 0.95:
-        logger.warning(
-            "[backtest] Merge coverage %.1f%% below warning threshold (95%%). "
-            "Proceeding, but metrics may reflect incomplete coverage. "
-            "See join audit JSON for missing key samples.",
-            coverage_ratio * 100.0,
-        )
-
-    (
-        brier,
-        ll,
-        mean_prob,
-        base_rate,
-        spread_mae,
-        spread_rmse,
-        avg_margin,
-        calib_df,
-        per_game_df,
-    ) = compute_metrics(merged, cfg)
-
-    metrics = BacktestMetrics(
-        brier_score=brier,
-        log_loss=ll,
-        mean_pred_prob=mean_prob,
-        base_rate_home_win=base_rate,
-        spread_mae=spread_mae,
-        spread_rmse=spread_rmse,
-        avg_margin=avg_margin,
-        n_games_total=int(n_total),
-        n_games_covered=int(n_cov),
-        coverage=float(coverage_ratio),
-    )
-
-    # Write summary metrics JSON
-    Path(cfg.metrics_path).parent and Path(cfg.metrics_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(cfg.metrics_path, "w", encoding="utf-8") as f:
-        json.dump(asdict(metrics), f, indent=2)
-    logger.info("Wrote backtest metrics to %s", cfg.metrics_path)
-
-    # Write calibration CSV
-    calib_df.to_csv(cfg.calibration_path, index=False)
-    logger.info("Wrote calibration bins to %s", cfg.calibration_path)
-
-    # Write per-game CSV
-    per_game_df.to_csv(cfg.per_game_path, index=False)
-    logger.info("Wrote per-game backtest data to %s", cfg.per_game_path)
-
-    logger.info(
-        "Backtest complete: brier=%.4f logloss=%.4f spread_mae=%.3f coverage=%.1f%%",
-        brier,
-        ll,
-        spread_mae,
-        coverage_ratio * 100.0,
-    )
+def _brier(y: np.ndarray, p: np.ndarray) -> float:
+    return float(np.mean((p - y) ** 2))
 
 
-# ---------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------
+def _logloss(y: np.ndarray, p: np.ndarray) -> float:
+    eps = 1e-12
+    p = np.clip(p, eps, 1 - eps)
+    return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
 
 
-def _parse_args() -> BacktestConfig:
-    ap = argparse.ArgumentParser(description="Run a backtest over historical predictions.")
-    ap.add_argument("--pred-dir", default="outputs", help="Directory with prediction CSVs.")
-    ap.add_argument(
-        "--pattern",
-        default="predictions_*_market.csv",
-        help="Glob pattern for prediction files (inside --pred-dir).",
-    )
-    ap.add_argument(
-        "--results",
-        default="data/history/games_2019_2024.csv",
-        help="Historical results CSV with scores.",
-    )
-    ap.add_argument("--start", default=None, help="Start date (YYYY-MM-DD).")
-    ap.add_argument("--end", default=None, help="End date (YYYY-MM-DD).")
-    ap.add_argument("--prob-col", default="home_win_prob", help="Probability column to score.")
-    ap.add_argument("--spread-col", default="fair_spread", help="Spread column to score.")
-    ap.add_argument("--bins", type=int, default=10, help="Number of calibration bins.")
-    ap.add_argument(
-        "--metrics-path",
-        default=os.path.join("outputs", "backtest_metrics.json"),
-        help="Where to write summary metrics JSON.",
-    )
-    ap.add_argument(
-        "--calib-path",
-        default=os.path.join("outputs", "backtest_calibration.csv"),
-        help="Where to write calibration bins CSV.",
-    )
-    ap.add_argument(
-        "--per-game-path",
-        default=os.path.join("outputs", "backtest_per_game.csv"),
-        help="Where to write per-game CSV.",
-    )
+def _spread_errors(df: pd.DataFrame, spread_col: str) -> Dict[str, Any]:
+    if spread_col not in df.columns:
+        return {}
+    if "home_score" not in df.columns or "away_score" not in df.columns:
+        return {}
+    # actual margin = home - away
+    actual = (df["home_score"].astype(float) - df["away_score"].astype(float)).to_numpy()
+    pred = df[spread_col].astype(float).to_numpy()
+    err = pred - actual
+    mae = float(np.mean(np.abs(err)))
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+    return {"mae": mae, "rmse": rmse}
 
-    args = ap.parse_args()
 
-    cfg = BacktestConfig(
-        predictions_dir=args.pred_dir,
-        predictions_pattern=args.pattern,
-        results_path=args.results,
-        start_date=args.start,
-        end_date=args.end,
-        prob_col=args.prob_col,
-        fair_spread_col=args.spread_col,
-        n_calibration_bins=args.bins,
-        metrics_path=args.metrics_path,
-        calibration_path=args.calib_path,
-        per_game_path=args.per_game_path,
-    )
-    return cfg
+def _write_audit(
+    out_dir: Path,
+    audit: Dict[str, Any],
+) -> None:
+    _write_json(out_dir / "backtest_join_audit.json", audit)
+    _info("wrote outputs/backtest_join_audit.json")
 
 
 def main() -> None:
-    cfg = _parse_args()
-    run_backtest(cfg)
+    ap = argparse.ArgumentParser(description="Backtesting engine with merge-coverage enforcement + join audit.")
+    ap.add_argument("--pred-dir", required=True, help="Directory containing predictions_*.csv files.")
+    ap.add_argument("--pattern", default="predictions_*_market.csv", help="Glob pattern for prediction files.")
+    ap.add_argument("--results", required=True, help="Results CSV path (historical games).")
+    ap.add_argument("--start", required=True, help="Start date YYYY-MM-DD (inclusive).")
+    ap.add_argument("--end", required=True, help="End date YYYY-MM-DD (inclusive).")
+    ap.add_argument("--prob-col", default="home_win_prob", help="Probability column for win-prob metrics.")
+    ap.add_argument("--spread-col", default="fair_spread", help="Spread column for error metrics.")
+    ap.add_argument("--metrics-path", default=str(DEFAULT_OUT_DIR / "backtest_metrics.json"))
+    ap.add_argument("--calib-path", default=str(DEFAULT_OUT_DIR / "backtest_calibration.csv"))
+    ap.add_argument("--per-game-path", default=str(DEFAULT_OUT_DIR / "backtest_per_game.csv"))
+    args = ap.parse_args()
+
+    pred_dir = Path(args.pred_dir)
+    results_csv = Path(args.results)
+    out_dir = Path(args.metrics_path).resolve().parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- load ----
+    pred_files = _select_pred_files(pred_dir, args.pattern, args.start, args.end)
+    if not pred_files:
+        audit = {
+            "status": "fail",
+            "reason": "no_prediction_files",
+            "pred_dir": str(pred_dir),
+            "pattern": args.pattern,
+            "start": args.start,
+            "end": args.end,
+        }
+        _write_audit(out_dir, audit)
+        _hard_fail("No prediction files matched pattern/date window.")
+
+    preds = _load_predictions(pred_files)
+    results = _load_results(results_csv)
+
+    # filter results to window
+    s0, s1 = _parse_date(args.start), _parse_date(args.end)
+    results = results.copy()
+    results["game_date"] = results["game_date"].astype(str)
+    results["_dt"] = results["game_date"].apply(_parse_date)
+    results = results[(results["_dt"] >= s0) & (results["_dt"] <= s1)].drop(columns=["_dt"])
+
+    preds = _add_norm_keys(preds)
+    results = _add_norm_keys(results)
+
+    # ---- merge + coverage ----
+    merged = preds.merge(
+        results,
+        on="merge_key",
+        how="inner",
+        suffixes=("_pred", "_res"),
+    )
+
+    total_results_games = int(len(results))
+    matched_games = int(len(merged))
+    coverage = (matched_games / total_results_games) if total_results_games else 0.0
+
+    # Coverage diagnostics
+    results_keys = set(results["merge_key"].tolist())
+    pred_keys = set(preds["merge_key"].tolist())
+    missing_pred = sorted(list(results_keys - pred_keys))[:50]  # cap
+    missing_res = sorted(list(pred_keys - results_keys))[:50]   # cap
+
+    audit: Dict[str, Any] = {
+        "status": "ok",
+        "window": {"start": args.start, "end": args.end},
+        "inputs": {
+            "pred_dir": str(pred_dir),
+            "pattern": args.pattern,
+            "results_csv": str(results_csv),
+            "pred_files": [str(p) for p in pred_files],
+        },
+        "counts": {
+            "results_games": total_results_games,
+            "pred_rows": int(len(preds)),
+            "matched_games": matched_games,
+        },
+        "coverage": {
+            "rate": float(round(coverage, 6)),
+            "warn_lt": 0.95,
+            "fail_lt": 0.80,
+        },
+        "missing_examples": {
+            "missing_pred_keys_sample": missing_pred,
+            "missing_result_keys_sample": missing_res,
+        },
+        "columns": {
+            "prob_col": args.prob_col,
+            "spread_col": args.spread_col,
+        },
+    }
+
+    # Write audit BEFORE any gates (so failures still produce the audit file)
+    _write_audit(out_dir, audit)
+
+    if coverage < 0.80:
+        _hard_fail(f"Merge coverage too low: {coverage:.3f} (<0.80 hard fail). See outputs/backtest_join_audit.json")
+    if coverage < 0.95:
+        _warn(f"Merge coverage low: {coverage:.3f} (<0.95 warn). See outputs/backtest_join_audit.json")
+
+    # ---- metrics ----
+    metrics: Dict[str, Any] = {
+        "window": {"start": args.start, "end": args.end},
+        "coverage": float(round(coverage, 6)),
+        "matched_games": matched_games,
+        "results_games": total_results_games,
+    }
+
+    # win-prob metrics
+    if args.prob_col in merged.columns:
+        # determine outcome from scores when present
+        if "home_score" in merged.columns and "away_score" in merged.columns:
+            y = (merged["home_score"].astype(float) > merged["away_score"].astype(float)).astype(int).to_numpy()
+            p = merged[args.prob_col].astype(float).to_numpy()
+            metrics["brier"] = _brier(y, p)
+            metrics["log_loss"] = _logloss(y, p)
+        else:
+            _warn("home_score/away_score not present in merged frame; skipping brier/logloss.")
+    else:
+        _warn(f"prob-col '{args.prob_col}' not found; skipping brier/logloss.")
+
+    # spread metrics
+    se = _spread_errors(merged, args.spread_col)
+    if se:
+        metrics["spread_error"] = se
+
+    # ---- write outputs ----
+    metrics_path = Path(args.metrics_path)
+    _write_json(metrics_path, metrics)
+    _info(f"wrote: {metrics_path}")
+
+    # per-game
+    per_game_path = Path(args.per_game_path)
+    merged.to_csv(per_game_path, index=False)
+    _info(f"wrote: {per_game_path}")
+
+    # calibration csv (lightweight)
+    calib_path = Path(args.calib_path)
+    if args.prob_col in merged.columns and "home_score" in merged.columns and "away_score" in merged.columns:
+        tmp = merged[[args.prob_col, "home_score", "away_score"]].copy()
+        tmp["y"] = (tmp["home_score"].astype(float) > tmp["away_score"].astype(float)).astype(int)
+        tmp.to_csv(calib_path, index=False)
+        _info(f"wrote: {calib_path}")
+    else:
+        _warn("Skipping calibration csv (missing prob-col or scores).")
+
+    _info("DONE")
 
 
 if __name__ == "__main__":
