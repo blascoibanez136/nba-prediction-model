@@ -4,23 +4,18 @@ import argparse
 import glob
 import json
 import math
-import os
 import re
-import sys
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
 # ---- Team normalizer (critical for merge-key contract) ----
-# Prefer the canonical location used by ingest.
 try:
     from src.ingest.team_normalizer import normalize_team_name  # type: ignore
 except Exception:  # pragma: no cover
-    # Fallback (keeps script runnable even if paths change again)
     def normalize_team_name(x: Any) -> str:
         if x is None or (isinstance(x, float) and math.isnan(x)):
             return ""
@@ -35,10 +30,6 @@ DEFAULT_OUT_DIR = REPO_ROOT / "outputs"
 
 def _parse_date(s: str) -> datetime:
     return datetime.strptime(s, "%Y-%m-%d")
-
-
-def _date_str(d: datetime) -> str:
-    return d.strftime("%Y-%m-%d")
 
 
 def _merge_key(home: str, away: str, game_date: str) -> str:
@@ -57,18 +48,6 @@ def _hard_fail(msg: str) -> None:
     raise RuntimeError(f"[backtest] {msg}")
 
 
-def _safe_float(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        v = float(x)
-        if math.isnan(v):
-            return None
-        return v
-    except Exception:
-        return None
-
-
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -80,7 +59,6 @@ def _load_results(results_csv: Path) -> pd.DataFrame:
     df = pd.read_csv(results_csv)
     if "game_date" not in df.columns:
         _hard_fail("results file missing required column: game_date")
-    # Normalize columns (some historical files vary)
     for col in ["home_team", "away_team"]:
         if col not in df.columns:
             _hard_fail(f"results file missing required column: {col}")
@@ -92,7 +70,6 @@ def _load_predictions(pred_files: List[Path]) -> pd.DataFrame:
     for p in pred_files:
         df = pd.read_csv(p)
         if "game_date" not in df.columns:
-            # derive from filename if possible
             m = re.search(r"(\d{4}-\d{2}-\d{2})", p.name)
             if m:
                 df["game_date"] = m.group(1)
@@ -101,8 +78,7 @@ def _load_predictions(pred_files: List[Path]) -> pd.DataFrame:
         parts.append(df)
     if not parts:
         return pd.DataFrame()
-    out = pd.concat(parts, ignore_index=True)
-    return out
+    return pd.concat(parts, ignore_index=True)
 
 
 def _select_pred_files(pred_dir: Path, pattern: str, start: str, end: str) -> List[Path]:
@@ -110,7 +86,7 @@ def _select_pred_files(pred_dir: Path, pattern: str, start: str, end: str) -> Li
     if not files:
         return []
     s0, s1 = _parse_date(start), _parse_date(end)
-    keep = []
+    keep: List[Path] = []
     for p in files:
         m = re.search(r"(\d{4}-\d{2}-\d{2})", p.name)
         if not m:
@@ -126,7 +102,10 @@ def _add_norm_keys(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["home_team_norm"] = out["home_team"].apply(normalize_team_name)
     out["away_team_norm"] = out["away_team"].apply(normalize_team_name)
-    out["merge_key"] = out.apply(lambda r: _merge_key(r["home_team_norm"], r["away_team_norm"], str(r["game_date"])), axis=1)
+    out["merge_key"] = out.apply(
+        lambda r: _merge_key(r["home_team_norm"], r["away_team_norm"], str(r["game_date"])),
+        axis=1,
+    )
     return out
 
 
@@ -145,7 +124,6 @@ def _spread_errors(df: pd.DataFrame, spread_col: str) -> Dict[str, Any]:
         return {}
     if "home_score" not in df.columns or "away_score" not in df.columns:
         return {}
-    # actual margin = home - away
     actual = (df["home_score"].astype(float) - df["away_score"].astype(float)).to_numpy()
     pred = df[spread_col].astype(float).to_numpy()
     err = pred - actual
@@ -154,10 +132,7 @@ def _spread_errors(df: pd.DataFrame, spread_col: str) -> Dict[str, Any]:
     return {"mae": mae, "rmse": rmse}
 
 
-def _write_audit(
-    out_dir: Path,
-    audit: Dict[str, Any],
-) -> None:
+def _write_audit(out_dir: Path, audit: Dict[str, Any]) -> None:
     _write_json(out_dir / "backtest_join_audit.json", audit)
     _info("wrote outputs/backtest_join_audit.json")
 
@@ -181,135 +156,135 @@ def main() -> None:
     out_dir = Path(args.metrics_path).resolve().parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- load ----
-    pred_files = _select_pred_files(pred_dir, args.pattern, args.start, args.end)
-    if not pred_files:
-        audit = {
-            "status": "fail",
-            "reason": "no_prediction_files",
-            "pred_dir": str(pred_dir),
-            "pattern": args.pattern,
-            "start": args.start,
-            "end": args.end,
-        }
-        _write_audit(out_dir, audit)
-        _hard_fail("No prediction files matched pattern/date window.")
-
-    preds = _load_predictions(pred_files)
-    results = _load_results(results_csv)
-
-    # filter results to window
-    s0, s1 = _parse_date(args.start), _parse_date(args.end)
-    results = results.copy()
-    results["game_date"] = results["game_date"].astype(str)
-    results["_dt"] = results["game_date"].apply(_parse_date)
-    results = results[(results["_dt"] >= s0) & (results["_dt"] <= s1)].drop(columns=["_dt"])
-
-    preds = _add_norm_keys(preds)
-    results = _add_norm_keys(results)
-
-    # ---- merge + coverage ----
-    merged = preds.merge(
-        results,
-        on="merge_key",
-        how="inner",
-        suffixes=("_pred", "_res"),
-    )
-
-    total_results_games = int(len(results))
-    matched_games = int(len(merged))
-    coverage = (matched_games / total_results_games) if total_results_games else 0.0
-
-    # Coverage diagnostics
-    results_keys = set(results["merge_key"].tolist())
-    pred_keys = set(preds["merge_key"].tolist())
-    missing_pred = sorted(list(results_keys - pred_keys))[:50]  # cap
-    missing_res = sorted(list(pred_keys - results_keys))[:50]   # cap
-
+    # Start audit early so even early failures produce an artifact.
     audit: Dict[str, Any] = {
-        "status": "ok",
+        "status": "init",
         "window": {"start": args.start, "end": args.end},
         "inputs": {
             "pred_dir": str(pred_dir),
             "pattern": args.pattern,
             "results_csv": str(results_csv),
-            "pred_files": [str(p) for p in pred_files],
         },
-        "counts": {
-            "results_games": total_results_games,
-            "pred_rows": int(len(preds)),
+        "columns": {"prob_col": args.prob_col, "spread_col": args.spread_col},
+        "counts": {},
+        "coverage": {},
+        "missing_examples": {},
+        "column_presence": {},
+    }
+
+    try:
+        pred_files = _select_pred_files(pred_dir, args.pattern, args.start, args.end)
+        audit["inputs"]["pred_files"] = [str(p) for p in pred_files]
+
+        if not pred_files:
+            audit["status"] = "fail"
+            audit["reason"] = "no_prediction_files"
+            _write_audit(out_dir, audit)
+            _hard_fail("No prediction files matched pattern/date window.")
+
+        preds = _load_predictions(pred_files)
+        results = _load_results(results_csv)
+
+        # filter results to window
+        s0, s1 = _parse_date(args.start), _parse_date(args.end)
+        results = results.copy()
+        results["game_date"] = results["game_date"].astype(str)
+        results["_dt"] = results["game_date"].apply(_parse_date)
+        results = results[(results["_dt"] >= s0) & (results["_dt"] <= s1)].drop(columns=["_dt"])
+
+        preds = _add_norm_keys(preds)
+        results = _add_norm_keys(results)
+
+        merged = preds.merge(results, on="merge_key", how="inner", suffixes=("_pred", "_res"))
+
+        total_results_games = int(len(results))
+        matched_games = int(len(merged))
+        coverage = (matched_games / total_results_games) if total_results_games else 0.0
+
+        results_keys = set(results["merge_key"].tolist())
+        pred_keys = set(preds["merge_key"].tolist())
+        missing_pred = sorted(list(results_keys - pred_keys))[:50]
+        missing_res = sorted(list(pred_keys - results_keys))[:50]
+
+        audit.update(
+            {
+                "status": "ok",
+                "counts": {
+                    "results_games": total_results_games,
+                    "pred_rows": int(len(preds)),
+                    "matched_games": matched_games,
+                },
+                "coverage": {"rate": float(round(coverage, 6)), "warn_lt": 0.95, "fail_lt": 0.80},
+                "missing_examples": {
+                    "missing_pred_keys_sample": missing_pred,
+                    "missing_result_keys_sample": missing_res,
+                },
+                "column_presence": {
+                    "prob_col_in_merged": bool(args.prob_col in merged.columns),
+                    "spread_col_in_merged": bool(args.spread_col in merged.columns),
+                    "has_scores": bool(("home_score" in merged.columns) and ("away_score" in merged.columns)),
+                },
+            }
+        )
+
+        # Write audit BEFORE gates so failures still have it.
+        _write_audit(out_dir, audit)
+
+        if coverage < 0.80:
+            _hard_fail(f"Merge coverage too low: {coverage:.3f} (<0.80 hard fail). See outputs/backtest_join_audit.json")
+        if coverage < 0.95:
+            _warn(f"Merge coverage low: {coverage:.3f} (<0.95 warn). See outputs/backtest_join_audit.json")
+
+        metrics: Dict[str, Any] = {
+            "window": {"start": args.start, "end": args.end},
+            "coverage": float(round(coverage, 6)),
             "matched_games": matched_games,
-        },
-        "coverage": {
-            "rate": float(round(coverage, 6)),
-            "warn_lt": 0.95,
-            "fail_lt": 0.80,
-        },
-        "missing_examples": {
-            "missing_pred_keys_sample": missing_pred,
-            "missing_result_keys_sample": missing_res,
-        },
-        "columns": {
-            "prob_col": args.prob_col,
-            "spread_col": args.spread_col,
-        },
-    }
+            "results_games": total_results_games,
+        }
 
-    # Write audit BEFORE any gates (so failures still produce the audit file)
-    _write_audit(out_dir, audit)
-
-    if coverage < 0.80:
-        _hard_fail(f"Merge coverage too low: {coverage:.3f} (<0.80 hard fail). See outputs/backtest_join_audit.json")
-    if coverage < 0.95:
-        _warn(f"Merge coverage low: {coverage:.3f} (<0.95 warn). See outputs/backtest_join_audit.json")
-
-    # ---- metrics ----
-    metrics: Dict[str, Any] = {
-        "window": {"start": args.start, "end": args.end},
-        "coverage": float(round(coverage, 6)),
-        "matched_games": matched_games,
-        "results_games": total_results_games,
-    }
-
-    # win-prob metrics
-    if args.prob_col in merged.columns:
-        # determine outcome from scores when present
-        if "home_score" in merged.columns and "away_score" in merged.columns:
-            y = (merged["home_score"].astype(float) > merged["away_score"].astype(float)).astype(int).to_numpy()
-            p = merged[args.prob_col].astype(float).to_numpy()
-            metrics["brier"] = _brier(y, p)
-            metrics["log_loss"] = _logloss(y, p)
+        # win-prob metrics
+        if args.prob_col in merged.columns:
+            if "home_score" in merged.columns and "away_score" in merged.columns:
+                y = (merged["home_score"].astype(float) > merged["away_score"].astype(float)).astype(int).to_numpy()
+                p = merged[args.prob_col].astype(float).to_numpy()
+                metrics["brier"] = _brier(y, p)
+                metrics["log_loss"] = _logloss(y, p)
+            else:
+                _warn("home_score/away_score not present in merged frame; skipping brier/logloss.")
         else:
-            _warn("home_score/away_score not present in merged frame; skipping brier/logloss.")
-    else:
-        _warn(f"prob-col '{args.prob_col}' not found; skipping brier/logloss.")
+            _warn(f"prob-col '{args.prob_col}' not found; skipping brier/logloss.")
 
-    # spread metrics
-    se = _spread_errors(merged, args.spread_col)
-    if se:
-        metrics["spread_error"] = se
+        # spread metrics
+        se = _spread_errors(merged, args.spread_col)
+        if se:
+            metrics["spread_error"] = se
 
-    # ---- write outputs ----
-    metrics_path = Path(args.metrics_path)
-    _write_json(metrics_path, metrics)
-    _info(f"wrote: {metrics_path}")
+        metrics_path = Path(args.metrics_path)
+        _write_json(metrics_path, metrics)
+        _info(f"wrote: {metrics_path}")
 
-    # per-game
-    per_game_path = Path(args.per_game_path)
-    merged.to_csv(per_game_path, index=False)
-    _info(f"wrote: {per_game_path}")
+        per_game_path = Path(args.per_game_path)
+        merged.to_csv(per_game_path, index=False)
+        _info(f"wrote: {per_game_path}")
 
-    # calibration csv (lightweight)
-    calib_path = Path(args.calib_path)
-    if args.prob_col in merged.columns and "home_score" in merged.columns and "away_score" in merged.columns:
-        tmp = merged[[args.prob_col, "home_score", "away_score"]].copy()
-        tmp["y"] = (tmp["home_score"].astype(float) > tmp["away_score"].astype(float)).astype(int)
-        tmp.to_csv(calib_path, index=False)
-        _info(f"wrote: {calib_path}")
-    else:
-        _warn("Skipping calibration csv (missing prob-col or scores).")
+        calib_path = Path(args.calib_path)
+        if args.prob_col in merged.columns and "home_score" in merged.columns and "away_score" in merged.columns:
+            tmp = merged[[args.prob_col, "home_score", "away_score"]].copy()
+            tmp["y"] = (tmp["home_score"].astype(float) > tmp["away_score"].astype(float)).astype(int)
+            tmp.to_csv(calib_path, index=False)
+            _info(f"wrote: {calib_path}")
+        else:
+            _warn("Skipping calibration csv (missing prob-col or scores).")
 
-    _info("DONE")
+        _info("DONE")
+
+    except Exception as e:
+        # If we error before audit write in some unforeseen path, ensure an audit exists.
+        if (out_dir / "backtest_join_audit.json").exists() is False:
+            audit["status"] = "fail"
+            audit["error"] = {"type": type(e).__name__, "message": str(e)}
+            _write_audit(out_dir, audit)
+        raise
 
 
 if __name__ == "__main__":
