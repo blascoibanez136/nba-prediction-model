@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import inspect
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -44,45 +45,30 @@ def _find_first_existing(candidates: List[Path]) -> Optional[Path]:
 
 
 def _load_pickle(path: Path) -> Any:
-    import joblib  # local import to avoid import-time issues
-
+    import joblib
     return joblib.load(path)
 
 
 def _load_teams(path: Path) -> Any:
-    """
-    Teams artifact can be either:
-    - JSON (preferred for portability): team_index.json
-    - Pickle/joblib legacy: teams.pkl / team_index.pkl / etc.
-    """
     if path.suffix.lower() == ".json":
         return json.loads(path.read_text(encoding="utf-8"))
     return _load_pickle(path)
 
 
 def _locate_model_artifacts() -> Tuple[Dict[str, Path], Dict[str, Any]]:
-    """
-    Locate model artifacts without assuming a fixed directory exists.
-
-    Commit-2 fix: include REPO_ROOT/models (Colab upload target) as a first-class base.
-
-    Returns:
-      (paths, attempted_payload)
-    """
+    # ✅ commit-2 fix: include REPO_ROOT/models (Colab upload target)
     bases = [
-        REPO_ROOT / "models",  # ✅ commit-2 fix: primary location for Colab uploads
+        REPO_ROOT / "models",
         REPO_ROOT / "artifacts",
         REPO_ROOT / "artifacts" / "models",
         REPO_ROOT / "outputs",
         REPO_ROOT,
     ]
 
-    # conservative, allow multiple conventions
     win_names = ["win_model.pkl", "win_model.joblib", "model_win.pkl"]
     spread_names = ["spread_model.pkl", "spread_model.joblib", "model_spread.pkl"]
     total_names = ["total_model.pkl", "total_model.joblib", "model_total.pkl"]
 
-    # ✅ commit-2 fix: support JSON team index as canonical
     teams_names = [
         "team_index.json",
         "teams.json",
@@ -157,6 +143,61 @@ def _load_models(audit: Dict[str, Any]) -> Tuple[Any, Any, Any, Any]:
     return teams, win_model, spread_model, total_model
 
 
+def _call_predict_games(predict_games_fn: Any, df_day: pd.DataFrame, teams: Any, win_model: Any, spread_model: Any, total_model: Any) -> pd.DataFrame:
+    """
+    ✅ Fix for your error:
+    predict_games signature differs across repo versions.
+    We introspect and only pass supported kwargs, then fall back to safe positional patterns.
+    """
+    sig = inspect.signature(predict_games_fn)
+    params = list(sig.parameters.keys())
+
+    # Prefer kwargs (but only if supported)
+    kwargs: Dict[str, Any] = {}
+
+    # common names across variants
+    if "teams" in params:
+        kwargs["teams"] = teams
+    elif "team_index" in params:
+        kwargs["team_index"] = teams
+    elif "teams_map" in params:
+        kwargs["teams_map"] = teams
+
+    if "win_model" in params:
+        kwargs["win_model"] = win_model
+    if "spread_model" in params:
+        kwargs["spread_model"] = spread_model
+    if "total_model" in params:
+        kwargs["total_model"] = total_model
+
+    # Some variants use different model arg names; only try if present
+    if not kwargs:
+        # We'll go straight to positional fallbacks
+        pass
+
+    # Try kwargs first
+    try:
+        return predict_games_fn(df_day, **kwargs)
+    except TypeError:
+        pass
+
+    # Positional fallbacks (cover the two most common orderings)
+    # 1) (df, teams, win, spread, total)
+    try:
+        return predict_games_fn(df_day, teams, win_model, spread_model, total_model)
+    except TypeError:
+        pass
+
+    # 2) (df, win, spread, total, teams)
+    try:
+        return predict_games_fn(df_day, win_model, spread_model, total_model, teams)
+    except TypeError:
+        pass
+
+    # 3) (df, win, spread, total) (no teams object used)
+    return predict_games_fn(df_day, win_model, spread_model, total_model)
+
+
 def _run_predict_for_day(
     df_day: pd.DataFrame,
     teams: Any,
@@ -164,15 +205,9 @@ def _run_predict_for_day(
     spread_model: Any,
     total_model: Any,
 ) -> pd.DataFrame:
-    from src.model.predict import predict_games  # canonical in your repo
+    from src.model.predict import predict_games  # canonical path in your repo
 
-    return predict_games(
-        df_day,
-        teams=teams,
-        win_model=win_model,
-        spread_model=spread_model,
-        total_model=total_model,
-    )
+    return _call_predict_games(predict_games, df_day, teams, win_model, spread_model, total_model)
 
 
 def _try_apply_market(df_pred: pd.DataFrame, game_date: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -185,7 +220,6 @@ def _try_apply_market(df_pred: pd.DataFrame, game_date: str) -> Tuple[pd.DataFra
 
     try:
         from src.model.market_ensemble import apply_market_ensemble  # type: ignore
-
         df_out = apply_market_ensemble(df_pred, snapshot_path=str(snap))
         diag["applied"] = True
         return df_out, diag
@@ -294,3 +328,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
