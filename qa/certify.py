@@ -35,11 +35,6 @@ BACKTEST_AUDIT = OUTPUTS_DIR / "backtest_join_audit.json"
 HISTORICAL_AUDIT = OUTPUTS_DIR / "historical_prediction_runner_audit.json"
 
 
-# -------------------------
-# subprocess helpers
-# -------------------------
-
-
 def run(cmd: list[str]) -> None:
     print("\n[certify] ▶", " ".join(cmd))
     subprocess.check_call(cmd, cwd=REPO_ROOT)
@@ -51,11 +46,6 @@ def ensure_paths() -> None:
 
     ARTIFACTS_DIR.mkdir(exist_ok=True)
     OUTPUTS_DIR.mkdir(exist_ok=True)
-
-
-# -------------------------
-# certification suites
-# -------------------------
 
 
 def run_ats_regression() -> None:
@@ -125,15 +115,14 @@ def run_ml_suite() -> None:
     ])
 
 
-# -------------------------
-# optional: backtest + historical audit steps
-# -------------------------
+def _require_file(path: Path, label: str) -> None:
+    if not path.exists():
+        raise RuntimeError(f"[certify] Expected {label} at {path} but it does not exist.")
 
 
 def run_backtest_step(results_path: str, pred_dir: str = "outputs") -> None:
     """
     Runs src.eval.backtest to produce backtest metrics and join audit JSON.
-    This is optional because it depends on local repo data files.
     """
     print("\n[certify] === Backtest (optional) ===")
     run([
@@ -148,6 +137,9 @@ def run_backtest_step(results_path: str, pred_dir: str = "outputs") -> None:
         "--calib-path", str(OUTPUTS_DIR / "backtest_calibration.csv"),
         "--per-game-path", str(OUTPUTS_DIR / "backtest_per_game.csv"),
     ])
+
+    # ✅ fail-fast: confirm audit exists immediately after step
+    _require_file(BACKTEST_AUDIT, "backtest join audit")
 
 
 def run_historical_step(history_path: str, apply_market: bool, overwrite: bool) -> None:
@@ -168,10 +160,8 @@ def run_historical_step(history_path: str, apply_market: bool, overwrite: bool) 
         cmd.append("--overwrite")
     run(cmd)
 
-
-# -------------------------
-# outputs + metadata
-# -------------------------
+    # ✅ fail-fast: confirm audit exists immediately after step
+    _require_file(HISTORICAL_AUDIT, "historical runner audit")
 
 
 def verify_outputs() -> None:
@@ -261,14 +251,7 @@ def _try_load_overall(metrics_path: Path) -> Dict[str, Any]:
         return {}
 
 
-def write_run_metadata(
-    ran_backtest: bool,
-    ran_historical: bool,
-) -> None:
-    """
-    Deterministic run receipt for certification runs.
-    Additive only: does not affect selectors/policies/results.
-    """
+def write_run_metadata(ran_backtest: bool, ran_historical: bool) -> None:
     meta: Dict[str, Any] = {
         "kind": "certification_suite",
         "generated_at_utc": _utc_now_iso(),
@@ -296,9 +279,7 @@ def write_run_metadata(
             "backtest_step": bool(ran_backtest),
             "historical_step": bool(ran_historical),
         },
-        "inputs": {
-            "per_game_fixture": _safe_stat(PER_GAME_FIXTURE),
-        },
+        "inputs": {"per_game_fixture": _safe_stat(PER_GAME_FIXTURE)},
         "artifacts": {
             "total_calibrator": _safe_stat(ARTIFACTS_DIR / "total_calibrator.joblib"),
             "delta_calibrator": _safe_stat(ARTIFACTS_DIR / "delta_calibrator.joblib"),
@@ -325,43 +306,14 @@ def write_run_metadata(
     print("[certify] wrote: outputs/run_metadata.json")
 
 
-# -------------------------
-# CLI
-# -------------------------
-
-
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Run NBA Certification Suite (ATS/Totals/ML) + optional audits.")
-    ap.add_argument(
-        "--run-backtest",
-        action="store_true",
-        help="Also run src.eval.backtest (requires --results-path) and verify backtest_join_audit.json exists.",
-    )
-    ap.add_argument(
-        "--results-path",
-        default=None,
-        help="Results CSV path for backtest step (required if --run-backtest).",
-    )
-    ap.add_argument(
-        "--run-historical",
-        action="store_true",
-        help="Also run src.eval.historical_prediction_runner (requires --history-path) and verify historical audit exists.",
-    )
-    ap.add_argument(
-        "--history-path",
-        default=None,
-        help="History games CSV for historical runner (required if --run-historical).",
-    )
-    ap.add_argument(
-        "--historical-apply-market",
-        action="store_true",
-        help="When running historical runner, attempt market ensemble (will self-disable when coverage too low).",
-    )
-    ap.add_argument(
-        "--historical-overwrite",
-        action="store_true",
-        help="When running historical runner, overwrite existing outputs.",
-    )
+    ap.add_argument("--run-backtest", action="store_true")
+    ap.add_argument("--results-path", default=None)
+    ap.add_argument("--run-historical", action="store_true")
+    ap.add_argument("--history-path", default=None)
+    ap.add_argument("--historical-apply-market", action="store_true")
+    ap.add_argument("--historical-overwrite", action="store_true")
     return ap.parse_args()
 
 
@@ -379,7 +331,6 @@ def main() -> None:
     run_ml_suite()
     verify_outputs()
 
-    # Optional steps
     ran_backtest = False
     ran_historical = False
 
@@ -399,10 +350,7 @@ def main() -> None:
         )
         ran_historical = True
 
-    # Verify audits only if the corresponding step ran
     verify_optional_audits(require_backtest_audit=ran_backtest, require_historical_audit=ran_historical)
-
-    # Always write metadata last (includes whether optional steps ran)
     write_run_metadata(ran_backtest=ran_backtest, ran_historical=ran_historical)
 
     print("\n[certify] ✅ CERTIFICATION PASSED")
