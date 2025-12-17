@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -28,6 +29,10 @@ REQUIRED_OUTPUTS = [
     OUTPUTS_DIR / "totals_roi_metrics.json",
     OUTPUTS_DIR / "ml_roi_metrics.json",
 ]
+
+# Commit 2 audit outputs (only required if corresponding step runs)
+BACKTEST_AUDIT = OUTPUTS_DIR / "backtest_join_audit.json"
+HISTORICAL_AUDIT = OUTPUTS_DIR / "historical_prediction_runner_audit.json"
 
 
 # -------------------------
@@ -121,6 +126,50 @@ def run_ml_suite() -> None:
 
 
 # -------------------------
+# optional: backtest + historical audit steps
+# -------------------------
+
+
+def run_backtest_step(results_path: str, pred_dir: str = "outputs") -> None:
+    """
+    Runs src.eval.backtest to produce backtest metrics and join audit JSON.
+    This is optional because it depends on local repo data files.
+    """
+    print("\n[certify] === Backtest (optional) ===")
+    run([
+        sys.executable,
+        "-m", "src.eval.backtest",
+        "--pred-dir", pred_dir,
+        "--pattern", "predictions_*_market.csv",
+        "--results", results_path,
+        "--start", TRAIN_START,
+        "--end", EVAL_END,
+        "--metrics-path", str(OUTPUTS_DIR / "backtest_metrics.json"),
+        "--calib-path", str(OUTPUTS_DIR / "backtest_calibration.csv"),
+        "--per-game-path", str(OUTPUTS_DIR / "backtest_per_game.csv"),
+    ])
+
+
+def run_historical_step(history_path: str, apply_market: bool, overwrite: bool) -> None:
+    """
+    Runs src.eval.historical_prediction_runner and expects it to write an audit JSON.
+    """
+    print("\n[certify] === Historical Prediction Runner (optional) ===")
+    cmd = [
+        sys.executable,
+        "-m", "src.eval.historical_prediction_runner",
+        "--history", history_path,
+        "--start", TRAIN_START,
+        "--end", EVAL_END,
+    ]
+    if apply_market:
+        cmd.append("--apply-market")
+    if overwrite:
+        cmd.append("--overwrite")
+    run(cmd)
+
+
+# -------------------------
 # outputs + metadata
 # -------------------------
 
@@ -133,9 +182,28 @@ def verify_outputs() -> None:
             "[certify] Missing required outputs:\n"
             + "\n".join(str(p) for p in missing)
         )
-
     for p in REQUIRED_OUTPUTS:
         print(f"[certify] ✔ {p.name}")
+
+
+def verify_optional_audits(require_backtest_audit: bool, require_historical_audit: bool) -> None:
+    print("\n[certify] === Verifying Audit Outputs ===")
+    missing = []
+    if require_backtest_audit and not BACKTEST_AUDIT.exists():
+        missing.append(BACKTEST_AUDIT)
+    if require_historical_audit and not HISTORICAL_AUDIT.exists():
+        missing.append(HISTORICAL_AUDIT)
+
+    if missing:
+        raise RuntimeError(
+            "[certify] Missing required audit outputs:\n"
+            + "\n".join(str(p) for p in missing)
+        )
+
+    if require_backtest_audit:
+        print(f"[certify] ✔ {BACKTEST_AUDIT.name}")
+    if require_historical_audit:
+        print(f"[certify] ✔ {HISTORICAL_AUDIT.name}")
 
 
 def _utc_now_iso() -> str:
@@ -193,7 +261,10 @@ def _try_load_overall(metrics_path: Path) -> Dict[str, Any]:
         return {}
 
 
-def write_run_metadata() -> None:
+def write_run_metadata(
+    ran_backtest: bool,
+    ran_historical: bool,
+) -> None:
     """
     Deterministic run receipt for certification runs.
     Additive only: does not affect selectors/policies/results.
@@ -218,6 +289,13 @@ def write_run_metadata() -> None:
             "eval_start": EVAL_START,
             "eval_end": EVAL_END,
         },
+        "steps": {
+            "ats_regression": True,
+            "totals_suite": True,
+            "ml_suite": True,
+            "backtest_step": bool(ran_backtest),
+            "historical_step": bool(ran_historical),
+        },
         "inputs": {
             "per_game_fixture": _safe_stat(PER_GAME_FIXTURE),
         },
@@ -232,6 +310,8 @@ def write_run_metadata() -> None:
             "ats_bets": _safe_stat(OUTPUTS_DIR / "ats_roi_bets.csv"),
             "totals_bets": _safe_stat(OUTPUTS_DIR / "totals_roi_bets.csv"),
             "ml_bets": _safe_stat(OUTPUTS_DIR / "ml_roi_bets.csv"),
+            "backtest_join_audit": _safe_stat(BACKTEST_AUDIT),
+            "historical_runner_audit": _safe_stat(HISTORICAL_AUDIT),
         },
         "summary": {
             "ats_overall": _try_load_overall(OUTPUTS_DIR / "ats_roi_metrics.json"),
@@ -245,16 +325,85 @@ def write_run_metadata() -> None:
     print("[certify] wrote: outputs/run_metadata.json")
 
 
+# -------------------------
+# CLI
+# -------------------------
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Run NBA Certification Suite (ATS/Totals/ML) + optional audits.")
+    ap.add_argument(
+        "--run-backtest",
+        action="store_true",
+        help="Also run src.eval.backtest (requires --results-path) and verify backtest_join_audit.json exists.",
+    )
+    ap.add_argument(
+        "--results-path",
+        default=None,
+        help="Results CSV path for backtest step (required if --run-backtest).",
+    )
+    ap.add_argument(
+        "--run-historical",
+        action="store_true",
+        help="Also run src.eval.historical_prediction_runner (requires --history-path) and verify historical audit exists.",
+    )
+    ap.add_argument(
+        "--history-path",
+        default=None,
+        help="History games CSV for historical runner (required if --run-historical).",
+    )
+    ap.add_argument(
+        "--historical-apply-market",
+        action="store_true",
+        help="When running historical runner, attempt market ensemble (will self-disable when coverage too low).",
+    )
+    ap.add_argument(
+        "--historical-overwrite",
+        action="store_true",
+        help="When running historical runner, overwrite existing outputs.",
+    )
+    return ap.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+
     print("\n[certify] Starting NBA Certification Suite")
     print("[certify] Repo:", REPO_ROOT)
 
     ensure_paths()
+
+    # Core locked suite
     run_ats_regression()
     run_totals_suite()
     run_ml_suite()
     verify_outputs()
-    write_run_metadata()
+
+    # Optional steps
+    ran_backtest = False
+    ran_historical = False
+
+    if args.run_backtest:
+        if not args.results_path:
+            raise RuntimeError("[certify] --run-backtest requires --results-path")
+        run_backtest_step(results_path=args.results_path)
+        ran_backtest = True
+
+    if args.run_historical:
+        if not args.history_path:
+            raise RuntimeError("[certify] --run-historical requires --history-path")
+        run_historical_step(
+            history_path=args.history_path,
+            apply_market=bool(args.historical_apply_market),
+            overwrite=bool(args.historical_overwrite),
+        )
+        ran_historical = True
+
+    # Verify audits only if the corresponding step ran
+    verify_optional_audits(require_backtest_audit=ran_backtest, require_historical_audit=ran_historical)
+
+    # Always write metadata last (includes whether optional steps ran)
+    write_run_metadata(ran_backtest=ran_backtest, ran_historical=ran_historical)
 
     print("\n[certify] ✅ CERTIFICATION PASSED")
     print("[certify] System is reproducible and healthy.")
