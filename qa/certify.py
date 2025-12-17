@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -44,10 +43,14 @@ def run_ats_regression() -> None:
 
 
 def run_totals_suite() -> None:
+    """
+    Totals ROI CLI uses --per-game (dash) and does NOT accept --pricing/--strict.
+    """
     print("\n[certify] === Totals v3 ===")
 
     total_cal = ARTIFACTS_DIR / "total_calibrator.joblib"
 
+    # trainer expects --per-game (dash)
     run([
         sys.executable,
         "-m", "src.eval.train_total_calibrator",
@@ -57,43 +60,47 @@ def run_totals_suite() -> None:
         "--out", str(total_cal),
     ])
 
+    # ROI expects --per-game (dash); no --pricing / no --strict
     run([
         sys.executable,
         "-m", "src.eval.totals_roi_analysis",
-        "--per_game", str(PER_GAME_FIXTURE),
+        "--per-game", str(PER_GAME_FIXTURE),
         "--calibrator", str(total_cal),
         "--eval-start", EVAL_START,
         "--eval-end", EVAL_END,
-        "--pricing", "fixed_-110",
         "--max-bet-rate", "0.30",
-        "--strict",
     ])
 
 
 def run_ml_suite() -> None:
+    """
+    ML delta trainer expects --per_game (underscore).
+    ML ROI expects --per_game (underscore) and delta bundle must be passed via --delta-calibrator.
+    """
     print("\n[certify] === ML Selector v3 ===")
 
     delta_cal = ARTIFACTS_DIR / "delta_calibrator.joblib"
 
+    # delta trainer expects --per_game (underscore)
     run([
         sys.executable,
         "-m", "src.eval.train_delta_calibrator",
-        "--per-game", str(PER_GAME_FIXTURE),
+        "--per_game", str(PER_GAME_FIXTURE),
         "--train-start", TRAIN_START,
         "--train-end", TRAIN_END,
         "--out", str(delta_cal),
     ])
 
+    # ML ROI expects --per_game (underscore) and delta calibrator bundle via --delta-calibrator
     run([
         sys.executable,
         "-m", "src.eval.ml_roi_analysis",
         "--per_game", str(PER_GAME_FIXTURE),
         "--mode", "ev_cal",
-        "--calibrator", str(delta_cal),
+        "--delta-calibrator", str(delta_cal),
         "--eval-start", EVAL_START,
         "--eval-end", EVAL_END,
         "--max-bet-rate", "0.30",
-        "--strict",
     ])
 
 
@@ -102,8 +109,7 @@ def verify_outputs() -> None:
     missing = [p for p in REQUIRED_OUTPUTS if not p.exists()]
     if missing:
         raise RuntimeError(
-            "[certify] Missing required outputs:\n"
-            + "\n".join(str(p) for p in missing)
+            "[certify] Missing required outputs:\n" + "\n".join(str(p) for p in missing)
         )
 
     for p in REQUIRED_OUTPUTS:
