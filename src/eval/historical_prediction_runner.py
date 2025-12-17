@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -50,29 +49,48 @@ def _load_pickle(path: Path) -> Any:
     return joblib.load(path)
 
 
-def _locate_model_artifacts() -> Dict[str, Path]:
+def _load_teams(path: Path) -> Any:
+    """
+    Teams artifact can be either:
+    - JSON (preferred for portability): team_index.json
+    - Pickle/joblib legacy: teams.pkl / team_index.pkl / etc.
+    """
+    if path.suffix.lower() == ".json":
+        return json.loads(path.read_text(encoding="utf-8"))
+    return _load_pickle(path)
+
+
+def _locate_model_artifacts() -> Tuple[Dict[str, Path], Dict[str, Any]]:
     """
     Locate model artifacts without assuming a fixed directory exists.
 
-    We search the most likely runtime locations:
-    - artifacts/ (created by training/calibration runs)
-    - outputs/ (sometimes used in Colab workflows)
-    - repo root (legacy)
-    - artifacts/models/ (common pattern)
+    Commit-2 fix: include REPO_ROOT/models (Colab upload target) as a first-class base.
 
-    Filenames are conservative and allow multiple common conventions.
+    Returns:
+      (paths, attempted_payload)
     """
     bases = [
+        REPO_ROOT / "models",  # ✅ commit-2 fix: primary location for Colab uploads
         REPO_ROOT / "artifacts",
         REPO_ROOT / "artifacts" / "models",
         REPO_ROOT / "outputs",
         REPO_ROOT,
     ]
 
+    # conservative, allow multiple conventions
     win_names = ["win_model.pkl", "win_model.joblib", "model_win.pkl"]
     spread_names = ["spread_model.pkl", "spread_model.joblib", "model_spread.pkl"]
     total_names = ["total_model.pkl", "total_model.joblib", "model_total.pkl"]
-    teams_names = ["teams.pkl", "teams.joblib", "team_index.pkl", "teams_map.pkl"]
+
+    # ✅ commit-2 fix: support JSON team index as canonical
+    teams_names = [
+        "team_index.json",
+        "teams.json",
+        "teams.pkl",
+        "teams.joblib",
+        "team_index.pkl",
+        "teams_map.pkl",
+    ]
 
     def expand(names: List[str]) -> List[Path]:
         out: List[Path] = []
@@ -81,12 +99,25 @@ def _locate_model_artifacts() -> Dict[str, Path]:
                 out.append(b / n)
         return out
 
-    win_path = _find_first_existing(expand(win_names))
-    spread_path = _find_first_existing(expand(spread_names))
-    total_path = _find_first_existing(expand(total_names))
-    teams_path = _find_first_existing(expand(teams_names))
+    win_candidates = expand(win_names)
+    spread_candidates = expand(spread_names)
+    total_candidates = expand(total_names)
+    teams_candidates = expand(teams_names)
 
-    missing = []
+    win_path = _find_first_existing(win_candidates)
+    spread_path = _find_first_existing(spread_candidates)
+    total_path = _find_first_existing(total_candidates)
+    teams_path = _find_first_existing(teams_candidates)
+
+    attempted = {
+        "bases": [str(b) for b in bases],
+        "win_candidates": [str(p) for p in win_candidates],
+        "spread_candidates": [str(p) for p in spread_candidates],
+        "total_candidates": [str(p) for p in total_candidates],
+        "teams_candidates": [str(p) for p in teams_candidates],
+    }
+
+    missing: List[str] = []
     if win_path is None:
         missing.append("win_model")
     if spread_path is None:
@@ -97,52 +128,51 @@ def _locate_model_artifacts() -> Dict[str, Path]:
         missing.append("teams")
 
     if missing:
-        attempted = {
-            "bases": [str(b) for b in bases],
-            "win_candidates": [str(p) for p in expand(win_names)],
-            "spread_candidates": [str(p) for p in expand(spread_names)],
-            "total_candidates": [str(p) for p in expand(total_names)],
-            "teams_candidates": [str(p) for p in expand(teams_names)],
-        }
         raise RuntimeError(
             "Could not locate required model artifacts: "
             + ", ".join(missing)
             + ". Check attempted paths in audit."
-        ) from RuntimeError(json.dumps(attempted))
+        ) from RuntimeError(json.dumps({"missing": missing, "attempted": attempted}))
 
-    return {
-        "teams": teams_path,
-        "win_model": win_path,
-        "spread_model": spread_path,
-        "total_model": total_path,
-    }
+    return (
+        {
+            "teams": teams_path,
+            "win_model": win_path,
+            "spread_model": spread_path,
+            "total_model": total_path,
+        },
+        attempted,
+    )
 
 
 def _load_models(audit: Dict[str, Any]) -> Tuple[Any, Any, Any, Any]:
-    """
-    Loads teams + win/spread/total models by locating pickles/joblib files.
-    """
-    paths = _locate_model_artifacts()
+    paths, attempted = _locate_model_artifacts()
     audit["model_artifacts"] = {k: str(v) for k, v in paths.items()}
+    audit["artifact_search_attempted"] = attempted
 
-    teams = _load_pickle(paths["teams"])
+    teams = _load_teams(paths["teams"])
     win_model = _load_pickle(paths["win_model"])
     spread_model = _load_pickle(paths["spread_model"])
     total_model = _load_pickle(paths["total_model"])
     return teams, win_model, spread_model, total_model
 
 
-def _run_predict_for_day(df_day: pd.DataFrame, teams: Any, win_model: Any, spread_model: Any, total_model: Any) -> pd.DataFrame:
+def _run_predict_for_day(
+    df_day: pd.DataFrame,
+    teams: Any,
+    win_model: Any,
+    spread_model: Any,
+    total_model: Any,
+) -> pd.DataFrame:
     from src.model.predict import predict_games  # canonical in your repo
 
-    out = predict_games(
+    return predict_games(
         df_day,
         teams=teams,
         win_model=win_model,
         spread_model=spread_model,
         total_model=total_model,
     )
-    return out
 
 
 def _try_apply_market(df_pred: pd.DataFrame, game_date: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -184,6 +214,7 @@ def main() -> None:
             "overwrite": bool(args.overwrite),
         },
         "model_artifacts": {},
+        "artifact_search_attempted": {},
         "days": {"processed": 0, "written": 0, "skipped_existing": 0, "skipped_no_games": 0},
         "market": {"attempted_days": 0, "applied_days": 0, "skipped_days": 0, "skip_reasons": {}},
         "outputs_sample": [],
@@ -249,11 +280,10 @@ def main() -> None:
     except Exception as e:
         audit["status"] = "fail"
         audit["errors"].append({"type": type(e).__name__, "message": str(e)})
-        # If artifact location failed, include attempted paths payload (packed into the exception chain)
         if e.__cause__ is not None and isinstance(e.__cause__, RuntimeError):
             try:
-                attempted = json.loads(str(e.__cause__))
-                audit["artifact_search_attempted"] = attempted
+                payload = json.loads(str(e.__cause__))
+                audit["artifact_search_failure"] = payload
             except Exception:
                 pass
         raise
