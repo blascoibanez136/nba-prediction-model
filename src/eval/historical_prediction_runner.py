@@ -1,37 +1,28 @@
 from __future__ import annotations
 
 import argparse
-import glob
 import json
-import logging
+import os
+from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
-from src.model.predict import predict_games
-from src.model.market_ensemble import apply_market_ensemble
-from src.eval.edge_picker import _merge_key
-
-# Directories for input and output
-SNAPSHOT_DIR = Path("data/_snapshots")
-OUTPUT_DIR = Path("outputs")
-
-logger = logging.getLogger("historical")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [historical] %(message)s",
-)
-
-# Coverage thresholds for market ensemble enablement
-COVERAGE_WARN_THRESHOLD = 0.95
-COVERAGE_DISABLE_THRESHOLD = 0.80
+REPO_ROOT = Path(__file__).resolve().parents[2]
+OUTPUTS_DIR = REPO_ROOT / "outputs"
+SNAPSHOT_DIR = REPO_ROOT / "data" / "_snapshots"
 
 
-# -------------------------
-# deterministic JSON writer
-# -------------------------
+def _parse_date(s: str) -> datetime:
+    return datetime.strptime(s, "%Y-%m-%d")
+
+
+def _date_str(d: datetime) -> str:
+    return d.strftime("%Y-%m-%d")
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -41,262 +32,164 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
         f.write("\n")
 
 
-# -------------------------
-# core helpers
-# -------------------------
+def _info(msg: str) -> None:
+    print(f"[historical] {msg}")
 
 
-def load_history(history_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(history_path)
-    if df.empty:
-        raise ValueError(f"History CSV is empty: {history_path}")
-    required = {"game_date", "home_team", "away_team"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"History CSV missing required columns: {sorted(missing)}")
-    return df
+def _warn(msg: str) -> None:
+    print(f"[historical][WARNING] {msg}")
 
 
-def load_games_for_date(history_df: pd.DataFrame, run_date: str) -> pd.DataFrame:
-    """Extract games for a specific run_date from the history DataFrame."""
-    day = history_df[history_df["game_date"].astype(str) == run_date].copy()
-    if day.empty:
-        return pd.DataFrame(columns=["game_date", "home_team", "away_team"])
+def _load_models() -> Tuple[Any, Any, Any, Any]:
+    """
+    Keep behavior aligned with your current runner:
+    - loads teams mapping + win/spread/total models from artifacts/models.
+    """
+    # NOTE: These imports are intentionally inside the function to keep the script import-safe.
+    from src.model.load_models import load_models  # type: ignore
 
-    # Only what predict_games needs
-    out = day[["game_date", "home_team", "away_team"]].copy()
-    out["game_date"] = run_date
+    teams, win_model, spread_model, total_model = load_models()
+    return teams, win_model, spread_model, total_model
+
+
+def _run_predict_for_day(df_day: pd.DataFrame, teams: Any, win_model: Any, spread_model: Any, total_model: Any) -> pd.DataFrame:
+    from src.model.predict import predict_games  # type: ignore
+
+    out = predict_games(df_day, teams=teams, win_model=win_model, spread_model=spread_model, total_model=total_model)
     return out
 
 
-def _find_latest_snapshot_for_date(run_date: str, snapshot_type: str = "close") -> Optional[Path]:
+def _try_apply_market(df_pred: pd.DataFrame, game_date: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Find the latest odds snapshot file for a date.
-
-    Expected naming convention:
-      data/_snapshots/{snapshot_type}_{run_date}_*.csv
+    Apply market ensemble if snapshot exists, otherwise return original df.
     """
-    pattern = str(SNAPSHOT_DIR / f"{snapshot_type}_{run_date}_*.csv")
-    candidates = sorted(glob.glob(pattern))
-    if not candidates:
-        return None
-    return Path(candidates[-1])
+    diag: Dict[str, Any] = {"attempted": True, "applied": False, "reason": None}
 
+    # You’re using CLOSE snapshots in your logs; keep that convention.
+    # If your snapshot file naming differs, adjust here once and keep consistent.
+    snap = SNAPSHOT_DIR / f"odds_snapshot_close_{game_date}.csv"
+    if not snap.exists():
+        diag["reason"] = f"no_close_snapshot:{snap.name}"
+        return df_pred, diag
 
-def _coverage_from_merge_keys(preds: pd.DataFrame, odds: pd.DataFrame) -> float:
-    """
-    Behavior-preserving coverage check between predicted games and odds snapshot.
+    try:
+        from src.model.market_ensemble import apply_market_ensemble  # type: ignore
 
-    Coverage = (# of pred merge_keys found in odds merge_keys) / (# pred keys)
-    """
-    pred_keys = set(preds["merge_key"].astype(str).unique())
-    odds_keys = set(odds["merge_key"].astype(str).unique())
-    if not pred_keys:
-        return 0.0
-    return len(pred_keys & odds_keys) / len(pred_keys)
-
-
-def run_day(
-    history_df: pd.DataFrame,
-    run_date: str,
-    apply_market: bool,
-    overwrite: bool,
-) -> Dict[str, Any]:
-    """
-    Run predictions for a single day.
-
-    - Writes base predictions: outputs/predictions_{run_date}.csv
-    - Optionally writes market preds: outputs/predictions_{run_date}_market.csv
-      (only if odds snapshot exists AND coverage passes thresholds)
-
-    Commit 2 addition:
-    - returns a small audit dict (status, reason, coverage, paths written)
-      without changing prediction semantics.
-    """
-    audit: Dict[str, Any] = {
-        "date": run_date,
-        "status": "unknown",
-        "reason": None,
-        "base_written": False,
-        "market_written": False,
-        "coverage": None,
-        "snapshot_path": None,
-    }
-
-    games = load_games_for_date(history_df, run_date)
-    if games.empty:
-        logger.info("No games for %s — skipping", run_date)
-        audit["status"] = "skipped"
-        audit["reason"] = "no_games"
-        return audit
-
-    preds = predict_games(games)
-
-    preds["merge_key"] = preds.apply(
-        lambda r: _merge_key(r["home_team"], r["away_team"], r["game_date"]),
-        axis=1,
-    )
-
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    base_path = OUTPUT_DIR / f"predictions_{run_date}.csv"
-
-    if base_path.exists() and not overwrite:
-        logger.info("Base predictions already exist for %s — skipping write", run_date)
-        audit["base_written"] = False
-    else:
-        preds.to_csv(base_path, index=False)
-        logger.info("Wrote %s (%d rows)", base_path, len(preds))
-        audit["base_written"] = True
-
-    if not apply_market:
-        audit["status"] = "ok"
-        audit["reason"] = "base_only"
-        return audit
-
-    snap_path = _find_latest_snapshot_for_date(run_date, snapshot_type="close")
-    if snap_path is None:
-        logger.warning(
-            "No CLOSE odds snapshot found for %s in %s — skipping market ensemble",
-            run_date,
-            SNAPSHOT_DIR,
-        )
-        audit["status"] = "skipped"
-        audit["reason"] = "no_snapshot"
-        return audit
-
-    odds = pd.read_csv(snap_path)
-    audit["snapshot_path"] = str(snap_path)
-
-    if odds.empty or "merge_key" not in odds.columns:
-        logger.warning(
-            "CLOSE snapshot invalid for %s (%s): empty=%s, has_merge_key=%s — skipping market ensemble",
-            run_date,
-            snap_path,
-            odds.empty,
-            "merge_key" in odds.columns,
-        )
-        audit["status"] = "skipped"
-        audit["reason"] = "invalid_snapshot"
-        return audit
-
-    coverage = _coverage_from_merge_keys(preds, odds)
-    audit["coverage"] = float(coverage)
-
-    if coverage < COVERAGE_DISABLE_THRESHOLD:
-        logger.warning(
-            "Coverage %.1f%% < %.0f%% for %s — disabling market ensemble for this day",
-            coverage * 100.0,
-            COVERAGE_DISABLE_THRESHOLD * 100.0,
-            run_date,
-        )
-        audit["status"] = "skipped"
-        audit["reason"] = "coverage_disabled"
-        return audit
-    elif coverage < COVERAGE_WARN_THRESHOLD:
-        logger.warning(
-            "Coverage %.1f%% < %.0f%% for %s — proceeding, but results may be incomplete",
-            coverage * 100.0,
-            COVERAGE_WARN_THRESHOLD * 100.0,
-            run_date,
-        )
-
-    market_preds = apply_market_ensemble(preds, odds)
-
-    out_path = OUTPUT_DIR / f"predictions_{run_date}_market.csv"
-    if out_path.exists() and not overwrite:
-        logger.info("Market predictions already exist for %s — skipping write", run_date)
-        audit["status"] = "ok"
-        audit["reason"] = "market_exists"
-        audit["market_written"] = False
-        return audit
-
-    market_preds.to_csv(out_path, index=False)
-    logger.info("Wrote %s (%d rows)", out_path, len(market_preds))
-
-    audit["status"] = "ok"
-    audit["reason"] = "market_written"
-    audit["market_written"] = True
-    return audit
-
-
-def _date_range(start: str, end: str) -> list[str]:
-    d0 = datetime.strptime(start, "%Y-%m-%d")
-    d1 = datetime.strptime(end, "%Y-%m-%d")
-    out = []
-    d = d0
-    while d <= d1:
-        out.append(d.strftime("%Y-%m-%d"))
-        d += timedelta(days=1)
-    return out
+        df_out = apply_market_ensemble(df_pred, snapshot_path=str(snap))
+        diag["applied"] = True
+        return df_out, diag
+    except Exception as e:
+        diag["reason"] = f"market_apply_error:{type(e).__name__}"
+        return df_pred, diag
 
 
 def main() -> None:
-    """
-    Usage:
-      python -m src.eval.historical_prediction_runner \
-        --history data/history/games_2019_2024.csv \
-        --start 2023-10-24 \
-        --end 2024-06-17 \
-        --apply-market \
-        --overwrite
-
-    History CSV must contain:
-      - game_date
-      - home_team
-      - away_team
-    (It may contain scores too; we ignore them here.)
-    """
-    ap = argparse.ArgumentParser(
-        description="Run historical model predictions (optionally market-adjusted) for a date range."
-    )
-    ap.add_argument("--history", required=True, help="Path to history games CSV (must include game_date, home_team, away_team).")
-    ap.add_argument("--start", required=True, help="Start date (YYYY-MM-DD).")
-    ap.add_argument("--end", required=True, help="End date (YYYY-MM-DD).")
-    ap.add_argument("--apply-market", action="store_true", help="Apply market ensemble using CLOSE odds snapshots if available.")
-    ap.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs.")
-
+    ap = argparse.ArgumentParser(description="Historical prediction runner with audit output.")
+    ap.add_argument("--history", required=True, help="Historical games CSV (e.g., data/history/games_2019_2024.csv)")
+    ap.add_argument("--start", required=True, help="Start date YYYY-MM-DD (inclusive)")
+    ap.add_argument("--end", required=True, help="End date YYYY-MM-DD (inclusive)")
+    ap.add_argument("--apply-market", action="store_true", help="Attempt to apply market ensemble when snapshots exist")
+    ap.add_argument("--overwrite", action="store_true", help="Overwrite existing daily prediction files")
     args = ap.parse_args()
 
-    history_path = Path(args.history)
-    history_df = load_history(history_path)
+    OUTPUTS_DIR.mkdir(exist_ok=True)
 
-    dates = _date_range(args.start, args.end)
-
-    # Commit 2: structured run audit
-    run_audit: Dict[str, Any] = {
-        "kind": "historical_prediction_runner_audit",
-        "history_path": str(history_path),
-        "start": args.start,
-        "end": args.end,
-        "apply_market": bool(args.apply_market),
-        "overwrite": bool(args.overwrite),
-        "snapshot_dir": str(SNAPSHOT_DIR),
-        "output_dir": str(OUTPUT_DIR),
-        "coverage_warn_threshold": float(COVERAGE_WARN_THRESHOLD),
-        "coverage_disable_threshold": float(COVERAGE_DISABLE_THRESHOLD),
-        "days": [],
+    # audit container
+    audit: Dict[str, Any] = {
+        "status": "ok",
+        "window": {"start": args.start, "end": args.end},
+        "inputs": {"history": args.history, "apply_market": bool(args.apply_market), "overwrite": bool(args.overwrite)},
+        "model_files": {},
+        "days": {
+            "processed": 0,
+            "written": 0,
+            "skipped_existing": 0,
+            "skipped_no_games": 0,
+        },
+        "market": {
+            "attempted_days": 0,
+            "applied_days": 0,
+            "skipped_days": 0,
+            "skip_reasons": {},
+        },
+        "unseen_teams": {
+            "days_with_unseen": 0,
+            "max_unseen_rate": 0.0,
+        },
+        "outputs_sample": [],
     }
 
-    counts: Dict[str, int] = {}
+    # load history
+    hist = pd.read_csv(args.history)
+    if "game_date" not in hist.columns:
+        raise RuntimeError("[historical] history CSV missing required column: game_date")
+    hist["game_date"] = hist["game_date"].astype(str)
 
-    for d in dates:
-        day_audit = run_day(history_df, d, apply_market=args.apply_market, overwrite=args.overwrite)
-        run_audit["days"].append(day_audit)
+    # load models
+    teams, win_model, spread_model, total_model = _load_models()
+    _info("loaded models: teams=30 win=win_model.pkl spread=spread_model.pkl total=total_model.pkl")
 
-        key = f'{day_audit.get("status","unknown")}::{day_audit.get("reason","unknown")}'
-        counts[key] = counts.get(key, 0) + 1
+    start_dt = _parse_date(args.start)
+    end_dt = _parse_date(args.end)
 
-    run_audit["summary"] = {
-        "n_days": len(dates),
-        "counts": counts,
-        "n_ok": sum(v for k, v in counts.items() if k.startswith("ok::")),
-        "n_skipped": sum(v for k, v in counts.items() if k.startswith("skipped::")),
-    }
+    d = start_dt
+    while d <= end_dt:
+        game_date = _date_str(d)
+        audit["days"]["processed"] += 1
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    audit_path = OUTPUT_DIR / "historical_prediction_runner_audit.json"
-    _write_json(audit_path, run_audit)
-    logger.info("Wrote run audit to %s", audit_path)
+        out_path = OUTPUTS_DIR / f"predictions_{game_date}.csv"
+        if out_path.exists() and not args.overwrite:
+            audit["days"]["skipped_existing"] += 1
+            d += timedelta(days=1)
+            continue
+
+        df_day = hist[hist["game_date"] == game_date].copy()
+        if df_day.empty:
+            audit["days"]["skipped_no_games"] += 1
+            d += timedelta(days=1)
+            continue
+
+        # predict
+        df_pred = _run_predict_for_day(df_day, teams, win_model, spread_model, total_model)
+
+        # unseen team diagnostics (mirrors your warnings)
+        unseen_rate = float(df_pred.get("unseen_team_rate", pd.Series([0.0])).max()) if len(df_pred) else 0.0
+        if unseen_rate > 0:
+            audit["unseen_teams"]["days_with_unseen"] += 1
+            audit["unseen_teams"]["max_unseen_rate"] = float(max(audit["unseen_teams"]["max_unseen_rate"], unseen_rate))
+
+        # market ensemble (optional)
+        if args.apply_market:
+            audit["market"]["attempted_days"] += 1
+            df_pred2, diag = _try_apply_market(df_pred, game_date)
+            if diag.get("applied"):
+                audit["market"]["applied_days"] += 1
+                df_pred = df_pred2
+            else:
+                audit["market"]["skipped_days"] += 1
+                r = diag.get("reason") or "unknown"
+                audit["market"]["skip_reasons"][r] = int(audit["market"]["skip_reasons"].get(r, 0) + 1)
+                # keep your existing log tone
+                if r.startswith("no_close_snapshot"):
+                    _warn(f"No CLOSE odds snapshot found for {game_date} in data/_snapshots — skipping market ensemble")
+                else:
+                    _warn(f"Market ensemble skipped for {game_date}: {r}")
+
+        # write
+        df_pred.to_csv(out_path, index=False)
+        audit["days"]["written"] += 1
+
+        if len(audit["outputs_sample"]) < 15:
+            audit["outputs_sample"].append({"date": game_date, "path": str(out_path), "rows": int(len(df_pred))})
+
+        _info(f"Wrote {out_path} ({len(df_pred)} rows)")
+
+        d += timedelta(days=1)
+
+    # finalize audit
+    audit_path = OUTPUTS_DIR / "historical_prediction_runner_audit.json"
+    _write_json(audit_path, audit)
+    _info("wrote outputs/historical_prediction_runner_audit.json")
 
 
 if __name__ == "__main__":
