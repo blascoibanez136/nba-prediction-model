@@ -7,7 +7,10 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+# Supports both:
+#   - YYYY-MM-DD (e.g. 2023-10-25)
+#   - YYYYMMDD   (e.g. 20231025 in close_20231025.csv)
+DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{8})")
 
 
 @dataclass(frozen=True)
@@ -27,12 +30,34 @@ class SnapshotFileQuality:
 
 
 def parse_date_from_filename(path: str) -> Optional[str]:
+    """
+    Extract date from snapshot filename.
+
+    Accepts:
+      - YYYY-MM-DD
+      - YYYYMMDD (normalized to YYYY-MM-DD)
+
+    Examples:
+      close_20231025.csv -> 2023-10-25
+      snapshot_2023-10-25.csv -> 2023-10-25
+    """
     m = DATE_RE.search(Path(path).name)
-    return m.group(1) if m else None
+    if not m:
+        return None
+
+    s = m.group(1)
+    # Normalize YYYYMMDD -> YYYY-MM-DD
+    if len(s) == 8 and s.isdigit():
+        return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+    return s
 
 
 def safe_read_csv(path: str) -> pd.DataFrame:
-    # Keep strings stable; prevent dtype inference surprises
+    """
+    Read CSV in a stable way for audit tooling:
+      - dtype=str to prevent numeric coercion surprises
+      - keep_default_na=False to preserve empty strings
+    """
     return pd.read_csv(path, dtype=str, keep_default_na=False, na_values=[])
 
 
@@ -72,6 +97,7 @@ def compute_snapshot_quality(
         if c not in cols:
             continue
         ser = df[c]
+
         # Treat "" as missing (since we read empty strings for missing values)
         missing = (ser.astype(str).str.strip() == "").sum()
         null_rate = float(missing) / float(max(len(df), 1))
@@ -82,7 +108,8 @@ def compute_snapshot_quality(
         nun = int(nonblank[nonblank != ""].nunique(dropna=True))
         nunique[c] = nun
 
-        constant_flags[c] = (nun <= 1 and (1.0 - null_rate) > 0.5)  # constant but actually populated
+        # "constant" only if it's populated for a meaningful portion of rows
+        constant_flags[c] = (nun <= 1 and (1.0 - null_rate) > 0.5)
 
     return SnapshotFileQuality(
         file=Path(file_path).as_posix(),
