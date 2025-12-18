@@ -7,15 +7,19 @@ Main entry:
     predict_games(games_df) -> DataFrame with:
         home_win_prob, away_win_prob, fair_spread, fair_total
 
-Critical fix (Commit-3 audit-only):
-- Emit instrumentation on unseen teams to prevent silent league-average defaults.
-- Writes a deterministic sidecar JSON: outputs/audits/unseen_teams_YYYY-MM-DD.json
-  when unseen rows occur.
+Commit-3 hardened behavior:
+- Team name mapping for MODEL ENCODING now goes through TeamIndexMapper:
+    raw -> canonical franchise (ingest normalizer) -> exact team_index.json key
+  This eliminates false "unseen team" fallbacks like:
+    "los angeles clippers" vs "LA Clippers"
+
+- Audit-only unseen-team sidecar:
+    outputs/audits/unseen_teams_YYYY-MM-DD.json
+  Written only when unseen rows occur.
 
 NOTE:
-- This patch does NOT change model math.
-- This patch does NOT change prediction CSV schemas.
-- Canonicalization behavior remains unchanged (to avoid regressions).
+- No change to model math.
+- No change to prediction CSV schemas.
 """
 
 from __future__ import annotations
@@ -29,6 +33,8 @@ from typing import Dict, Optional, Tuple, List
 import numpy as np
 import pandas as pd
 from joblib import load
+
+from src.utils.team_index_mapper import TeamIndexMapper
 
 logger = logging.getLogger(__name__)
 
@@ -45,38 +51,11 @@ _win_model = None
 _spread_model = None
 _total_model = None
 
-# Common NBA naming aliases (ingest feeds often use these)
-_TEAM_ALIASES = {
-    "LA Clippers": "LA Clippers",
-    "Los Angeles Clippers": "LA Clippers",
-    "L.A. Clippers": "LA Clippers",
-    "LA Clipppers": "LA Clippers",  # common typo
-    "LA Lakers": "Los Angeles Lakers",
-    "Los Angeles Lakers": "Los Angeles Lakers",
-    "L.A. Lakers": "Los Angeles Lakers",
-    "NY Knicks": "New York Knicks",
-    "New York Knicks": "New York Knicks",
-    "BKN Nets": "Brooklyn Nets",
-    "Brooklyn Nets": "Brooklyn Nets",
-    "GS Warriors": "Golden State Warriors",
-    "Golden State Warriors": "Golden State Warriors",
-    "SA Spurs": "San Antonio Spurs",
-    "San Antonio Spurs": "San Antonio Spurs",
-    "NO Pelicans": "New Orleans Pelicans",
-    "New Orleans Pelicans": "New Orleans Pelicans",
-    "OKC Thunder": "Oklahoma City Thunder",
-    "Oklahoma City Thunder": "Oklahoma City Thunder",
-    "PHX Suns": "Phoenix Suns",
-    "Phoenix Suns": "Phoenix Suns",
-    "UTA Jazz": "Utah Jazz",
-    "Utah Jazz": "Utah Jazz",
-    "WAS Wizards": "Washington Wizards",
-    "Washington Wizards": "Washington Wizards",
-}
+_team_mapper: TeamIndexMapper | None = None
 
 
 def _load_models() -> None:
-    global _team_index, _win_model, _spread_model, _total_model
+    global _team_index, _win_model, _spread_model, _total_model, _team_mapper
     if _team_index is not None:
         return
 
@@ -89,7 +68,11 @@ def _load_models() -> None:
     if not TOTAL_MODEL_PATH.exists():
         raise FileNotFoundError(f"Missing TOTAL_MODEL_PATH: {TOTAL_MODEL_PATH}")
 
-    _team_index = json.loads(TEAM_INDEX_PATH.read_text(encoding="utf-8"))
+    # Mapper loads team_index.json internally and builds canonical->key map
+    _team_mapper = TeamIndexMapper(TEAM_INDEX_PATH)
+    _team_mapper.load()
+    _team_index = _team_mapper.team_index
+
     _win_model = load(WIN_MODEL_PATH)
     _spread_model = load(SPREAD_MODEL_PATH)
     _total_model = load(TOTAL_MODEL_PATH)
@@ -103,42 +86,7 @@ def _load_models() -> None:
     )
 
 
-def _normalize_team_name(name: object) -> Optional[str]:
-    """
-    Canonicalize team names to match team_index.json keys.
-
-    Strategy:
-    1) strip whitespace
-    2) apply alias map
-    3) if exact key exists -> return
-    4) else try case-insensitive match against keys
-    """
-    if name is None:
-        return None
-    s = str(name).strip()
-    if not s:
-        return None
-
-    # apply alias map first (preserves canonical capitalization)
-    s2 = _TEAM_ALIASES.get(s, s)
-
-    # exact match
-    if _team_index is not None and s2 in _team_index:
-        return s2
-
-    # case-insensitive match to existing keys
-    if _team_index is not None:
-        target = s2.lower()
-        for k in _team_index.keys():
-            if k.lower() == target:
-                return k
-
-    # no match
-    return s2
-
-
 def _validate_team_index_keys() -> None:
-    # Simple sanity check to avoid weird mismatches
     assert _team_index is not None
     if len(_team_index) < 25:
         raise RuntimeError(f"[predict] team_index.json seems wrong (only {len(_team_index)} teams).")
@@ -158,8 +106,6 @@ def _write_unseen_sidecar(
     Audit-only sidecar for unseen team events.
 
     Writes: outputs/audits/unseen_teams_YYYY-MM-DD.json
-
-    Does NOT affect predictions, schemas, or model math.
     """
     audits_dir = ROOT_DIR / "outputs" / "audits"
     audits_dir.mkdir(parents=True, exist_ok=True)
@@ -188,6 +134,7 @@ def _make_team_diff_features(df: pd.DataFrame) -> Tuple[np.ndarray, int, List[di
       X, n_unseen_rows, unseen_details
     """
     assert _team_index is not None, "Models not loaded. Call _load_models() first."
+    assert _team_mapper is not None, "TeamIndexMapper not loaded."
     _validate_team_index_keys()
 
     n_teams = len(_team_index)
@@ -196,16 +143,16 @@ def _make_team_diff_features(df: pd.DataFrame) -> Tuple[np.ndarray, int, List[di
     unseen_rows = 0
     unseen_details: List[dict] = []
 
-    # normalize to canonical team keys
-    home_norm = df["home_team"].apply(_normalize_team_name)
-    away_norm = df["away_team"].apply(_normalize_team_name)
+    # Map raw team names -> exact team_index keys (or deterministic fallback)
+    home_key = df["home_team"].apply(_team_mapper.to_team_index_key)
+    away_key = df["away_team"].apply(_team_mapper.to_team_index_key)
 
-    for i, (home, away) in enumerate(zip(home_norm, away_norm)):
+    for i, (home, away) in enumerate(zip(home_key, away_key)):
         hi = _team_index.get(home) if home is not None else None
         ai = _team_index.get(away) if away is not None else None
 
         if hi is None or ai is None:
-            # Unseen team => leave row zeros aside from bias (league-average fallback)
+            # Unseen team => league-average fallback row
             unseen_rows += 1
             X[i, -1] = 1.0
 
@@ -215,7 +162,6 @@ def _make_team_diff_features(df: pd.DataFrame) -> Tuple[np.ndarray, int, List[di
             if ai is None:
                 missing.append(str(away))
 
-            # Capture raw + normalized + which team keys were missing
             try:
                 home_raw = str(df.iloc[i]["home_team"])
                 away_raw = str(df.iloc[i]["away_team"])
@@ -314,7 +260,7 @@ def predict_games(games_df: pd.DataFrame) -> pd.DataFrame:
     out["fair_spread"] = -margins
     out["fair_total"] = totals
 
-    # Instrumentation: detect degenerate constant outputs (this is what bit us)
+    # Instrumentation: detect degenerate constant outputs
     nun_p = int(pd.Series(out["home_win_prob"]).nunique(dropna=True))
     nun_s = int(pd.Series(out["fair_spread"]).nunique(dropna=True))
     nun_t = int(pd.Series(out["fair_total"]).nunique(dropna=True))
