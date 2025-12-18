@@ -233,4 +233,3 @@ def predict_games(games_df: pd.DataFrame) -> pd.DataFrame:
         logger.warning("[predict] fair_total appears constant (nunique=%d). Totals will be weak/unsafe.", nun_t)
 
     return out
-
