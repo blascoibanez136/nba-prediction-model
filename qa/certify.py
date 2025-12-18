@@ -1,59 +1,86 @@
-"""QA entrypoint: run historical prediction runner, then backtest.
-
-Commit-2 goal:
-- Provide a single command to certify the pipeline works end-to-end in a fresh environment.
-- Historical runner must produce per-day CSVs.
-- Backtest must join those CSVs to history/results and emit metrics without crashing.
-
-Note: Backtest is intentionally tolerant of missing score columns; it will still emit an audit + metrics
-with status=missing_score_columns rather than failing the run.
+#!/usr/bin/env python3
 """
+QA certify script (Commit 2).
 
+Runs:
+  1) historical_prediction_runner to generate daily predictions
+  2) backtest to join predictions with history + compute basic metrics
+
+Usability goals:
+- If you run `python qa/certify.py` from repo root, it should "just work" with sensible defaults.
+- You can override paths/ranges via flags.
+"""
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 from pathlib import Path
 
 
-REPO_DIR = Path(__file__).resolve().parents[1]
-
-
 def _run(cmd: list[str]) -> None:
     print(f"[certify] $ {' '.join(cmd)}")
-    subprocess.check_call(cmd)
+    subprocess.check_call(cmd, env={**os.environ, "PYTHONPATH": os.environ.get("PYTHONPATH", ".")})
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--history", required=True, help="Path to games history CSV.")
-    ap.add_argument("--start", required=True)
-    ap.add_argument("--end", required=True)
-    ap.add_argument("--apply-market", action="store_true")
-    ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--history", default="data/history/games_2019_2024.csv", help="Historical games CSV")
+    ap.add_argument("--start", default="2023-10-24", help="YYYY-MM-DD")
+    ap.add_argument("--end", default="2024-04-14", help="YYYY-MM-DD (inclusive)")
+    ap.add_argument("--pred-dir", default="outputs", help="Where historical runner writes prediction files")
+    ap.add_argument("--snapshot-dir", default="data/_snapshots", help="Odds snapshots directory (close_YYYYMMDD.csv)")
+    ap.add_argument("--apply-market", action="store_true", help="Apply market close snapshots to prediction files")
+    ap.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
+    ap.add_argument("--pattern", default="predictions_*.csv", help="Glob pattern for pred files")
+    ap.add_argument("--prob-col", default="home_win_prob")
+    ap.add_argument("--spread-col", default="fair_spread")
+    ap.add_argument("--total-col", default="fair_total")
     args = ap.parse_args()
 
-    py = "/usr/bin/python3"
-
+    # 1) Historical predictions
     _run([
-        py, "-m", "src.eval.historical_prediction_runner",
-        "--history", args.history,
-        "--start", args.start,
-        "--end", args.end,
+        os.environ.get("PYTHON", "python"),
+        "-m",
+        "src.eval.historical_prediction_runner",
+        "--history",
+        args.history,
+        "--start",
+        args.start,
+        "--end",
+        args.end,
+        "--out-dir",
+        args.pred_dir,
+        "--snapshot-dir",
+        args.snapshot_dir,
         *(["--apply-market"] if args.apply_market else []),
         *(["--overwrite"] if args.overwrite else []),
     ])
 
+    # 2) Backtest join + metrics
     _run([
-        py, "-m", "src.eval.backtest",
-        "--pred-dir", str(REPO_DIR / "outputs"),
-        "--history", args.history,
-        "--start", args.start,
-        "--end", args.end,
-        "--prob-col", "home_win_prob",
-        "--spread-col", "fair_spread",
-        "--total-col", "fair_total",
+        os.environ.get("PYTHON", "python"),
+        "-m",
+        "src.eval.backtest",
+        "--pred-dir",
+        args.pred_dir,
+        "--pattern",
+        args.pattern,
+        "--history",
+        args.history,
+        "--start",
+        args.start,
+        "--end",
+        args.end,
+        "--prob-col",
+        args.prob_col,
+        "--spread-col",
+        args.spread_col,
+        "--total-col",
+        args.total_col,
     ])
+
+    print("[certify] ✅ Done")
 
 
 if __name__ == "__main__":
