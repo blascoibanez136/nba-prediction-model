@@ -1,328 +1,321 @@
+"""Backtest predictions against historical results.
+
+Commit-2 goal:
+- Join per-day prediction CSVs produced by historical_prediction_runner with a results/history CSV.
+- Be resilient to different column names across data sources (balldontlie, custom exports).
+- Never crash on missing score columns; emit an audit + metrics with clear warnings.
+
+Expected prediction columns:
+- game_id (preferred) or id
+- home_team / away_team (optional)
+- home_win_prob, fair_spread, fair_total (configurable via CLI)
+
+Expected results/history columns:
+- game_id or id
+- date (or game_date)
+- final scores (column names vary; we auto-detect)
+"""
+
 from __future__ import annotations
 
 import argparse
+import glob
 import json
-import math
-from dataclasses import asdict, dataclass
+from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_HISTORY = REPO_ROOT / "data" / "history" / "games_2019_2024.csv"
-DEFAULT_PRED_DIR = REPO_ROOT / "outputs"
-DEFAULT_TEAM_INDEX = REPO_ROOT / "models" / "team_index.json"
-DEFAULT_OUT_DIR = REPO_ROOT / "outputs"
-DEFAULT_AUDIT_PATH = DEFAULT_OUT_DIR / "backtest_join_audit.json"
-DEFAULT_METRICS_PATH = DEFAULT_OUT_DIR / "backtest_metrics.json"
+REPO_DIR = Path(__file__).resolve().parents[2]
+DEFAULT_OUT_DIR = REPO_DIR / "outputs"
 
 
-ALIASES = {
-    "LA Clippers": "Los Angeles Clippers",
-    "LA Lakers": "Los Angeles Lakers",
-    "NY Knicks": "New York Knicks",
-    "GS Warriors": "Golden State Warriors",
-    "G.S. Warriors": "Golden State Warriors",
-    "Nets": "Brooklyn Nets",
-    "Knicks": "New York Knicks",
-    "Spurs": "San Antonio Spurs",
-    "Mavs": "Dallas Mavericks",
-    "Wolves": "Minnesota Timberwolves",
-    "Blazers": "Portland Trail Blazers",
-    "Sixers": "Philadelphia 76ers",
-    "Suns": "Phoenix Suns",
-    "Bucks": "Milwaukee Bucks",
-    "Cavs": "Cleveland Cavaliers",
-    "Pels": "New Orleans Pelicans",
-}
+def _parse_date(s: str) -> date:
+    return datetime.strptime(s, "%Y-%m-%d").date()
 
 
-@dataclass
-class JoinAudit:
-    pred_dir: str
-    history_path: str
-    start: str
-    end: str
-    pred_files: int
-    pred_rows: int
-    history_rows: int
-    joined_rows: int
-    missing_pred_rows: int
-    missing_result_rows: int
-    duplicate_keys_pred: int
-    duplicate_keys_hist: int
-    notes: list[str]
-
-
-@dataclass
-class Metrics:
-    n_games: int
-    win_prob_brier: Optional[float]
-    win_prob_logloss: Optional[float]
-    spread_mae: Optional[float]
-    total_mae: Optional[float]
-    ats_accuracy: Optional[float]
-    ou_accuracy: Optional[float]
-
-
-def _read_team_index(path: Path) -> Dict[str, int]:
-    try:
-        obj = json.loads(path.read_text())
-    except Exception:
-        return {}
-    if isinstance(obj, dict) and all(isinstance(v, (int, float)) for v in obj.values()):
-        return {str(k): int(v) for k, v in obj.items()}
-    return {}
-
-
-def _norm_team(name: str) -> str:
-    if name is None or (isinstance(name, float) and math.isnan(name)):
-        return ""
-    s = str(name).strip()
-    s = " ".join(s.split())
-    return ALIASES.get(s, s)
-
-
-def _ensure_date(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_date_col(df: pd.DataFrame) -> pd.DataFrame:
     if "date" in df.columns:
-        col = "date"
-    elif "game_date" in df.columns:
-        col = "game_date"
-    elif "gameDate" in df.columns:
-        col = "gameDate"
-    else:
-        raise RuntimeError("Missing date column in input.")
-    out = df.copy()
-    out[col] = pd.to_datetime(out[col]).dt.date
-    out = out.rename(columns={col: "game_date"})
-    return out
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        return df
+    if "game_date" in df.columns:
+        df["date"] = pd.to_datetime(df["game_date"]).dt.date
+        return df
+    if "start_time" in df.columns:
+        df["date"] = pd.to_datetime(df["start_time"]).dt.date
+        return df
+    return df
 
 
-def _ensure_teams(df: pd.DataFrame, home_col: str, away_col: str) -> pd.DataFrame:
-    out = df.copy()
-    if home_col not in out.columns:
-        raise RuntimeError(f"Missing {home_col} column.")
-    if away_col not in out.columns:
-        raise RuntimeError(f"Missing {away_col} column.")
-    out["home_team"] = out[home_col].apply(_norm_team)
-    out["away_team"] = out[away_col].apply(_norm_team)
-    return out
+def _pick_id_col(df: pd.DataFrame) -> str:
+    if "game_id" in df.columns:
+        return "game_id"
+    if "id" in df.columns:
+        return "id"
+    raise ValueError(f"No join id column found. Columns={list(df.columns)}")
 
 
-def _load_predictions(pred_dir: Path, start_d, end_d) -> pd.DataFrame:
-    files = sorted(pred_dir.glob("predictions_*.csv"))
-    rows = []
+def _resolve_score_cols(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
+    """Try to find home/away final score columns in a merged dataframe."""
+    home_candidates = [
+        "home_score", "home_team_score", "home_points", "home_pts",
+        "home_score_hist", "home_team_score_hist", "home_points_hist", "home_pts_hist",
+        "home_score_y", "home_team_score_y", "home_points_y", "home_pts_y",
+    ]
+    away_candidates = [
+        "away_score", "visitor_score", "away_team_score", "away_points", "away_pts",
+        "away_score_hist", "visitor_score_hist", "away_team_score_hist", "away_points_hist", "away_pts_hist",
+        "away_score_y", "visitor_score_y", "away_team_score_y", "away_points_y", "away_pts_y",
+    ]
+
+    home = next((c for c in home_candidates if c in df.columns), None)
+    away = next((c for c in away_candidates if c in df.columns), None)
+    return home, away
+
+
+def _load_results(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df = _normalize_date_col(df)
+
+    # normalize id naming
+    if "game_id" not in df.columns and "id" in df.columns:
+        pass
+    elif "id" not in df.columns and "game_id" in df.columns:
+        pass
+
+    return df
+
+
+def _load_predictions(pred_dir: Path, pattern: str) -> pd.DataFrame:
+    files = sorted(Path(pred_dir).glob(pattern))
+    if not files:
+        # fallback patterns
+        for pat in ["predictions_*.csv", "predictions_*_market.csv"]:
+            files = sorted(Path(pred_dir).glob(pat))
+            if files:
+                break
+
+    if not files:
+        raise FileNotFoundError(f"No prediction files found in {pred_dir} with pattern {pattern}")
+
+    dfs = []
     for f in files:
         try:
             df = pd.read_csv(f)
+            df["__pred_file"] = str(f)
+            dfs.append(df)
         except Exception:
             continue
-        df = _ensure_date(df)
-        df = df[(df["game_date"] >= start_d) & (df["game_date"] <= end_d)]
-        if df.empty:
-            continue
-        df = _ensure_teams(df, "home_team", "away_team")
-        rows.append(df)
-    if not rows:
-        raise RuntimeError(f"No prediction files matched the date window in {pred_dir}.")
-    return pd.concat(rows, ignore_index=True)
+
+    if not dfs:
+        raise FileNotFoundError(f"Could not read any prediction CSVs from {pred_dir}")
+
+    out = pd.concat(dfs, ignore_index=True)
+    return out
 
 
-def _load_history(history_path: Path, start_d, end_d) -> pd.DataFrame:
-    df = pd.read_csv(history_path)
-    df = _ensure_date(df)
-
-    if "home_team" not in df.columns:
-        for alt in ["homeTeam", "HOME_TEAM", "home"]:
-            if alt in df.columns:
-                df = df.rename(columns={alt: "home_team"})
-                break
-    if "away_team" not in df.columns:
-        for alt in ["visitor_team", "awayTeam", "VISITOR_TEAM", "away", "visitor"]:
-            if alt in df.columns:
-                df = df.rename(columns={alt: "away_team"})
-                break
-    df = _ensure_teams(df, "home_team", "away_team")
-
-    if "home_score" not in df.columns:
-        for alt in ["home_points", "home_pts", "HOME_SCORE", "homeScore"]:
-            if alt in df.columns:
-                df = df.rename(columns={alt: "home_score"})
-                break
-    if "away_score" not in df.columns:
-        for alt in ["visitor_score", "away_points", "away_pts", "AWAY_SCORE", "awayScore", "visitor_points"]:
-            if alt in df.columns:
-                df = df.rename(columns={alt: "away_score"})
-                break
-    if "home_score" not in df.columns or "away_score" not in df.columns:
-        raise RuntimeError("History CSV must include home_score and away_score columns (or common variants).")
-
-    return df[(df["game_date"] >= start_d) & (df["game_date"] <= end_d)].copy()
+def _brier(y_true: np.ndarray, p: np.ndarray) -> float:
+    return float(np.mean((p - y_true) ** 2))
 
 
-def _brier(y: np.ndarray, p: np.ndarray) -> float:
-    p = np.clip(p, 1e-6, 1 - 1e-6)
-    return float(np.mean((y - p) ** 2))
+def _rmse(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.sqrt(np.mean((a - b) ** 2)))
 
 
-def _logloss(y: np.ndarray, p: np.ndarray) -> float:
-    p = np.clip(p, 1e-6, 1 - 1e-6)
-    return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pred-dir", required=True, help="Directory containing prediction CSVs.")
+    ap.add_argument("--pattern", default="predictions_*.csv", help="Glob pattern for prediction files.")
+    ap.add_argument("--history", dest="history", default=None, help="Results/history CSV path (alias for --results).")
+    ap.add_argument("--results", dest="results", default=None, help="Results CSV path (historical games).")
+    ap.add_argument("--start", required=True, help="Start date YYYY-MM-DD (inclusive).")
+    ap.add_argument("--end", required=True, help="End date YYYY-MM-DD (inclusive).")
+    ap.add_argument("--prob-col", default="home_win_prob", help="Probability column for win-prob metrics.")
+    ap.add_argument("--spread-col", default="fair_spread", help="Spread column for error metrics.")
+    ap.add_argument("--total-col", default="fair_total", help="Total column for error metrics.")
+    ap.add_argument("--metrics-path", default=str(DEFAULT_OUT_DIR / "backtest_metrics.json"))
+    ap.add_argument("--calib-path", default=str(DEFAULT_OUT_DIR / "backtest_calibration.csv"))
+    ap.add_argument("--per-game-path", default=str(DEFAULT_OUT_DIR / "backtest_per_game.csv"))
+    args = ap.parse_args()
 
-
-def _mae(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.mean(np.abs(a - b)))
-
-
-def main(argv: Optional[list[str]] = None) -> None:
-    p = argparse.ArgumentParser(description="Join daily prediction files to results and compute simple backtest metrics.")
-    p.add_argument("--pred-dir", type=str, default=str(DEFAULT_PRED_DIR), help="Directory containing predictions_*.csv.")
-    p.add_argument("--history", type=str, default=str(DEFAULT_HISTORY), help="Games history CSV (must include scores).")
-    p.add_argument("--start", type=str, required=True, help="Start date YYYY-MM-DD (inclusive).")
-    p.add_argument("--end", type=str, required=True, help="End date YYYY-MM-DD (inclusive).")
-    p.add_argument("--team-index", type=str, default=str(DEFAULT_TEAM_INDEX), help="team_index.json used for unseen-team checks.")
-    p.add_argument("--prob-col", type=str, default="home_win_prob", help="Column in predictions for home win probability.")
-    p.add_argument("--spread-col", type=str, default="fair_spread", help="Column in predictions for predicted/fair spread (home - away).")
-    p.add_argument("--total-col", type=str, default="fair_total", help="Column in predictions for predicted/fair total.")
-    p.add_argument("--audit-path", type=str, default=str(DEFAULT_AUDIT_PATH), help="Path to write join audit JSON.")
-    p.add_argument("--metrics-path", type=str, default=str(DEFAULT_METRICS_PATH), help="Path to write metrics JSON.")
-    args = p.parse_args(argv)
+    results_path = Path(args.history or args.results) if (args.history or args.results) else None
+    if results_path is None:
+        raise SystemExit("Must provide --history or --results")
 
     pred_dir = Path(args.pred_dir)
-    history_path = Path(args.history)
-    audit_path = Path(args.audit_path)
-    metrics_path = Path(args.metrics_path)
+    start = _parse_date(args.start)
+    end = _parse_date(args.end)
 
-    start_d = pd.to_datetime(args.start).date()
-    end_d = pd.to_datetime(args.end).date()
+    preds = _load_predictions(pred_dir, args.pattern)
+    results = _load_results(results_path)
 
-    team_index = _read_team_index(Path(args.team_index))
-    notes: list[str] = []
-    if not team_index:
-        notes.append("team_index_missing_or_unreadable")
+    preds_id = _pick_id_col(preds)
+    results_id = _pick_id_col(results)
 
-    df_pred = _load_predictions(pred_dir, start_d, end_d)
-    df_hist = _load_history(history_path, start_d, end_d)
+    # Normalize ids to string to avoid int/str mismatches
+    preds[preds_id] = preds[preds_id].astype(str)
+    results[results_id] = results[results_id].astype(str)
 
-    if team_index:
-        pred_teams = set(df_pred["home_team"]).union(set(df_pred["away_team"]))
-        unseen = sorted([t for t in pred_teams if t and t not in team_index])
-        if unseen:
-            notes.append(f"unseen_teams_in_predictions:{len(unseen)}")
-            notes.append("unseen_teams_sample:" + ",".join(unseen[:10]))
+    # Filter results to date range if possible
+    if "date" in results.columns:
+        results = results[(results["date"] >= start) & (results["date"] <= end)].copy()
 
-    key_cols = ["game_date", "home_team", "away_team"]
-    dup_pred = int(df_pred.duplicated(subset=key_cols).sum())
-    dup_hist = int(df_hist.duplicated(subset=key_cols).sum())
-
-    df_pred_u = df_pred.drop_duplicates(subset=key_cols, keep="last")
-    df_hist_u = df_hist.drop_duplicates(subset=key_cols, keep="last")
-
-    joined = df_pred_u.merge(df_hist_u, on=key_cols, how="outer", indicator=True)
-    missing_pred = int((joined["_merge"] == "right_only").sum())
-    missing_res = int((joined["_merge"] == "left_only").sum())
-    joined_ok = joined[joined["_merge"] == "both"].copy()
-
-    audit = JoinAudit(
-        pred_dir=str(pred_dir),
-        history_path=str(history_path),
-        start=str(start_d),
-        end=str(end_d),
-        pred_files=len(list(pred_dir.glob("predictions_*.csv"))),
-        pred_rows=int(df_pred.shape[0]),
-        history_rows=int(df_hist.shape[0]),
-        joined_rows=int(joined_ok.shape[0]),
-        missing_pred_rows=missing_pred,
-        missing_result_rows=missing_res,
-        duplicate_keys_pred=dup_pred,
-        duplicate_keys_hist=dup_hist,
-        notes=notes,
+    # Merge: keep history score columns clearly
+    joined = preds.merge(
+        results,
+        how="left",
+        left_on=preds_id,
+        right_on=results_id,
+        suffixes=("_pred", "_hist"),
     )
-    audit_path.parent.mkdir(parents=True, exist_ok=True)
-    audit_path.write_text(json.dumps(asdict(audit), indent=2))
+
+    # Basic join audit
+    join_ok = joined[~joined[results_id].isna()].copy()
+    audit = {
+        "pred_dir": str(pred_dir),
+        "pattern": args.pattern,
+        "results": str(results_path),
+        "start": args.start,
+        "end": args.end,
+        "pred_rows": int(len(preds)),
+        "results_rows": int(len(results)),
+        "joined_rows": int(len(joined)),
+        "joined_ok_rows": int(len(join_ok)),
+        "missing_results_rows": int(len(joined) - len(join_ok)),
+        "prob_col": args.prob_col,
+        "spread_col": args.spread_col,
+        "total_col": args.total_col,
+    }
+    audit_path = Path(args.metrics_path).with_name("backtest_join_audit.json")
+    audit_path.write_text(json.dumps(audit, indent=2))
     print(f"[backtest] wrote {audit_path}")
 
-    n_games = int(joined_ok.shape[0])
+    # Resolve final score cols
+    home_sc, away_sc = _resolve_score_cols(join_ok)
+    if home_sc is None or away_sc is None:
+        metrics = {
+            "status": "missing_score_columns",
+            "message": "Could not auto-detect home/away score columns in joined data; metrics skipped.",
+            "home_score_col": home_sc,
+            "away_score_col": away_sc,
+            "n_games": int(len(join_ok)),
+        }
+        Path(args.metrics_path).write_text(json.dumps(metrics, indent=2))
+        print(f"[backtest][WARNING] Missing score columns; wrote {args.metrics_path} and exiting 0.")
+        return
 
-    win_prob_brier = None
-    win_prob_logloss = None
-    if args.prob_col in joined_ok.columns:
-        p_home = pd.to_numeric(joined_ok[args.prob_col], errors="coerce").to_numpy()
-        y_home = (
-            pd.to_numeric(joined_ok["home_score"], errors="coerce")
-            > pd.to_numeric(joined_ok["away_score"], errors="coerce")
-        ).astype(int).to_numpy()
-        mask = np.isfinite(p_home) & np.isfinite(y_home)
-        if mask.any():
-            win_prob_brier = _brier(y_home[mask], p_home[mask])
-            win_prob_logloss = _logloss(y_home[mask], p_home[mask])
+    # Build targets
+    home_score = pd.to_numeric(join_ok[home_sc], errors="coerce")
+    away_score = pd.to_numeric(join_ok[away_sc], errors="coerce")
+    valid_scores = home_score.notna() & away_score.notna()
+    join_ok = join_ok[valid_scores].copy()
+    home_score = home_score[valid_scores]
+    away_score = away_score[valid_scores]
 
-    spread_mae = None
-    if args.spread_col in joined_ok.columns:
-        pred_spread = pd.to_numeric(joined_ok[args.spread_col], errors="coerce").to_numpy()
-        actual_spread = (
-            pd.to_numeric(joined_ok["home_score"], errors="coerce")
-            - pd.to_numeric(joined_ok["away_score"], errors="coerce")
-        ).to_numpy()
-        mask = np.isfinite(pred_spread) & np.isfinite(actual_spread)
-        if mask.any():
-            spread_mae = _mae(actual_spread[mask], pred_spread[mask])
+    if len(join_ok) == 0:
+        metrics = {
+            "status": "no_scored_games",
+            "message": "Joined rows exist but none have valid numeric final scores; metrics skipped.",
+            "home_score_col": home_sc,
+            "away_score_col": away_sc,
+            "n_games": 0,
+        }
+        Path(args.metrics_path).write_text(json.dumps(metrics, indent=2))
+        print(f"[backtest][WARNING] No scored games; wrote {args.metrics_path} and exiting 0.")
+        return
 
-    total_mae = None
-    if args.total_col in joined_ok.columns:
-        pred_total = pd.to_numeric(joined_ok[args.total_col], errors="coerce").to_numpy()
-        actual_total = (
-            pd.to_numeric(joined_ok["home_score"], errors="coerce")
-            + pd.to_numeric(joined_ok["away_score"], errors="coerce")
-        ).to_numpy()
-        mask = np.isfinite(pred_total) & np.isfinite(actual_total)
-        if mask.any():
-            total_mae = _mae(actual_total[mask], pred_total[mask])
+    y_win = (home_score > away_score).astype(int).to_numpy()
 
-    ats_accuracy = None
-    if "spread" in joined_ok.columns and args.spread_col in joined_ok.columns:
-        line = pd.to_numeric(joined_ok["spread"], errors="coerce").to_numpy()
-        pred = pd.to_numeric(joined_ok[args.spread_col], errors="coerce").to_numpy()
-        actual = (
-            pd.to_numeric(joined_ok["home_score"], errors="coerce")
-            - pd.to_numeric(joined_ok["away_score"], errors="coerce")
-        ).to_numpy()
-        mask = np.isfinite(line) & np.isfinite(pred) & np.isfinite(actual)
-        if mask.any():
-            bet_home = pred[mask] < line[mask]
-            home_covers = actual[mask] > line[mask]
-            ats_accuracy = float(np.mean(bet_home == home_covers))
+    per_game = join_ok[[c for c in join_ok.columns if c not in []]].copy()
+    per_game["home_score_final"] = home_score.to_numpy()
+    per_game["away_score_final"] = away_score.to_numpy()
+    per_game["home_win_actual"] = y_win
 
-    ou_accuracy = None
-    if "total" in joined_ok.columns and args.total_col in joined_ok.columns:
-        line = pd.to_numeric(joined_ok["total"], errors="coerce").to_numpy()
-        pred = pd.to_numeric(joined_ok[args.total_col], errors="coerce").to_numpy()
-        actual = (
-            pd.to_numeric(joined_ok["home_score"], errors="coerce")
-            + pd.to_numeric(joined_ok["away_score"], errors="coerce")
-        ).to_numpy()
-        mask = np.isfinite(line) & np.isfinite(pred) & np.isfinite(actual)
-        if mask.any():
-            bet_over = pred[mask] > line[mask]
-            over_hits = actual[mask] > line[mask]
-            ou_accuracy = float(np.mean(bet_over == over_hits))
+    metrics: Dict[str, object] = {
+        "status": "ok",
+        "n_games": int(len(join_ok)),
+        "home_score_col": home_sc,
+        "away_score_col": away_sc,
+    }
 
-    metrics = Metrics(
-        n_games=n_games,
-        win_prob_brier=win_prob_brier,
-        win_prob_logloss=win_prob_logloss,
-        spread_mae=spread_mae,
-        total_mae=total_mae,
-        ats_accuracy=ats_accuracy,
-        ou_accuracy=ou_accuracy,
-    )
-    metrics_path.parent.mkdir(parents=True, exist_ok=True)
-    metrics_path.write_text(json.dumps(asdict(metrics), indent=2))
-    print(f"[backtest] wrote {metrics_path}")
+    # Win prob metrics
+    if args.prob_col in join_ok.columns:
+        p = pd.to_numeric(join_ok[args.prob_col], errors="coerce").clip(0, 1)
+        ok = p.notna()
+        if ok.any():
+            metrics["brier"] = _brier(y_win[ok.to_numpy()], p[ok].to_numpy())
+            metrics["logloss"] = float(
+                -np.mean(y_win[ok.to_numpy()] * np.log(np.clip(p[ok].to_numpy(), 1e-9, 1 - 1e-9)) +
+                         (1 - y_win[ok.to_numpy()]) * np.log(np.clip(1 - p[ok].to_numpy(), 1e-9, 1 - 1e-9)))
+            )
+            per_game["p_home_win"] = p
+        else:
+            metrics["brier"] = None
+            metrics["logloss"] = None
+    else:
+        metrics["brier"] = None
+        metrics["logloss"] = None
+
+    # Spread metrics (model fair spread vs actual margin)
+    if args.spread_col in join_ok.columns:
+        fair_spread = pd.to_numeric(join_ok[args.spread_col], errors="coerce")
+        actual_margin = (home_score - away_score).to_numpy()
+        ok = fair_spread.notna().to_numpy()
+        if ok.any():
+            metrics["spread_rmse"] = _rmse(fair_spread.to_numpy()[ok], actual_margin[ok])
+            metrics["spread_mae"] = float(np.mean(np.abs(fair_spread.to_numpy()[ok] - actual_margin[ok])))
+            per_game["actual_margin"] = actual_margin
+            per_game["fair_spread"] = fair_spread
+        else:
+            metrics["spread_rmse"] = None
+            metrics["spread_mae"] = None
+    else:
+        metrics["spread_rmse"] = None
+        metrics["spread_mae"] = None
+
+    # Total metrics (model fair total vs actual total)
+    if args.total_col in join_ok.columns:
+        fair_total = pd.to_numeric(join_ok[args.total_col], errors="coerce")
+        actual_total = (home_score + away_score).to_numpy()
+        ok = fair_total.notna().to_numpy()
+        if ok.any():
+            metrics["total_rmse"] = _rmse(fair_total.to_numpy()[ok], actual_total[ok])
+            metrics["total_mae"] = float(np.mean(np.abs(fair_total.to_numpy()[ok] - actual_total[ok])))
+            per_game["actual_total"] = actual_total
+            per_game["fair_total"] = fair_total
+        else:
+            metrics["total_rmse"] = None
+            metrics["total_mae"] = None
+    else:
+        metrics["total_rmse"] = None
+        metrics["total_mae"] = None
+
+    # Calibration table (10 bins)
+    calib_path = Path(args.calib_path)
+    if args.prob_col in join_ok.columns and "p_home_win" in per_game.columns:
+        p = per_game["p_home_win"].astype(float)
+        bins = np.linspace(0, 1, 11)
+        per_game["prob_bin"] = pd.cut(p, bins=bins, include_lowest=True)
+        calib = (
+            per_game.groupby("prob_bin", observed=False)
+            .agg(n=("home_win_actual", "size"), p_mean=("p_home_win", "mean"), win_rate=("home_win_actual", "mean"))
+            .reset_index()
+        )
+        calib.to_csv(calib_path, index=False)
+    else:
+        # write empty file for consistent downstream expectations
+        pd.DataFrame(columns=["prob_bin", "n", "p_mean", "win_rate"]).to_csv(calib_path, index=False)
+
+    # Write per-game and metrics
+    Path(args.per_game_path).parent.mkdir(parents=True, exist_ok=True)
+    per_game.to_csv(Path(args.per_game_path), index=False)
+    Path(args.metrics_path).write_text(json.dumps(metrics, indent=2))
+    print(f"[backtest] wrote {args.metrics_path}")
 
 
 if __name__ == "__main__":
     main()
+
