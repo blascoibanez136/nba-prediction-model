@@ -7,17 +7,24 @@ Main entry:
     predict_games(games_df) -> DataFrame with:
         home_win_prob, away_win_prob, fair_spread, fair_total
 
-Critical fix:
-- Canonicalize team names to match models/team_index.json keys.
+Critical fix (Commit-3 audit-only):
 - Emit instrumentation on unseen teams to prevent silent league-average defaults.
+- Writes a deterministic sidecar JSON: outputs/audits/unseen_teams_YYYY-MM-DD.json
+  when unseen rows occur.
+
+NOTE:
+- This patch does NOT change model math.
+- This patch does NOT change prediction CSV schemas.
+- Canonicalization behavior remains unchanged (to avoid regressions).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -137,13 +144,48 @@ def _validate_team_index_keys() -> None:
         raise RuntimeError(f"[predict] team_index.json seems wrong (only {len(_team_index)} teams).")
 
 
-def _make_team_diff_features(df: pd.DataFrame) -> Tuple[np.ndarray, int]:
+def _sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _write_unseen_sidecar(
+    *,
+    game_date: str,
+    unseen_rows: List[dict],
+    team_index_keys: List[str],
+) -> None:
+    """
+    Audit-only sidecar for unseen team events.
+
+    Writes: outputs/audits/unseen_teams_YYYY-MM-DD.json
+
+    Does NOT affect predictions, schemas, or model math.
+    """
+    audits_dir = ROOT_DIR / "outputs" / "audits"
+    audits_dir.mkdir(parents=True, exist_ok=True)
+
+    keys_norm = sorted({str(k).strip() for k in team_index_keys if str(k).strip()})
+    payload = {
+        "game_date": game_date,
+        "unseen_rows_count": len(unseen_rows),
+        "unseen_rows": unseen_rows[:500],  # cap for safety
+        "team_index_keys_count": len(keys_norm),
+        "team_index_keys_sample": keys_norm[:50],
+        "team_index_keys_sha256": _sha256_text("|".join(keys_norm)) if keys_norm else None,
+    }
+
+    out_path = audits_dir / f"unseen_teams_{game_date}.json"
+    out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    logger.info("[predict] wrote unseen-teams sidecar: %s", out_path.as_posix())
+
+
+def _make_team_diff_features(df: pd.DataFrame) -> Tuple[np.ndarray, int, List[dict]]:
     """
     Same encoding as in train_model.make_team_diff_features:
       +1 for home team, -1 for away team, +1 bias for home court.
 
     Returns:
-      X, n_unseen_rows
+      X, n_unseen_rows, unseen_details
     """
     assert _team_index is not None, "Models not loaded. Call _load_models() first."
     _validate_team_index_keys()
@@ -152,6 +194,7 @@ def _make_team_diff_features(df: pd.DataFrame) -> Tuple[np.ndarray, int]:
     X = np.zeros((len(df), n_teams + 1), dtype=float)
 
     unseen_rows = 0
+    unseen_details: List[dict] = []
 
     # normalize to canonical team keys
     home_norm = df["home_team"].apply(_normalize_team_name)
@@ -165,13 +208,51 @@ def _make_team_diff_features(df: pd.DataFrame) -> Tuple[np.ndarray, int]:
             # Unseen team => leave row zeros aside from bias (league-average fallback)
             unseen_rows += 1
             X[i, -1] = 1.0
+
+            missing = []
+            if hi is None:
+                missing.append(str(home))
+            if ai is None:
+                missing.append(str(away))
+
+            # Capture raw + normalized + which team keys were missing
+            try:
+                home_raw = str(df.iloc[i]["home_team"])
+                away_raw = str(df.iloc[i]["away_team"])
+            except Exception:
+                home_raw = ""
+                away_raw = ""
+
+            unseen_details.append(
+                {
+                    "row_index": int(i),
+                    "home_team_raw": home_raw,
+                    "away_team_raw": away_raw,
+                    "home_team_norm": None if home is None else str(home),
+                    "away_team_norm": None if away is None else str(away),
+                    "missing_team_keys": missing,
+                }
+            )
             continue
 
         X[i, hi] = 1.0
         X[i, ai] = -1.0
         X[i, -1] = 1.0
 
-    return X, unseen_rows
+    return X, unseen_rows, unseen_details
+
+
+def _infer_game_date(games_df: pd.DataFrame) -> str:
+    """
+    Best-effort deterministic date string for audit filenames.
+    Prefers 'game_date' then 'date', else 'unknown_date'.
+    """
+    for col in ("game_date", "date"):
+        if col in games_df.columns and len(games_df) > 0:
+            v = str(games_df[col].iloc[0]).strip()
+            if v:
+                return v
+    return "unknown_date"
 
 
 def predict_games(games_df: pd.DataFrame) -> pd.DataFrame:
@@ -196,7 +277,7 @@ def predict_games(games_df: pd.DataFrame) -> pd.DataFrame:
 
     _load_models()
 
-    X, unseen_rows = _make_team_diff_features(games_df)
+    X, unseen_rows, unseen_details = _make_team_diff_features(games_df)
 
     n = len(games_df)
     if unseen_rows > 0:
@@ -208,6 +289,19 @@ def predict_games(games_df: pd.DataFrame) -> pd.DataFrame:
             n,
             100.0 * frac,
         )
+
+        # Audit-only: write unseen-team details sidecar so this is debuggable
+        try:
+            game_date = _infer_game_date(games_df)
+            assert _team_index is not None
+            _write_unseen_sidecar(
+                game_date=game_date,
+                unseen_rows=unseen_details,
+                team_index_keys=list(_team_index.keys()),
+            )
+        except Exception as e:
+            # Never break predictions for audit failures
+            logger.error("[predict] failed to write unseen sidecar: %r", e)
 
     # Predict
     win_probs = _win_model.predict_proba(X)[:, 1]  # P(home wins)
