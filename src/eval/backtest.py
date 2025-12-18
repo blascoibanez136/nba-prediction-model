@@ -1,39 +1,30 @@
-"""
-Backtest predictions against historical results.
+"""Backtest predictions against historical results.
 
 Commit-2 intent:
 - Load prediction CSVs produced by `src.eval.historical_prediction_runner`.
 - Join to a historical results CSV and compute basic scoring/edge metrics.
 
-Commit-3 additive:
-- Produce audit-only calibration metrics (bucketed reliability, Brier, logloss)
-  without modifying existing outputs or behavior.
+Robustness fixes:
+- Historical results schemas vary. We infer/rename common score and key columns
+  (home_score/away_score, date, teams, game_id).
+- Prediction filename pattern defaults to `predictions_*.csv` (matches runner).
 
 Outputs:
 - outputs/backtest_metrics.csv
 - outputs/backtest_joined.csv
 - outputs/backtest_join_audit.json
-- outputs/backtest_calibration.csv            (NEW, Commit-3)
-- outputs/audits/backtest_calibration.json    (NEW, Commit-3)
 """
 
 from __future__ import annotations
 
 import argparse
-import glob
 import json
-import os
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-
-# -----------------------------
-# Schema inference helpers
-# -----------------------------
 
 _SCORE_CANDIDATES_HOME = [
     "home_score",
@@ -58,6 +49,7 @@ _SCORE_CANDIDATES_AWAY = [
     "away_final_score",
     "away_score_final",
     "awayTeamScore",
+    # NOTE: kept as-is from Commit-2 file you uploaded
 ]
 
 _DATE_CANDIDATES = [
@@ -127,8 +119,21 @@ def _ensure_score_cols(df: pd.DataFrame) -> pd.DataFrame:
     if a and a != "away_score":
         df = df.rename(columns={a: "away_score"})
 
+    # Some datasets store a single "score" field like "102-98"
     if "home_score" not in df.columns or "away_score" not in df.columns:
-        raise KeyError("Could not find home_score / away_score columns")
+        for combo in ["score", "final_score", "final", "result"]:
+            if combo in df.columns:
+                parts = df[combo].astype(str).str.replace(" ", "", regex=False).str.split("-", n=1, expand=True)
+                if parts.shape[1] == 2:
+                    df["home_score"] = pd.to_numeric(parts[0], errors="coerce")
+                    df["away_score"] = pd.to_numeric(parts[1], errors="coerce")
+                    break
+
+    if "home_score" not in df.columns or "away_score" not in df.columns:
+        raise KeyError(
+            "Could not find/derive home_score and away_score in history results. "
+            f"Columns: {list(df.columns)}"
+        )
 
     df["home_score"] = pd.to_numeric(df["home_score"], errors="coerce")
     df["away_score"] = pd.to_numeric(df["away_score"], errors="coerce")
@@ -161,10 +166,6 @@ def _ensure_join_keys(df: pd.DataFrame, *, label: str) -> Tuple[pd.DataFrame, Li
     return df, ["date", "home_team", "away_team"]
 
 
-# -----------------------------
-# Core loading
-# -----------------------------
-
 def _load_predictions(pred_dir: str, pattern: str) -> pd.DataFrame:
     paths = sorted(Path(pred_dir).glob(pattern))
     if not paths:
@@ -192,17 +193,15 @@ def _load_history(history_csv: str) -> pd.DataFrame:
     return hist
 
 
-# -----------------------------
-# Metrics
-# -----------------------------
-
 def _compute_metrics(joined: pd.DataFrame, prob_col: str, spread_col: str, total_col: str) -> pd.DataFrame:
     out = joined.copy()
 
+    # actuals
     out["home_margin"] = out["home_score"] - out["away_score"]
     out["total_points"] = out["home_score"] + out["away_score"]
     out["home_win"] = (out["home_margin"] > 0).astype(int)
 
+    # probability scoring
     if prob_col in out.columns:
         p = pd.to_numeric(out[prob_col], errors="coerce").clip(0, 1)
         out["logloss_component"] = -(
@@ -211,10 +210,12 @@ def _compute_metrics(joined: pd.DataFrame, prob_col: str, spread_col: str, total
         )
         out["brier_component"] = (p - out["home_win"]) ** 2
 
+    # spread MAE (margin = home - away)
     if spread_col in out.columns:
         s = pd.to_numeric(out[spread_col], errors="coerce")
         out["spread_error"] = (s - out["home_margin"]).abs()
 
+    # total MAE
     if total_col in out.columns:
         t = pd.to_numeric(out[total_col], errors="coerce")
         out["total_error"] = (t - out["total_points"]).abs()
@@ -222,11 +223,11 @@ def _compute_metrics(joined: pd.DataFrame, prob_col: str, spread_col: str, total
     return out
 
 
-def _summarize(joined: pd.DataFrame) -> Dict[str, float]:
+def _summarize(joined: pd.DataFrame) -> dict:
     def _mean(col: str) -> float:
         return float(pd.to_numeric(joined.get(col), errors="coerce").mean())
 
-    return {
+    metrics = {
         "n_rows": float(len(joined)),
         "n_complete_scores": float(joined[["home_score", "away_score"]].dropna().shape[0]),
         "mean_logloss": _mean("logloss_component"),
@@ -234,54 +235,82 @@ def _summarize(joined: pd.DataFrame) -> Dict[str, float]:
         "mae_spread": _mean("spread_error"),
         "mae_total": _mean("total_error"),
     }
+    return metrics
 
 
-# -----------------------------
-# CLI
-# -----------------------------
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Backtest model predictions vs historical results")
+    p.add_argument("--pred-dir", required=True, help="Directory containing prediction CSVs")
+    p.add_argument("--history", required=True, help="Historical games/results CSV")
+    p.add_argument("--start", required=True, help="Start date (YYYY-MM-DD)")
+    p.add_argument("--end", required=True, help="End date (YYYY-MM-DD)")
+    p.add_argument("--pattern", default="predictions_*.csv", help="Prediction file glob pattern")
+    p.add_argument("--prob-col", default="home_win_prob", help="Probability column in predictions")
+    p.add_argument("--spread-col", default="fair_spread", help="Spread column in predictions")
+    p.add_argument("--total-col", default="fair_total", help="Total column in predictions")
+    p.add_argument("--out-dir", default=None, help="Output directory (defaults to pred-dir)")
+    return p
+
 
 def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--pred-dir", required=True)
-    p.add_argument("--history", required=True)
-    p.add_argument("--start", required=True)
-    p.add_argument("--end", required=True)
-    p.add_argument("--pattern", default="predictions_*.csv")
-    p.add_argument("--prob-col", default="home_win_prob")
-    p.add_argument("--spread-col", default="fair_spread")
-    p.add_argument("--total-col", default="fair_total")
-    p.add_argument("--out-dir", default=None)
-    args = p.parse_args()
+    args = build_argparser().parse_args()
 
     start = pd.to_datetime(args.start).date()
     end = pd.to_datetime(args.end).date()
 
-    out_dir = Path(args.out_dir or args.pred_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    pred_dir = args.pred_dir
+    out_dir = args.out_dir or pred_dir
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-    preds = _load_predictions(args.pred_dir, args.pattern)
+    preds = _load_predictions(pred_dir, args.pattern)
     hist = _load_history(args.history)
 
-    preds = preds[(preds["date"] >= start) & (preds["date"] <= end)]
-    hist = hist[(hist["date"] >= start) & (hist["date"] <= end)]
+    # Filter date range
+    preds = preds[(preds["date"] >= start) & (preds["date"] <= end)].copy()
+    hist = hist[(hist["date"] >= start) & (hist["date"] <= end)].copy()
 
-    join_keys = ["game_id"] if "game_id" in preds.columns and "game_id" in hist.columns else ["date", "home_team", "away_team"]
-    joined = preds.merge(hist, on=join_keys, how="inner")
+    # Join mode is determined by what keys exist in both.
+    if "game_id" in preds.columns and "game_id" in hist.columns:
+        join_keys = ["game_id"]
+    else:
+        join_keys = ["date", "home_team", "away_team"]
+
+    joined = preds.merge(hist, how="inner", on=join_keys, suffixes=("", "_hist"))
 
     audit = {
+        "pred_dir": pred_dir,
+        "pattern": args.pattern,
+        "history": args.history,
+        "start": str(start),
+        "end": str(end),
         "pred_rows": int(len(preds)),
         "hist_rows": int(len(hist)),
-        "joined_rows": int(len(joined)),
         "join_keys": join_keys,
+        "joined_rows": int(len(joined)),
+        "pred_cols": list(preds.columns),
+        "hist_cols": list(hist.columns),
     }
-    (out_dir / "backtest_join_audit.json").write_text(json.dumps(audit, indent=2))
+
+    audit_path = Path(out_dir) / "backtest_join_audit.json"
+    audit_path.write_text(json.dumps(audit, indent=2))
+    print(f"[backtest] wrote {audit_path}")
 
     if joined.empty:
-        raise RuntimeError("Backtest join produced 0 rows")
+        raise RuntimeError(
+            "Backtest join produced 0 rows. Check join keys and team canonicalization. "
+            f"See audit: {audit_path}"
+        )
 
     joined_scored = _compute_metrics(joined, args.prob_col, args.spread_col, args.total_col)
-    joined_scored.to_csv(out_dir / "backtest_joined.csv", index=False)
-    pd.DataFrame([_summarize(joined_scored)]).to_csv(out_dir / "backtest_metrics.csv", index=False)
+    summary = _summarize(joined_scored)
+
+    joined_path = Path(out_dir) / "backtest_joined.csv"
+    joined_scored.to_csv(joined_path, index=False)
+    print(f"[backtest] wrote {joined_path}")
+
+    metrics_path = Path(out_dir) / "backtest_metrics.csv"
+    pd.DataFrame([summary]).to_csv(metrics_path, index=False)
+    print(f"[backtest] wrote {metrics_path}")
 
     # ---------------------------------------------------------
     # Commit-3 ADDITIVE: calibration metrics (audit-only)
@@ -289,31 +318,42 @@ def main() -> None:
     try:
         from src.eval.backtest_calibration import calibration_table
 
-        cal_df, cal_summary = calibration_table(joined_scored)
+        cal_df, cal_summary = calibration_table(
+            joined_scored,
+            prob_col=args.prob_col,
+            n_buckets=10,
+            min_rows_per_bucket=25,
+        )
 
-        cal_df.to_csv(out_dir / "backtest_calibration.csv", index=False)
+        cal_path = Path(out_dir) / "backtest_calibration.csv"
+        cal_df.to_csv(cal_path, index=False)
+        print(f"[backtest] wrote {cal_path}")
 
-        audits_dir = out_dir / "audits"
-        audits_dir.mkdir(exist_ok=True)
+        audits_dir = Path(out_dir) / "audits"
+        audits_dir.mkdir(parents=True, exist_ok=True)
 
-        (audits_dir / "backtest_calibration.json").write_text(
+        cal_audit_path = audits_dir / "backtest_calibration.json"
+        cal_audit_path.write_text(
             json.dumps(
                 {
-                    "n": cal_summary.n,
-                    "n_used": cal_summary.n_used,
-                    "n_dropped": cal_summary.n_dropped,
-                    "brier": cal_summary.brier,
-                    "logloss": cal_summary.logloss,
-                    "dropped_reasons": cal_summary.dropped_reasons,
+                    "summary": {
+                        "n": cal_summary["n"],
+                        "n_used": cal_summary["n_used"],
+                        "n_dropped": cal_summary["n_dropped"],
+                        "brier": cal_summary["brier"],
+                        "logloss": cal_summary["logloss"],
+                        "dropped_reasons": cal_summary["dropped_reasons"],
+                    }
                 },
                 indent=2,
                 sort_keys=True,
-            )
+            ),
+            encoding="utf-8",
         )
+        print(f"[backtest] wrote {cal_audit_path}")
     except Exception as e:
         print(f"[backtest] calibration metrics failed (non-fatal): {e!r}")
 
 
 if __name__ == "__main__":
     main()
-
