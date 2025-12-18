@@ -1,236 +1,363 @@
-#!/usr/bin/env python3
-"""
-Backtest runner.
+"""Backtest predictions against historical results.
 
-Commit 2 goal: join per-day prediction CSVs with historical outcomes, then compute a few
-basic diagnostics/metrics without assuming fragile column names.
+Commit-2 intent:
+- Load prediction CSVs produced by `src.eval.historical_prediction_runner`.
+- Join to a historical results CSV and compute basic scoring/edge metrics.
 
-This script does NOT assume predictions contain actual scores. Scores come from history.
+Robustness fixes:
+- Historical results schemas vary. We infer/rename common score and key columns
+  (home_score/away_score, date, teams, game_id).
+- Prediction filename pattern defaults to `predictions_*.csv` (matches runner).
+
+Outputs:
+- outputs/backtest_metrics.csv
+- outputs/backtest_joined.csv
+- outputs/backtest_join_audit.json
+
+Note: This module does not assume the presence of market columns; it will
+compute what it can from whatever columns exist.
 """
+
 from __future__ import annotations
 
 import argparse
+import glob
 import json
+import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 
-def _ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
+# -----------------------------
+# Schema inference helpers
+# -----------------------------
+
+_SCORE_CANDIDATES_HOME = [
+    "home_score",
+    "home_points",
+    "home_pts",
+    "pts_home",
+    "home_team_score",
+    "home_team_points",
+    "home_final",
+    "home_final_score",
+    "home_score_final",
+    "homeTeamScore",
+]
+_SCORE_CANDIDATES_AWAY = [
+    "away_score",
+    "away_points",
+    "away_pts",
+    "pts_away",
+    "away_team_score",
+    "away_team_points",
+    "away_final",
+    "away_final_score",
+    "away_score_final",
+    "awayTeamScore",
+]
+
+_DATE_CANDIDATES = [
+    "date",
+    "game_date",
+    "gameDate",
+    "start_date",
+    "startDate",
+    "commence_time",
+    "commenceTime",
+]
+
+_GAME_ID_CANDIDATES = [
+    "game_id",
+    "id",
+    "gameId",
+    "GAME_ID",
+]
+
+_HOME_TEAM_CANDIDATES = [
+    "home_team",
+    "home",
+    "home_team_name",
+    "homeTeam",
+    "HOME_TEAM",
+]
+
+_AWAY_TEAM_CANDIDATES = [
+    "away_team",
+    "away",
+    "away_team_name",
+    "awayTeam",
+    "AWAY_TEAM",
+]
 
 
-def _find_first(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+def _first_present(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols = set(df.columns)
     for c in candidates:
-        if c in df.columns:
+        if c in cols:
             return c
+    # also allow case-insensitive matches
+    lower = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in lower:
+            return lower[cand.lower()]
     return None
 
 
-def _parse_date_col(df: pd.DataFrame) -> str:
-    c = _find_first(df, ["date", "game_date", "gameDate", "start_date"])
-    if not c:
-        raise ValueError(f"Could not find date column in history. Columns: {list(df.columns)[:60]}...")
-    return c
-
-
-def _normalize_dates(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
-    out = df.copy()
-    out[date_col] = pd.to_datetime(out[date_col], errors="coerce").dt.date
-    out = out.dropna(subset=[date_col])
-    return out
-
-
-def _standardize_history(df: pd.DataFrame) -> pd.DataFrame:
-    date_col = _parse_date_col(df)
-    df = _normalize_dates(df, date_col).rename(columns={date_col: "date"})
-
-    # teams
-    ren = {}
-    if "home_team" not in df.columns:
-        hc = _find_first(df, ["homeTeam", "home", "team_home", "home_abbr"])
-        if hc:
-            ren[hc] = "home_team"
-    if "away_team" not in df.columns:
-        ac = _find_first(df, ["awayTeam", "away", "team_away", "visitor_team", "visitor_abbr"])
-        if ac:
-            ren[ac] = "away_team"
-
-    # scores (many possible schemas)
-    if "home_score" not in df.columns:
-        hs = _find_first(df, ["home_score", "home_points", "home_pts", "pts_home", "home_team_score", "homeScore"])
-        if hs:
-            ren[hs] = "home_score"
-    if "away_score" not in df.columns:
-        as_ = _find_first(df, ["away_score", "away_points", "away_pts", "pts_away", "visitor_team_score", "awayScore"])
-        if as_:
-            ren[as_] = "away_score"
-
-    df = df.rename(columns=ren)
-
-    missing = [c for c in ["date", "home_team", "away_team", "home_score", "away_score"] if c not in df.columns]
-    if missing:
-        raise ValueError(
-            f"History missing required columns after standardization: {missing}. "
-            f"Columns: {list(df.columns)[:80]}..."
+def _ensure_date_col(df: pd.DataFrame, *, label: str) -> pd.DataFrame:
+    df = df.copy()
+    date_col = _first_present(df, _DATE_CANDIDATES)
+    if not date_col:
+        raise KeyError(
+            f"[{label}] Could not find a date column. Tried: {_DATE_CANDIDATES}. Available: {list(df.columns)}"
         )
-
-    # numeric scores
-    df["home_score"] = pd.to_numeric(df["home_score"], errors="coerce")
-    df["away_score"] = pd.to_numeric(df["away_score"], errors="coerce")
-    df = df.dropna(subset=["home_score", "away_score"])
+    if date_col != "date":
+        df = df.rename(columns={date_col: "date"})
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
     return df
 
 
-def _load_predictions(pred_dir: Path, pattern: str) -> pd.DataFrame:
-    files = sorted(pred_dir.glob(pattern))
-    if not files:
+def _ensure_score_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    h = _first_present(df, _SCORE_CANDIDATES_HOME)
+    a = _first_present(df, _SCORE_CANDIDATES_AWAY)
+
+    if h and h != "home_score":
+        df = df.rename(columns={h: "home_score"})
+    if a and a != "away_score":
+        df = df.rename(columns={a: "away_score"})
+
+    # Some historical files store score as a string "102-98".
+    if "home_score" not in df.columns or "away_score" not in df.columns:
+        # try common combined formats
+        for combo in ["score", "final_score", "final", "result"]:
+            if combo in df.columns:
+                parts = df[combo].astype(str).str.replace(" ", "", regex=False).str.split("-", n=1, expand=True)
+                if parts.shape[1] == 2:
+                    df["home_score"] = pd.to_numeric(parts[0], errors="coerce")
+                    df["away_score"] = pd.to_numeric(parts[1], errors="coerce")
+                    break
+
+    if "home_score" not in df.columns or "away_score" not in df.columns:
+        raise KeyError(
+            "Could not find/derive home_score and away_score in history results. "
+            f"Columns: {list(df.columns)}"
+        )
+
+    df["home_score"] = pd.to_numeric(df["home_score"], errors="coerce")
+    df["away_score"] = pd.to_numeric(df["away_score"], errors="coerce")
+    return df
+
+
+def _ensure_join_keys(df: pd.DataFrame, *, label: str) -> Tuple[pd.DataFrame, List[str]]:
+    """Return df and a list of join keys to use.
+
+    Preferred join key order:
+    1) game_id if available
+    2) (date, home_team, away_team)
+    """
+    df = df.copy()
+
+    gid = _first_present(df, _GAME_ID_CANDIDATES)
+    if gid:
+        if gid != "game_id":
+            df = df.rename(columns={gid: "game_id"})
+        return df, ["game_id"]
+
+    home = _first_present(df, _HOME_TEAM_CANDIDATES)
+    away = _first_present(df, _AWAY_TEAM_CANDIDATES)
+    if not home or not away:
+        raise KeyError(
+            f"[{label}] Could not find team columns for join. Tried home={_HOME_TEAM_CANDIDATES}, away={_AWAY_TEAM_CANDIDATES}. "
+            f"Available: {list(df.columns)}"
+        )
+
+    if home != "home_team":
+        df = df.rename(columns={home: "home_team"})
+    if away != "away_team":
+        df = df.rename(columns={away: "away_team"})
+
+    # Normalize team strings a bit (trim)
+    df["home_team"] = df["home_team"].astype(str).str.strip()
+    df["away_team"] = df["away_team"].astype(str).str.strip()
+
+    df = _ensure_date_col(df, label=label)
+    return df, ["date", "home_team", "away_team"]
+
+
+# -----------------------------
+# Core loading
+# -----------------------------
+
+
+def _load_predictions(pred_dir: str, pattern: str) -> pd.DataFrame:
+    pred_dir_p = Path(pred_dir)
+    paths = sorted(pred_dir_p.glob(pattern))
+    if not paths:
         raise FileNotFoundError(f"No prediction files found in {pred_dir} with pattern {pattern}")
 
-    dfs = []
-    for p in files:
+    frames: List[pd.DataFrame] = []
+    for p in paths:
         df = pd.read_csv(p)
-        # normalize date + required cols
-        date_col = _find_first(df, ["date", "game_date"])
-        if not date_col:
-            # If missing, infer from filename predictions_YYYY-MM-DD.csv
-            m = p.stem.replace("predictions_", "")
-            try:
-                df["date"] = pd.to_datetime(m).date()
-            except Exception:
-                raise ValueError(f"{p}: missing date column and cannot infer from filename")
-        else:
-            df["date"] = pd.to_datetime(df[date_col], errors="coerce").dt.date
+        df["_pred_file"] = p.name
+        frames.append(df)
 
-        # ensure team cols
-        if "home_team" not in df.columns or "away_team" not in df.columns:
-            raise ValueError(f"{p}: predictions must include home_team and away_team. Columns: {list(df.columns)[:80]}")
+    preds = pd.concat(frames, ignore_index=True)
+    preds = _ensure_date_col(preds, label="preds")
+    preds, join_keys = _ensure_join_keys(preds, label="preds")
 
-        dfs.append(df)
+    # Keep join keys as explicit columns even if file naming implied date.
+    preds["_join_key_mode"] = "|".join(join_keys)
+    return preds
 
-    out = pd.concat(dfs, ignore_index=True)
-    out = out.dropna(subset=["date", "home_team", "away_team"])
+
+def _load_history(history_csv: str) -> pd.DataFrame:
+    hist = pd.read_csv(history_csv)
+    hist = _ensure_date_col(hist, label="history")
+    hist, join_keys = _ensure_join_keys(hist, label="history")
+    hist["_join_key_mode"] = "|".join(join_keys)
+    hist = _ensure_score_cols(hist)
+    return hist
+
+
+# -----------------------------
+# Metrics
+# -----------------------------
+
+
+def _compute_metrics(joined: pd.DataFrame, prob_col: str, spread_col: str, total_col: str) -> pd.DataFrame:
+    out = joined.copy()
+
+    # actuals
+    out["home_margin"] = out["home_score"] - out["away_score"]
+    out["total_points"] = out["home_score"] + out["away_score"]
+    out["home_win"] = (out["home_margin"] > 0).astype(int)
+
+    # prob calibration / brier-ish
+    if prob_col in out.columns:
+        p = pd.to_numeric(out[prob_col], errors="coerce").clip(0, 1)
+        out["prob"] = p
+        out["logloss_component"] = -(
+            out["home_win"] * np.log(np.clip(p, 1e-9, 1 - 1e-9))
+            + (1 - out["home_win"]) * np.log(np.clip(1 - p, 1e-9, 1 - 1e-9))
+        )
+        out["brier_component"] = (p - out["home_win"]) ** 2
+
+    # spread error
+    if spread_col in out.columns:
+        s = pd.to_numeric(out[spread_col], errors="coerce")
+        out["pred_spread"] = s
+        out["spread_error"] = (s - out["home_margin"]).abs()
+
+    # total error
+    if total_col in out.columns:
+        t = pd.to_numeric(out[total_col], errors="coerce")
+        out["pred_total"] = t
+        out["total_error"] = (t - out["total_points"]).abs()
+
     return out
 
 
-def _compute_metrics(joined: pd.DataFrame, prob_col: str, spread_col: str, total_col: str) -> dict:
-    df = joined.copy()
-
-    # Outcomes
-    df["home_win"] = (df["home_score"] > df["away_score"]).astype(int)
-    df["margin"] = df["home_score"] - df["away_score"]
-    df["total_points"] = df["home_score"] + df["away_score"]
+def _summarize(joined: pd.DataFrame) -> Dict[str, float]:
+    def _mean(series_name: str) -> float:
+        if series_name not in joined.columns:
+            return float("nan")
+        return float(pd.to_numeric(joined[series_name], errors="coerce").dropna().mean())
 
     metrics = {
-        "rows": int(len(df)),
-        "date_min": str(df["date"].min()) if len(df) else None,
-        "date_max": str(df["date"].max()) if len(df) else None,
+        "n_rows": float(len(joined)),
+        "n_complete_scores": float(joined[["home_score", "away_score"]].dropna().shape[0]),
+        "mean_logloss": _mean("logloss_component"),
+        "mean_brier": _mean("brier_component"),
+        "mae_spread": _mean("spread_error"),
+        "mae_total": _mean("total_error"),
     }
-
-    # Win prob (Brier)
-    if prob_col in df.columns:
-        p = pd.to_numeric(df[prob_col], errors="coerce")
-        metrics["brier_home_win"] = float(((p - df["home_win"]) ** 2).mean()) if p.notna().any() else None
-        metrics["prob_nunique"] = int(p.nunique(dropna=True)) if p.notna().any() else 0
-    else:
-        metrics["brier_home_win"] = None
-        metrics["prob_nunique"] = None
-
-    # Spread MAE vs actual margin
-    if spread_col in df.columns:
-        s = pd.to_numeric(df[spread_col], errors="coerce")
-        metrics["spread_mae"] = float((s - df["margin"]).abs().mean()) if s.notna().any() else None
-        metrics["spread_nunique"] = int(s.nunique(dropna=True)) if s.notna().any() else 0
-    else:
-        metrics["spread_mae"] = None
-        metrics["spread_nunique"] = None
-
-    # Total MAE vs actual total
-    if total_col in df.columns:
-        t = pd.to_numeric(df[total_col], errors="coerce")
-        metrics["total_mae"] = float((t - df["total_points"]).abs().mean()) if t.notna().any() else None
-        metrics["total_nunique"] = int(t.nunique(dropna=True)) if t.notna().any() else 0
-    else:
-        metrics["total_mae"] = None
-        metrics["total_nunique"] = None
-
     return metrics
 
 
+# -----------------------------
+# CLI
+# -----------------------------
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Backtest model predictions vs historical results")
+    p.add_argument("--pred-dir", required=True, help="Directory containing prediction CSVs")
+    p.add_argument("--history", required=True, help="Historical games/results CSV")
+    p.add_argument("--start", required=True, help="Start date (YYYY-MM-DD)")
+    p.add_argument("--end", required=True, help="End date (YYYY-MM-DD)")
+    p.add_argument("--pattern", default="predictions_*.csv", help="Glob pattern for prediction files")
+    p.add_argument("--prob-col", default="home_win_prob", help="Probability column name")
+    p.add_argument("--spread-col", default="fair_spread", help="Spread prediction column name")
+    p.add_argument("--total-col", default="fair_total", help="Total prediction column name")
+    p.add_argument("--out-dir", default=None, help="Output dir (defaults to pred-dir)")
+    return p
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--pred-dir", required=True, help="Directory containing predictions_YYYY-MM-DD.csv files")
-    ap.add_argument("--pattern", default="predictions_*.csv", help="Glob pattern for prediction files")
-    ap.add_argument("--history", required=True, help="Historical games CSV")
-    ap.add_argument("--start", required=True, help="YYYY-MM-DD")
-    ap.add_argument("--end", required=True, help="YYYY-MM-DD (inclusive)")
-    ap.add_argument("--prob-col", default="home_win_prob")
-    ap.add_argument("--spread-col", default="fair_spread")
-    ap.add_argument("--total-col", default="fair_total")
-    ap.add_argument("--out-csv", default="outputs/backtest_joined.csv")
-    ap.add_argument("--audit-path", default="outputs/backtest_join_audit.json")
-    args = ap.parse_args()
-
-    pred_dir = Path(args.pred_dir)
-    out_csv = Path(args.out_csv)
-    audit_path = Path(args.audit_path)
-    _ensure_dir(out_csv.parent)
-    _ensure_dir(audit_path.parent)
-
-    preds = _load_predictions(pred_dir, args.pattern)
-
-    hist = pd.read_csv(args.history)
-    hist = _standardize_history(hist)
+    args = build_argparser().parse_args()
 
     start = pd.to_datetime(args.start).date()
     end = pd.to_datetime(args.end).date()
 
+    pred_dir = args.pred_dir
+    out_dir = args.out_dir or pred_dir
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+    preds = _load_predictions(pred_dir, args.pattern)
+    hist = _load_history(args.history)
+
+    # Filter date range
     preds = preds[(preds["date"] >= start) & (preds["date"] <= end)].copy()
     hist = hist[(hist["date"] >= start) & (hist["date"] <= end)].copy()
 
-    joined = preds.merge(
-        hist[["date", "home_team", "away_team", "home_score", "away_score"]],
-        how="left",
-        on=["date", "home_team", "away_team"],
-        validate="m:1",
-    )
+    # Join mode is determined by what keys exist in both.
+    if "game_id" in preds.columns and "game_id" in hist.columns:
+        join_keys = ["game_id"]
+    else:
+        join_keys = ["date", "home_team", "away_team"]
 
-    # Some histories might use swapped home/away naming; attempt a fallback join if too many missing.
-    miss = joined["home_score"].isna().mean()
-    if miss > 0.20:
-        swapped = preds.merge(
-            hist[["date", "home_team", "away_team", "home_score", "away_score"]].rename(
-                columns={"home_team": "away_team", "away_team": "home_team", "home_score": "away_score", "away_score": "home_score"}
-            ),
-            how="left",
-            on=["date", "home_team", "away_team"],
-            validate="m:1",
-        )
-        if swapped["home_score"].isna().mean() < miss:
-            joined = swapped
-
-    joined.to_csv(out_csv, index=False)
-
-    metrics = _compute_metrics(joined.dropna(subset=["home_score", "away_score"]), args.prob_col, args.spread_col, args.total_col)
+    joined = preds.merge(hist, how="inner", on=join_keys, suffixes=("", "_hist"))
 
     audit = {
-        "pred_dir": str(pred_dir),
-        "history": str(args.history),
+        "pred_dir": pred_dir,
+        "pattern": args.pattern,
+        "history": args.history,
         "start": str(start),
         "end": str(end),
-        "pattern": args.pattern,
-        "out_csv": str(out_csv),
-        "metrics": metrics,
-        "join_missing_rate": float(joined["home_score"].isna().mean()) if len(joined) else None,
-        "columns_predictions": list(preds.columns),
-        "columns_history_sample": list(hist.columns)[:120],
+        "pred_rows": int(len(preds)),
+        "hist_rows": int(len(hist)),
+        "join_keys": join_keys,
+        "joined_rows": int(len(joined)),
+        "pred_cols": list(preds.columns),
+        "hist_cols": list(hist.columns),
     }
-    audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+
+    audit_path = Path(out_dir) / "backtest_join_audit.json"
+    audit_path.write_text(json.dumps(audit, indent=2))
     print(f"[backtest] wrote {audit_path}")
-    print(f"[backtest] wrote {out_csv}")
+
+    if joined.empty:
+        raise RuntimeError(
+            "Backtest join produced 0 rows. Check join keys and team canonicalization. "
+            f"See audit: {audit_path}"
+        )
+
+    joined_scored = _compute_metrics(joined, args.prob_col, args.spread_col, args.total_col)
+    summary = _summarize(joined_scored)
+
+    joined_path = Path(out_dir) / "backtest_joined.csv"
+    joined_scored.to_csv(joined_path, index=False)
+    print(f"[backtest] wrote {joined_path}")
+
+    metrics_path = Path(out_dir) / "backtest_metrics.csv"
+    pd.DataFrame([summary]).to_csv(metrics_path, index=False)
+    print(f"[backtest] wrote {metrics_path}")
 
 
 if __name__ == "__main__":
     main()
-
