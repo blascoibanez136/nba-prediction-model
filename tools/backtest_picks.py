@@ -19,7 +19,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -68,7 +68,6 @@ def _american_to_decimal(odds: object) -> float:
 
 
 def _coerce_decimal_odds(x: object) -> float:
-    # Accept decimal odds as-is (>=1.01), or american odds like -110 / +125
     if x is None:
         return np.nan
     try:
@@ -77,10 +76,8 @@ def _coerce_decimal_odds(x: object) -> float:
         return np.nan
     if np.isnan(v) or v == 0:
         return np.nan
-    # heuristic: decimal odds usually between ~1.01 and 50; american often <= -100 or >= +100
-    if v >= 1.01 and v <= 100:
+    if 1.01 <= v <= 100:
         return v
-    # treat as american otherwise
     return _american_to_decimal(v)
 
 
@@ -154,7 +151,6 @@ def _discover_team_cols(snap: pd.DataFrame) -> Tuple[Optional[str], Optional[str
 
 def _discover_ml_cols(snap: pd.DataFrame) -> Dict[str, Optional[str]]:
     cols = list(snap.columns)
-
     moneyline_like = [
         c for c in cols
         if re.search(r"(moneyline|(^|_)ml(_|$)|american|odds|price|line)", c.lower())
@@ -165,14 +161,12 @@ def _discover_ml_cols(snap: pd.DataFrame) -> Dict[str, Optional[str]]:
         must = [side]
         nice = ["moneyline", "ml", "american", "odds", "price", "line"]
         avoid = ["spread", "total", "team", "name", "score"]
-
         if timing == "close":
             nice += ["close", "closing", "cl"]
             avoid += ["open", "opening"]
         else:
             nice += ["open", "opening", "op"]
             avoid += ["close", "closing"]
-
         return _best_match(moneyline_like, must=must, nice=nice, avoid=avoid)
 
     return {
@@ -219,10 +213,8 @@ def _normalize_picks(picks_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
     df["bet_side"] = df["bet_side"].astype(str).str.upper()
     df = df[df["bet_side"].isin(["HOME", "AWAY"])].copy()
 
-    # Detect embedded odds column candidates
     embedded_cols = [c for c in ["odds_decimal", "odds", "american_odds", "price", "line"] if c in df.columns]
     if embedded_cols:
-        # pick first in priority order
         src = embedded_cols[0]
         df["odds_decimal"] = df[src].apply(_coerce_decimal_odds)
         audit["mode"] = "embedded_odds"
@@ -236,15 +228,53 @@ def _normalize_picks(picks_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
 
 
 # ---------------------------------------------------------------------
-# Attach odds from snapshots (only when needed)
+# Snapshot odds attach (FIXED: duplicate mk safe + scalar safe)
 # ---------------------------------------------------------------------
+
+def _first_non_null_scalar(val: Union[pd.Series, pd.DataFrame, object]) -> object:
+    """
+    Make 'val' scalar-safe:
+    - If DataFrame: return first non-null in first column? (caller should pass column slice)
+    - If Series: return first non-null element
+    - Else: return as-is
+    """
+    if isinstance(val, pd.DataFrame):
+        # caller should never pass full DF here, but be safe anyway
+        for c in val.columns:
+            s = val[c]
+            nn = s.dropna()
+            if len(nn) > 0:
+                return nn.iloc[0]
+        return np.nan
+    if isinstance(val, pd.Series):
+        nn = val.dropna()
+        return nn.iloc[0] if len(nn) > 0 else np.nan
+    return val
+
+
+def _get_cell(row: Union[pd.Series, pd.DataFrame], col: Optional[str]) -> object:
+    """
+    Return a scalar value for column 'col' from a snapshot row.
+    If snapshot has duplicate mk, row will be a DataFrame: choose first non-null in that column.
+    """
+    if col is None:
+        return np.nan
+    if isinstance(row, pd.DataFrame):
+        if col not in row.columns:
+            return np.nan
+        return _first_non_null_scalar(row[col])
+    # Series
+    try:
+        return row.get(col, np.nan)  # type: ignore
+    except Exception:
+        return np.nan
+
 
 def _attach_odds_from_snapshots(
     picks_df: pd.DataFrame,
     snapshot_dir: Optional[Path],
 ) -> Tuple[pd.DataFrame, Dict]:
     df = picks_df.copy()
-
     audit: Dict = {
         "snapshot_dir": str(snapshot_dir) if snapshot_dir else None,
         "dates_seen": int(df["game_date"].nunique()),
@@ -255,10 +285,11 @@ def _attach_odds_from_snapshots(
         "team_cols": None,
         "ml_cols": None,
         "example_snapshot_columns": None,
+        "dup_mk_rows_seen": 0,
         "note": None,
     }
 
-    # If odds already present, skip snapshots entirely
+    # If odds already present, skip snapshots
     if int(df["odds_decimal"].notna().sum()) > 0:
         audit["note"] = "embedded odds detected; snapshot odds attach skipped"
         audit["odds_missing_after"] = int(df["odds_decimal"].isna().sum())
@@ -273,6 +304,7 @@ def _attach_odds_from_snapshots(
     matched_rows = 0
     found_snaps = 0
     first_cols_dumped = False
+    dup_mk_rows = 0
 
     for game_date, idx in df.groupby("game_date").groups.items():
         snap = _load_snapshot_for_date(snapshot_dir, str(game_date))
@@ -296,11 +328,17 @@ def _attach_odds_from_snapshots(
         if not home_team_col or not away_team_col:
             continue
 
-        # Build merge-key index for snapshot
         snap["_mk"] = [
             _merge_key(h, a, game_date) for h, a in zip(snap[home_team_col], snap[away_team_col])
         ]
-        snap = snap.set_index("_mk")
+
+        # Count duplicate mk rows (important debug signal)
+        vc = snap["_mk"].value_counts()
+        dup = int((vc > 1).sum())
+        if dup > 0:
+            dup_mk_rows += dup
+
+        snap = snap.set_index("_mk")  # may have duplicate index => loc can return DataFrame
 
         for i in idx:
             mk = df.at[i, "merge_key"]
@@ -308,17 +346,17 @@ def _attach_odds_from_snapshots(
                 continue
 
             matched_rows += 1
-            row = snap.loc[mk]
+            row = snap.loc[mk]  # Series OR DataFrame
 
-            # close preferred, open fallback
+            # choose close preferred, open fallback
             if df.at[i, "bet_side"] == "HOME":
-                am = row.get(ml_cols["home_ml_close"], np.nan) if ml_cols["home_ml_close"] else np.nan
-                if pd.isna(am) and ml_cols["home_ml_open"]:
-                    am = row.get(ml_cols["home_ml_open"], np.nan)
+                am = _get_cell(row, ml_cols.get("home_ml_close"))
+                if pd.isna(am) and (ml_cols.get("home_ml_open") is not None):
+                    am = _get_cell(row, ml_cols.get("home_ml_open"))
             else:
-                am = row.get(ml_cols["away_ml_close"], np.nan) if ml_cols["away_ml_close"] else np.nan
-                if pd.isna(am) and ml_cols["away_ml_open"]:
-                    am = row.get(ml_cols["away_ml_open"], np.nan)
+                am = _get_cell(row, ml_cols.get("away_ml_close"))
+                if pd.isna(am) and (ml_cols.get("away_ml_open") is not None):
+                    am = _get_cell(row, ml_cols.get("away_ml_open"))
 
             dec = _american_to_decimal(am)
             if pd.notna(dec):
@@ -329,6 +367,7 @@ def _attach_odds_from_snapshots(
     audit["rows_with_snapshot_match"] = int(matched_rows)
     audit["odds_filled"] = int(filled)
     audit["odds_missing_after"] = int(df["odds_decimal"].isna().sum())
+    audit["dup_mk_rows_seen"] = int(dup_mk_rows)
     return df, audit
 
 
@@ -428,7 +467,7 @@ def backtest_picks(
         raise RuntimeError(
             "[picks_backtest] No resolved bets. "
             "Likely: snapshot join mismatch OR moneyline columns not detected. "
-            "Inspect outputs/picks_backtest_audit.json -> odds_attach.team_cols/ml_cols/example_snapshot_columns."
+            "Inspect outputs/picks_backtest_audit.json -> odds_attach.team_cols/ml_cols/example_snapshot_columns/dup_mk_rows_seen."
         )
 
     total_pnl = float(resolved["pnl"].sum())
@@ -471,13 +510,11 @@ def main() -> int:
         if not files:
             raise RuntimeError(f"[picks_backtest] No picks files matched: {picks_dir}/{args.pattern}")
 
-        # Avoid concat warning: skip empty/all-NA frames
         dfs = []
         for f in files:
             df = pd.read_csv(f)
             if df is None or df.empty:
                 continue
-            # drop fully-empty columns that cause dtype warnings
             df = df.dropna(axis=1, how="all")
             df["_source_file"] = f.name
             dfs.append(df)
@@ -509,7 +546,6 @@ def main() -> int:
         return 0
 
     except Exception as e:
-        # Always write failure audit
         try:
             audit_path.write_text(json.dumps({"error": str(e)}, indent=2), encoding="utf-8")
         except Exception:
