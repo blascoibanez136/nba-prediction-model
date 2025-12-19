@@ -40,9 +40,6 @@ def _find_score_cols(df: pd.DataFrame) -> Tuple[str, str]:
 
 
 def _normalize_picks(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
-    """
-    Adapt legacy pick schemas into canonical picks contract.
-    """
     audit = {"inferred": {}, "rows": len(df)}
 
     # merge_key
@@ -55,7 +52,7 @@ def _normalize_picks(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
                 + "__"
                 + df["game_date"].astype(str)
             )
-            audit["inferred"]["merge_key"] = "built from teams + date"
+            audit["inferred"]["merge_key"] = "from teams + date"
         else:
             raise RuntimeError("[picks_backtest] Cannot infer merge_key")
 
@@ -67,7 +64,7 @@ def _normalize_picks(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
                 audit["inferred"]["odds"] = f"from {c}"
                 break
         else:
-            raise RuntimeError("[picks_backtest] Cannot infer odds column")
+            raise RuntimeError("[picks_backtest] Cannot infer odds")
 
     # bet_side
     if "bet_side" not in df.columns:
@@ -146,6 +143,7 @@ def main():
     ap.add_argument("--picks-dir", required=True)
     ap.add_argument("--pattern", default="picks_*.csv")
     ap.add_argument("--history", required=True)
+    ap.add_argument("--snapshot-dir", default=None)  # accepted for compatibility
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--stake", type=float, default=1.0)
     args = ap.parse_args()
