@@ -71,17 +71,10 @@ def _coerce_decimal_odds(x: object) -> float:
 
 
 # ---------------------------------------------------------------------
-# Snapshot discovery (CLOSE preferred, OPEN fallback)
+# Snapshot discovery (CLOSE preferred)
 # ---------------------------------------------------------------------
 
 def _find_snapshot_file(snapshot_dir: Path, game_date: str) -> Optional[Path]:
-    """
-    Find a snapshot file for a given date.
-    Supports:
-    - close_YYYYMMDD.csv
-    - YYYYMMDD.csv
-    - YYYY-MM-DD.csv
-    """
     ymd = str(game_date).replace("-", "")
     candidates = [
         snapshot_dir / f"close_{ymd}.csv",
@@ -166,11 +159,7 @@ def _normalize_picks(picks_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
     df["bet_side"] = df["bet_side"].astype(str).str.upper()
     df = df[df["bet_side"].isin(["HOME", "AWAY"])].copy()
 
-    # Commit-4 (additive): support embedded execution odds when present.
-    # We distinguish:
-    # - bet_odds_decimal: execution / pick-time odds (if embedded)
-    # - close_odds_decimal: closing odds from snapshots (attached later)
-    # The existing 'odds_decimal' column remains the odds used for PnL (backward compatible).
+    # Commit-4 (additive): support embedded execution odds when present
     embedded_cols = [c for c in ["bet_ml", "odds_decimal", "odds", "american_odds", "price", "line"] if c in df.columns]
     if embedded_cols:
         src = embedded_cols[0]
@@ -192,15 +181,10 @@ def _normalize_picks(picks_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
 
 
 # ---------------------------------------------------------------------
-# Snapshot odds attach (FIXED: duplicate mk safe + scalar safe)
+# Snapshot odds attach (duplicate mk safe + scalar safe)
 # ---------------------------------------------------------------------
 
 def _first_non_null_scalar(val: Union[pd.Series, pd.DataFrame, object]) -> object:
-    """
-    Make 'val' scalar-safe:
-    - If Series: return first non-null element
-    - Else: return as-is
-    """
     if isinstance(val, pd.Series):
         for x in val.values.tolist():
             if pd.notna(x):
@@ -246,8 +230,6 @@ def _attach_odds_from_snapshots(
         audit["odds_missing_after"] = int(df["odds_decimal"].isna().sum())
         return df, audit
 
-    # Commit-4: Do NOT skip snapshot attach just because embedded odds exist.
-    # We still want close_odds_decimal for CLV diagnostics.
     embedded_present = int(df["odds_decimal"].notna().sum()) > 0
     if embedded_present:
         audit["note"] = "embedded odds detected; attaching close odds for CLV"
@@ -300,9 +282,7 @@ def _attach_odds_from_snapshots(
 
             dec = _american_to_decimal(am)
             if pd.notna(dec):
-                # Always fill close_odds_decimal for CLV diagnostics
                 df.at[i, "close_odds_decimal"] = float(dec)
-                # Backward compatible: if PnL odds not set (no embedded), use close odds
                 if pd.isna(df.at[i, "odds_decimal"]):
                     df.at[i, "odds_decimal"] = float(dec)
                 filled += 1
@@ -317,41 +297,61 @@ def _attach_odds_from_snapshots(
 
 
 # ---------------------------------------------------------------------
-# History join helpers (your existing history contains scores; we use them)
+# History join helpers (NEW: build merge_key if missing)
 # ---------------------------------------------------------------------
 
+def _ensure_history_merge_key(history_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Commit-3 safe: if history has no merge_key column, we build it deterministically from:
+      home_team / away_team / game_date (or common variants).
+    """
+    df = history_df.copy()
+    audit: Dict = {"merge_key_built": False, "used_cols": None}
+
+    if "merge_key" in df.columns:
+        return df, audit
+
+    cols = {c.lower(): c for c in df.columns}
+
+    date_col = cols.get("game_date") or cols.get("date") or cols.get("game_day")
+    home_col = cols.get("home_team") or cols.get("home") or cols.get("home_team_name")
+    away_col = cols.get("away_team") or cols.get("away") or cols.get("away_team_name") or cols.get("visitor_team")
+
+    if date_col is None or home_col is None or away_col is None:
+        raise RuntimeError(
+            "[picks_backtest] History CSV missing merge_key and could not infer "
+            "date/home/away columns. Please add merge_key or rename columns to include "
+            "game_date, home_team, away_team."
+        )
+
+    df["merge_key"] = [
+        _merge_key(h, a, d) for h, a, d in zip(df[home_col], df[away_col], df[date_col])
+    ]
+    audit["merge_key_built"] = True
+    audit["used_cols"] = {"game_date": date_col, "home_team": home_col, "away_team": away_col}
+    return df, audit
+
+
 def _find_score_cols(df: pd.DataFrame) -> Tuple[str, str]:
-    cols = [c.lower() for c in df.columns]
-    home_candidates = ["home_score", "home_pts", "home_points", "pts_home"]
-    away_candidates = ["away_score", "away_pts", "away_points", "pts_away"]
-
-    home_col = None
-    away_col = None
-    for cand in home_candidates:
-        if cand in cols:
-            home_col = df.columns[cols.index(cand)]
-            break
-    for cand in away_candidates:
-        if cand in cols:
-            away_col = df.columns[cols.index(cand)]
-            break
-
+    cols = {c.lower(): c for c in df.columns}
+    home_col = cols.get("home_score") or cols.get("home_pts") or cols.get("home_points") or cols.get("pts_home")
+    away_col = cols.get("away_score") or cols.get("away_pts") or cols.get("away_points") or cols.get("pts_away")
     if home_col is None or away_col is None:
-        raise RuntimeError("[picks_backtest] Could not find home/away score columns in history join output")
-
+        raise RuntimeError("[picks_backtest] Could not find home/away score columns in history")
     return home_col, away_col
 
 
 def _join_history(picks_df: pd.DataFrame, history_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
-    df = picks_df.copy()
-    if "merge_key" not in history_df.columns:
-        raise RuntimeError("[picks_backtest] History CSV missing merge_key column")
+    hist, mk_audit = _ensure_history_merge_key(history_df)
 
-    joined = df.merge(history_df, on="merge_key", how="left", validate="m:1")
+    joined = picks_df.merge(hist, on="merge_key", how="left", validate="m:1")
+    match_rate = float(joined["merge_key"].notna().mean()) if len(joined) else 0.0
+
     audit = {
-        "rows_in": int(len(df)),
+        "rows_in": int(len(picks_df)),
         "rows_out": int(len(joined)),
-        "history_match_rate": float(joined["merge_key"].notna().mean()) if len(joined) else 0.0,
+        "history_match_rate": match_rate,
+        "history_merge_key": mk_audit,
         "unmatched_rows": int(joined.isna().all(axis=1).sum()) if len(joined) else 0,
     }
     return joined, audit
@@ -394,9 +394,7 @@ def backtest_picks(
         np.nan,
     )
 
-    # -----------------------------------------------------------------
-    # Commit-4: Edge + CLV columns (additive, audit-first)
-    # -----------------------------------------------------------------
+    # Commit-4: Edge + CLV columns (additive)
     if "bet_odds_decimal" not in joined.columns:
         joined["bet_odds_decimal"] = np.nan
     joined["bet_odds_decimal"] = np.where(
@@ -444,7 +442,6 @@ def backtest_picks(
         "unresolved_missing_odds": int(joined["pnl"].isna().sum()),
     }
 
-    # Commit-4: CLV coverage stats (additive)
     clv_available_rate = float(joined["clv_implied"].notna().mean()) if "clv_implied" in joined.columns else 0.0
     if "clv_positive" in joined.columns and joined["clv_implied"].notna().any():
         clv_positive_rate = float(joined.loc[joined["clv_implied"].notna(), "clv_positive"].mean())
@@ -459,7 +456,7 @@ def backtest_picks(
         else False,
     }
 
-    # Write outputs (same as existing pattern)
+    # Write outputs
     resolved.to_csv(out_dir / "picks_backtest.csv", index=False)
 
     total_pnl = float(resolved["pnl"].sum()) if not resolved.empty else 0.0
