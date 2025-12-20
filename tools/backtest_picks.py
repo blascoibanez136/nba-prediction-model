@@ -17,9 +17,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
-import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -39,11 +36,11 @@ def _merge_key(home_team: str, away_team: str, game_date: str) -> str:
 # Odds helpers
 # ---------------------------------------------------------------------
 
-def _american_to_decimal(american: object) -> float:
-    if american is None:
+def _american_to_decimal(odds: object) -> float:
+    if odds is None:
         return np.nan
     try:
-        o = float(american)
+        o = float(odds)
     except Exception:
         return np.nan
     if np.isnan(o) or o == 0:
@@ -74,26 +71,7 @@ def _coerce_decimal_odds(x: object) -> float:
 
 
 # ---------------------------------------------------------------------
-# IO helpers
-# ---------------------------------------------------------------------
-
-def _safe_mkdir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
-
-def _write_json(path: Path, obj: object) -> None:
-    _safe_mkdir(path.parent)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, sort_keys=True, default=str)
-
-
-def _read_csv(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path)
-
-
-# ---------------------------------------------------------------------
 # Snapshot discovery (CLOSE preferred, OPEN fallback)
-# NOTE: This does NOT change ingestion rules; it preserves Commit-3 behavior.
 # ---------------------------------------------------------------------
 
 def _find_snapshot_file(snapshot_dir: Path, game_date: str) -> Optional[Path]:
@@ -118,9 +96,9 @@ def _find_snapshot_file(snapshot_dir: Path, game_date: str) -> Optional[Path]:
 
 def _discover_team_columns(snapshot_df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
     cols = [c.lower() for c in snapshot_df.columns]
-    # Common variants
     home_candidates = ["home_team", "home", "team_home", "home_name", "home_team_name"]
     away_candidates = ["away_team", "away", "team_away", "away_name", "away_team_name"]
+
     home_col = None
     away_col = None
     for cand in home_candidates:
@@ -136,9 +114,9 @@ def _discover_team_columns(snapshot_df: pd.DataFrame) -> Tuple[Optional[str], Op
 
 def _discover_ml_columns(snapshot_df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
     cols = [c.lower() for c in snapshot_df.columns]
-    # Common variants for moneyline
     home_ml_candidates = ["ml_home", "home_ml", "moneyline_home", "home_moneyline", "home_ml_close", "ml_home_close"]
     away_ml_candidates = ["ml_away", "away_ml", "moneyline_away", "away_moneyline", "away_ml_close", "ml_away_close"]
+
     home_ml = None
     away_ml = None
     for cand in home_ml_candidates:
@@ -173,17 +151,17 @@ def _normalize_picks(picks_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
         df["merge_key"] = [
             _merge_key(h, a, d) for h, a, d in zip(df["home_team"], df["away_team"], df["game_date"])
         ]
-        audit["inferred"]["merge_key"] = "constructed from home/away/game_date"
+        audit["inferred"]["merge_key"] = "built from teams+date (normalized)"
 
-    # bet_side inference
     if "bet_side" not in df.columns:
-        for c in ["pick_side", "side", "selection"]:
-            if c in df.columns:
-                df = df.rename(columns={c: "bet_side"})
-                audit["inferred"]["bet_side"] = f"renamed from {c}"
-                break
-    if "bet_side" not in df.columns:
-        raise RuntimeError(or("[picks_backtest] Cannot infer bet_side (need bet_side/pick_side/side)"))
+        if "pick_side" in df.columns:
+            df["bet_side"] = df["pick_side"].astype(str).str.upper()
+            audit["inferred"]["bet_side"] = "from pick_side"
+        elif "side" in df.columns:
+            df["bet_side"] = df["side"].astype(str).str.upper()
+            audit["inferred"]["bet_side"] = "from side"
+        else:
+            raise RuntimeError("[picks_backtest] Cannot infer bet_side (need bet_side/pick_side/side)")
 
     df["bet_side"] = df["bet_side"].astype(str).str.upper()
     df = df[df["bet_side"].isin(["HOME", "AWAY"])].copy()
@@ -193,12 +171,10 @@ def _normalize_picks(picks_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
     # - bet_odds_decimal: execution / pick-time odds (if embedded)
     # - close_odds_decimal: closing odds from snapshots (attached later)
     # The existing 'odds_decimal' column remains the odds used for PnL (backward compatible).
-
     embedded_cols = [c for c in ["bet_ml", "odds_decimal", "odds", "american_odds", "price", "line"] if c in df.columns]
     if embedded_cols:
         src = embedded_cols[0]
         df["bet_odds_decimal"] = df[src].apply(_coerce_decimal_odds)
-        # Backward compatible: use execution odds for PnL if we have them
         df["odds_decimal"] = df["bet_odds_decimal"]
         audit["mode"] = "embedded_odds"
         audit["inferred"]["bet_odds_decimal"] = f"from {src}"
@@ -208,7 +184,6 @@ def _normalize_picks(picks_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
         df["odds_decimal"] = np.nan
         audit["mode"] = "snapshot_odds"
 
-    # Always create close_odds_decimal (filled during snapshot attach when available)
     if "close_odds_decimal" not in df.columns:
         df["close_odds_decimal"] = np.nan
 
@@ -223,8 +198,8 @@ def _normalize_picks(picks_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
 def _first_non_null_scalar(val: Union[pd.Series, pd.DataFrame, object]) -> object:
     """
     Make 'val' scalar-safe:
-    - If Series: return first non-null
-    - If object: return as-is
+    - If Series: return first non-null element
+    - Else: return as-is
     """
     if isinstance(val, pd.Series):
         for x in val.values.tolist():
@@ -235,17 +210,12 @@ def _first_non_null_scalar(val: Union[pd.Series, pd.DataFrame, object]) -> objec
 
 
 def _get_cell(row: Union[pd.Series, pd.DataFrame], col: Optional[str]) -> object:
-    """
-    Return a scalar value for column 'col' from a snapshot row.
-    If snapshot has duplicate mk, row will be a DataFrame: choose first non-null in that column.
-    """
     if col is None:
         return np.nan
     if isinstance(row, pd.DataFrame):
         if col not in row.columns:
             return np.nan
         return _first_non_null_scalar(row[col])
-    # Series
     try:
         return row.get(col, np.nan)  # type: ignore
     except Exception:
@@ -272,7 +242,7 @@ def _attach_odds_from_snapshots(
     }
 
     if snapshot_dir is None:
-        audit["note"] = "no snapshot_dir provided; leaving odds unresolved"
+        audit["note"] = "snapshot_dir not provided; cannot attach odds"
         audit["odds_missing_after"] = int(df["odds_decimal"].isna().sum())
         return df, audit
 
@@ -283,18 +253,18 @@ def _attach_odds_from_snapshots(
         audit["note"] = "embedded odds detected; attaching close odds for CLV"
 
     filled = 0
-    matched = 0
-    found = 0
+    matched_rows = 0
+    found_snaps = 0
     dup_mk_rows = 0
 
-    # Load snapshot per date
     for game_date, grp in df.groupby("game_date"):
         snap_path = _find_snapshot_file(snapshot_dir, str(game_date))
         if snap_path is None:
             continue
 
-        found += 1
-        snap = _read_csv(snap_path)
+        found_snaps += 1
+        snap = pd.read_csv(snap_path)
+
         if audit["example_snapshot_columns"] is None:
             audit["example_snapshot_columns"] = list(snap.columns)
 
@@ -321,9 +291,8 @@ def _attach_odds_from_snapshots(
             if isinstance(row, pd.DataFrame):
                 dup_mk_rows += 1
 
-            matched += 1
+            matched_rows += 1
 
-            # Choose ML based on bet_side
             if df.at[i, "bet_side"] == "HOME":
                 am = _get_cell(row, home_ml_col)
             else:
@@ -331,15 +300,15 @@ def _attach_odds_from_snapshots(
 
             dec = _american_to_decimal(am)
             if pd.notna(dec):
-                # Always fill close_odds_decimal (for CLV diagnostics)
+                # Always fill close_odds_decimal for CLV diagnostics
                 df.at[i, "close_odds_decimal"] = float(dec)
-                # Backward compatible: if pnl odds not set (no embedded), use close as odds_decimal
+                # Backward compatible: if PnL odds not set (no embedded), use close odds
                 if pd.isna(df.at[i, "odds_decimal"]):
                     df.at[i, "odds_decimal"] = float(dec)
                 filled += 1
 
-    audit["snapshots_found"] = int(found)
-    audit["rows_with_snapshot_match"] = int(matched)
+    audit["snapshots_found"] = int(found_snaps)
+    audit["rows_with_snapshot_match"] = int(matched_rows)
     audit["odds_filled"] = int(filled)
     audit["odds_missing_after"] = int(df["odds_decimal"].isna().sum())
     audit["close_odds_missing_after"] = int(df["close_odds_decimal"].isna().sum())
@@ -348,75 +317,71 @@ def _attach_odds_from_snapshots(
 
 
 # ---------------------------------------------------------------------
-# History join
+# History join helpers (your existing history contains scores; we use them)
 # ---------------------------------------------------------------------
 
-def _load_history(history_csv: Path) -> pd.DataFrame:
-    hist = _read_csv(history_csv)
-    need = {"merge_key", "home_win"}
-    miss = need - set(hist.columns)
-    if miss:
-        raise RuntimeError(f"[picks_backtest] History missing required columns: {sorted(miss)}")
-    hist["home_win"] = hist["home_win"].astype(int)
-    return hist
+def _find_score_cols(df: pd.DataFrame) -> Tuple[str, str]:
+    cols = [c.lower() for c in df.columns]
+    home_candidates = ["home_score", "home_pts", "home_points", "pts_home"]
+    away_candidates = ["away_score", "away_pts", "away_points", "pts_away"]
+
+    home_col = None
+    away_col = None
+    for cand in home_candidates:
+        if cand in cols:
+            home_col = df.columns[cols.index(cand)]
+            break
+    for cand in away_candidates:
+        if cand in cols:
+            away_col = df.columns[cols.index(cand)]
+            break
+
+    if home_col is None or away_col is None:
+        raise RuntimeError("[picks_backtest] Could not find home/away score columns in history join output")
+
+    return home_col, away_col
 
 
 def _join_history(picks_df: pd.DataFrame, history_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
     df = picks_df.copy()
-    joined = df.merge(history_df[["merge_key", "home_win"]], on="merge_key", how="left", validate="m:1")
-    coverage = float(joined["home_win"].notna().mean()) if len(joined) else 0.0
+    if "merge_key" not in history_df.columns:
+        raise RuntimeError("[picks_backtest] History CSV missing merge_key column")
+
+    joined = df.merge(history_df, on="merge_key", how="left", validate="m:1")
     audit = {
         "rows_in": int(len(df)),
         "rows_out": int(len(joined)),
-        "history_match_rate": coverage,
-        "unmatched_rows": int(joined["home_win"].isna().sum()),
+        "history_match_rate": float(joined["merge_key"].notna().mean()) if len(joined) else 0.0,
+        "unmatched_rows": int(joined.isna().all(axis=1).sum()) if len(joined) else 0,
     }
     return joined, audit
 
 
 # ---------------------------------------------------------------------
-# Main backtest
+# Core backtest
 # ---------------------------------------------------------------------
 
 def backtest_picks(
-    picks_csvs: List[Path],
-    history_csv: Path,
+    picks_df: pd.DataFrame,
+    history_df: pd.DataFrame,
     snapshot_dir: Optional[Path],
     out_dir: Path,
     stake: float = 1.0,
-) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
-    if not picks_csvs:
-        raise RuntimeError("[picks_backtest] No picks files provided")
+) -> Tuple[pd.DataFrame, Dict]:
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    _safe_mkdir(out_dir)
+    if picks_df is None or picks_df.empty:
+        raise RuntimeError("[picks_backtest] picks_df is empty")
 
-    # Load + concat
-    parts = []
-    for p in picks_csvs:
-        if not p.exists():
-            continue
-        df = _read_csv(p)
-        if len(df) == 0:
-            continue
-        parts.append(df)
+    picks_df, norm_audit = _normalize_picks(picks_df)
+    picks_df, odds_audit = _attach_odds_from_snapshots(picks_df, snapshot_dir)
 
-    if not parts:
-        raise RuntimeError("[picks_backtest] No picks rows found in provided files")
+    joined, join_audit = _join_history(picks_df, history_df)
+    if joined is None or joined.empty:
+        raise RuntimeError("[picks_backtest] All picks dropped after history join")
 
-    picks = pd.concat(parts, ignore_index=True)
-
-    # Normalize picks + infer mode
-    picks, norm_audit = _normalize_picks(picks)
-
-    # Attach odds
-    picks, odds_audit = _attach_odds_from_snapshots(picks, snapshot_dir)
-
-    # Load history + join
-    hist = _load_history(history_csv)
-    joined, join_audit = _join_history(picks, hist)
-
-    # Compute result and pnl
-    joined["home_win"] = joined["home_win"].fillna(np.nan)
+    home_score_col, away_score_col = _find_score_cols(joined)
+    joined["home_win"] = (joined[home_score_col] > joined[away_score_col]).astype(int)
     joined["result"] = joined.apply(
         lambda r: r["home_win"] if r["bet_side"] == "HOME" else 1 - r["home_win"],
         axis=1,
@@ -429,20 +394,11 @@ def backtest_picks(
         np.nan,
     )
 
-
     # -----------------------------------------------------------------
     # Commit-4: Edge + CLV columns (additive, audit-first)
-    #
-    # Definitions:
-    # - bet_odds_decimal: execution odds if embedded, else odds_decimal
-    # - close_odds_decimal: closing odds from snapshots if available, else odds_decimal
-    # - edge_bet: p_model (chosen side) - implied_prob(bet_odds_decimal)
-    # - clv_implied: implied_prob(bet) - implied_prob(close)
     # -----------------------------------------------------------------
-
     if "bet_odds_decimal" not in joined.columns:
         joined["bet_odds_decimal"] = np.nan
-
     joined["bet_odds_decimal"] = np.where(
         joined["bet_odds_decimal"].notna(),
         joined["bet_odds_decimal"].astype(float),
@@ -451,7 +407,6 @@ def backtest_picks(
 
     if "close_odds_decimal" not in joined.columns:
         joined["close_odds_decimal"] = np.nan
-
     joined["close_odds_decimal"] = np.where(
         joined["close_odds_decimal"].notna(),
         joined["close_odds_decimal"].astype(float),
@@ -465,33 +420,21 @@ def backtest_picks(
         joined["close_odds_decimal"].notna(), 1.0 / joined["close_odds_decimal"], np.nan
     )
 
-    # p_model for the chosen side
-    joined["p_model"] = np.where(
-        joined["bet_side"] == "HOME",
-        joined["home_win_prob"].astype(float),
-        1.0 - joined["home_win_prob"].astype(float),
-    )
+    if "home_win_prob" in joined.columns:
+        joined["p_model"] = np.where(
+            joined["bet_side"] == "HOME",
+            joined["home_win_prob"].astype(float),
+            1.0 - joined["home_win_prob"].astype(float),
+        )
+        joined["edge_bet"] = joined["p_model"] - joined["p_implied_bet"]
+    else:
+        joined["p_model"] = np.nan
+        joined["edge_bet"] = np.nan
 
-    joined["edge_bet"] = joined["p_model"] - joined["p_implied_bet"]
-
-    # CLV in probability space (primary)
     joined["clv_implied"] = joined["p_implied_bet"] - joined["p_implied_close"]
     joined["clv_positive"] = joined["clv_implied"].apply(lambda x: bool(x > 0) if pd.notna(x) else False)
 
     resolved = joined[joined["pnl"].notna()].copy()
-
-    # Summary
-    summary = pd.DataFrame(
-        [
-            {
-                "bets": int(len(resolved)),
-                "wins": int((resolved["pnl"] > 0).sum()),
-                "win_rate": float((resolved["pnl"] > 0).mean()) if len(resolved) else np.nan,
-                "units": float(resolved["pnl"].sum()) if len(resolved) else 0.0,
-                "roi": float(resolved["pnl"].sum() / resolved["stake"].sum()) if len(resolved) else np.nan,
-            }
-        ]
-    )
 
     audit = {
         "normalize": norm_audit,
@@ -500,7 +443,6 @@ def backtest_picks(
         "resolved_bets": int(len(resolved)),
         "unresolved_missing_odds": int(joined["pnl"].isna().sum()),
     }
-
 
     # Commit-4: CLV coverage stats (additive)
     clv_available_rate = float(joined["clv_implied"].notna().mean()) if "clv_implied" in joined.columns else 0.0
@@ -512,57 +454,91 @@ def backtest_picks(
     audit["clv"] = {
         "clv_available_rate": clv_available_rate,
         "clv_positive_rate": clv_positive_rate,
-        "embedded_execution_odds_present": bool(joined["bet_odds_decimal"].notna().any()),
+        "embedded_execution_odds_present": bool(joined["bet_odds_decimal"].notna().any())
+        if "bet_odds_decimal" in joined.columns
+        else False,
     }
 
-    # Write outputs (existing contract)
-    backtest_csv = out_dir / "picks_backtest.csv"
-    summary_csv = out_dir / "picks_backtest_summary.csv"
-    audit_json = out_dir / "picks_backtest_audit.json"
+    # Write outputs (same as existing pattern)
+    resolved.to_csv(out_dir / "picks_backtest.csv", index=False)
 
-    resolved.to_csv(backtest_csv, index=False)
-    summary.to_csv(summary_csv, index=False)
-    _write_json(audit_json, audit)
+    total_pnl = float(resolved["pnl"].sum()) if not resolved.empty else 0.0
+    total_staked = float(resolved["stake"].sum()) if not resolved.empty else 0.0
+    roi = float(total_pnl / total_staked) if total_staked > 0 else np.nan
 
-    return resolved, summary, audit
+    summary = pd.DataFrame(
+        [{
+            "bets": int(len(resolved)),
+            "wins": int((resolved["pnl"] > 0).sum()) if not resolved.empty else 0,
+            "win_rate": float((resolved["pnl"] > 0).mean()) if not resolved.empty else np.nan,
+            "total_pnl": total_pnl,
+            "total_staked": total_staked,
+            "roi": roi,
+        }]
+    )
+    summary.to_csv(out_dir / "picks_backtest_summary.csv", index=False)
+
+    with open(out_dir / "picks_backtest_audit.json", "w", encoding="utf-8") as f:
+        json.dump(audit, f, indent=2, sort_keys=True, default=str)
+
+    if resolved.empty:
+        raise RuntimeError("[picks_backtest] No resolved bets. (All missing odds?)")
+
+    return resolved, audit
 
 
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
 
-def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--picks_dir", type=str, required=True, help="Directory containing picks_YYYY-MM-DD.csv files")
-    p.add_argument("--history_csv", type=str, required=True, help="Path to history CSV containing merge_key + home_win")
-    p.add_argument("--snapshot_dir", type=str, default=None, help="Directory containing snapshot CSVs (optional)")
-    p.add_argument("--out_dir", type=str, required=True, help="Output directory")
-    p.add_argument("--stake", type=float, default=1.0, help="Flat stake per bet (units)")
-    return p.parse_args(argv)
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Backtest picks (embedded odds OR snapshot odds).")
+    ap.add_argument("--picks-dir", required=True)
+    ap.add_argument("--pattern", default="picks_*.csv")
+    ap.add_argument("--history", required=True)
+    ap.add_argument("--snapshot-dir", default=None)
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--stake", type=float, default=1.0)
+    args = ap.parse_args()
 
-
-def main(argv: Optional[List[str]] = None) -> int:
-    args = _parse_args(argv)
-
-    picks_dir = Path(args.picks_dir)
-    history_csv = Path(args.history_csv)
-    snapshot_dir = Path(args.snapshot_dir) if args.snapshot_dir else None
     out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = out_dir / "picks_backtest_audit.json"
 
     try:
-        picks_csvs = sorted(picks_dir.glob("picks_*.csv"))
+        picks_dir = Path(args.picks_dir)
+        files = sorted(picks_dir.glob(args.pattern))
+        if not files:
+            raise RuntimeError(f"[picks_backtest] No picks files matched: {picks_dir}/{args.pattern}")
+
+        dfs = []
+        for f in files:
+            df = pd.read_csv(f)
+            if df is None or df.empty:
+                continue
+            df = df.dropna(axis=1, how="all")
+            df["_source_file"] = f.name
+            dfs.append(df)
+
+        if not dfs:
+            raise RuntimeError("[picks_backtest] All picks files were empty")
+
+        picks = pd.concat(dfs, ignore_index=True)
+        history = pd.read_csv(args.history)
+
+        snapshot_dir = Path(args.snapshot_dir) if args.snapshot_dir else None
         backtest_picks(
-            picks_csvs=picks_csvs,
-            history_csv=history_csv,
+            picks_df=picks,
+            history_df=history,
             snapshot_dir=snapshot_dir,
             out_dir=out_dir,
             stake=float(args.stake),
         )
         return 0
+
     except Exception as e:
-        # Always write an audit JSON on failure
-        _safe_mkdir(out_dir)
-        _write_json(out_dir / "picks_backtest_audit.json", {"error": str(e)})
+        with open(audit_path, "w", encoding="utf-8") as f:
+            json.dump({"error": str(e)}, f, indent=2, sort_keys=True)
         raise
 
 
