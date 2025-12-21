@@ -4,17 +4,7 @@ Historical Picks Runner (Commit-4 / Option A)
 
 Purpose:
 - Generate pick files across a historical date range from existing daily prediction CSVs.
-- This is additive and does NOT change prediction/backtest core behavior.
-- Mirrors src/eval/historical_prediction_runner.py but for picks.
-
-Inputs:
-- outputs/predictions_YYYY-MM-DD.csv (already produced by historical_prediction_runner)
-- Uses existing pick logic module (Commit-3 conservative picks), with a safe fallback.
-
-Outputs:
-- outputs/picks_YYYY-MM-DD.csv
-- outputs/audits/picks_YYYY-MM-DD_audit.json
-- outputs/historical_picks_runner_audit.json (coverage summary)
+- Additively annotate pick rows with execution price (bet_ml) resolved from close snapshots.
 
 Rules:
 - Deterministic
@@ -32,40 +22,34 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+PRED_RE = re.compile(r"^predictions_(\d{4}-\d{2}-\d{2})\.csv$")
 
 
 # -----------------------------
 # Config / Contracts
 # -----------------------------
 
-PRED_RE = re.compile(r"^predictions_(\d{4}-\d{2}-\d{2})\.csv$")
-
-
 @dataclass(frozen=True)
 class PicksRunnerConfig:
     prob_floor: float = 0.62
     max_picks_per_day: int = 3
     min_games_for_picks: int = 2
-    # If you have calibration info in preds, these are safe defaults:
     require_calibration_keep: bool = False
     max_abs_gap: float = 0.08
-    # Column names
     date_col: str = "game_date"
     prob_col: str = "home_win_prob"
 
 
 # -----------------------------
-# Import existing pick logic (preferred)
+# Commit-3 import (preferred)
 # -----------------------------
 
 def _try_import_commit3_picks():
-    """
-    Try to import your existing conservative picks generator.
-    We keep this flexible since file/module names vary between setups.
-    """
     candidates = [
         ("src.picks.conservative_picks", "generate_conservative_picks"),
         ("src.picks.picks", "generate_conservative_picks"),
@@ -81,7 +65,7 @@ def _try_import_commit3_picks():
 
 
 # -----------------------------
-# Minimal fallback conservative picks (only used if import fails)
+# Minimal fallback picks (only if import fails)
 # -----------------------------
 
 def _fallback_generate_conservative_picks(
@@ -89,16 +73,8 @@ def _fallback_generate_conservative_picks(
     *,
     config: PicksRunnerConfig,
 ) -> Tuple[pd.DataFrame, Dict]:
-    """
-    Fallback conservative picks:
-    - ML HOME only
-    - prob_floor
-    - max_picks_per_day cap
-    - deterministic ordering by prob desc
-    """
     df = preds_df.copy()
 
-    # normalize date column
     if config.date_col not in df.columns and "date" in df.columns:
         df = df.rename(columns={"date": config.date_col})
     if config.date_col not in df.columns:
@@ -146,20 +122,11 @@ def _fallback_generate_conservative_picks(
     picks["pick_type"] = "ML"
     picks["pick_side"] = "HOME"
     picks["confidence"] = picks["home_win_prob"]
-    picks["reason"] = picks["home_win_prob"].apply(
-        lambda p: f"prob>={config.prob_floor:.2f};prob={float(p):.3f}"
-    )
+    picks["reason"] = picks["home_win_prob"].apply(lambda p: f"prob>={config.prob_floor:.2f};prob={float(p):.3f}")
 
-    out_cols = [
-        config.date_col,
-        "home_team",
-        "away_team",
-        "pick_type",
-        "pick_side",
-        "confidence",
-        "reason",
-    ]
+    out_cols = [config.date_col, "home_team", "away_team", "pick_type", "pick_side", "confidence", "reason"]
     out_cols = [c for c in out_cols if c in picks.columns]
+
     audit = {
         "n_games": n_games,
         "n_candidates": int(len(candidates)),
@@ -176,7 +143,164 @@ def _fallback_generate_conservative_picks(
 
 
 # -----------------------------
-# File discovery helpers
+# Odds annotation helpers (additive)
+# -----------------------------
+
+def _american_to_decimal(odds: object) -> float:
+    if odds is None:
+        return np.nan
+    try:
+        o = float(odds)
+    except Exception:
+        return np.nan
+    if np.isnan(o) or o == 0:
+        return np.nan
+    if o > 0:
+        return 1.0 + (o / 100.0)
+    return 1.0 + (100.0 / abs(o))
+
+
+def _merge_key(home_team: str, away_team: str, game_date: str) -> str:
+    return f"{str(home_team).strip().lower()}__{str(away_team).strip().lower()}__{str(game_date).strip()}"
+
+
+def _find_close_snapshot(snapshot_dir: Path, game_date: str) -> Optional[Path]:
+    ymd = str(game_date).replace("-", "")
+    p = snapshot_dir / f"close_{ymd}.csv"
+    return p if p.exists() else None
+
+
+def _discover_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+    cols = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in cols:
+            return cols[cand.lower()]
+    return None
+
+
+def _pick_book_row(snap: pd.DataFrame, preferred_books: list[str]) -> Tuple[pd.DataFrame, Dict]:
+    audit: Dict = {"book_col": None, "selected_book": None, "rule": None}
+
+    book_col = _discover_col(snap, ["book", "book_name", "sportsbook", "sportsbook_name"])
+    audit["book_col"] = book_col
+
+    if book_col and book_col in snap.columns:
+        s = snap.copy()
+        s[book_col] = s[book_col].astype(str)
+
+        for b in preferred_books:
+            m = s[s[book_col].str.lower() == b.lower()]
+            if not m.empty:
+                m = m.sort_values(by=[book_col], kind="mergesort").head(1)
+                audit["selected_book"] = b
+                audit["rule"] = "preferred_book"
+                return m, audit
+
+        s2 = s.sort_values(by=[book_col], kind="mergesort").head(1)
+        audit["selected_book"] = str(s2.iloc[0][book_col])
+        audit["rule"] = "lexicographic_book"
+        return s2, audit
+
+    s = snap.copy()
+    sort_cols = list(s.columns)
+    for c in sort_cols:
+        s[c] = s[c].astype(str)
+    s = s.sort_values(by=sort_cols, kind="mergesort").head(1)
+    audit["rule"] = "stable_sort_all_cols"
+    return s, audit
+
+
+def _attach_bet_ml_from_close_snapshot(
+    picks_df: pd.DataFrame,
+    *,
+    snapshot_dir: Path,
+    preferred_books: list[str],
+) -> Tuple[pd.DataFrame, Dict]:
+    df = picks_df.copy()
+    audit: Dict = {
+        "snapshot_dir": str(snapshot_dir),
+        "snapshot_file": None,
+        "attached_rows": 0,
+        "missing_snapshot": False,
+        "missing_cols": [],
+        "book_selection": None,
+    }
+    if df.empty:
+        return df, audit
+
+    if "game_date" not in df.columns:
+        audit["missing_cols"].append("game_date")
+        return df, audit
+
+    game_date = str(df["game_date"].iloc[0])
+    snap_path = _find_close_snapshot(snapshot_dir, game_date)
+    if snap_path is None:
+        audit["missing_snapshot"] = True
+        return df, audit
+
+    audit["snapshot_file"] = snap_path.name
+    snap = pd.read_csv(snap_path)
+
+    home_team_col = _discover_col(snap, ["home_team", "home", "team_home", "home_name", "home_team_name"])
+    away_team_col = _discover_col(snap, ["away_team", "away", "team_away", "away_name", "away_team_name"])
+    home_ml_col = _discover_col(snap, ["ml_home", "home_ml", "moneyline_home", "home_moneyline", "home_ml_close", "ml_home_close"])
+    away_ml_col = _discover_col(snap, ["ml_away", "away_ml", "moneyline_away", "away_moneyline", "away_ml_close", "ml_away_close"])
+
+    missing = []
+    for name, col in [("home_team", home_team_col), ("away_team", away_team_col), ("ml_home", home_ml_col), ("ml_away", away_ml_col)]:
+        if col is None:
+            missing.append(name)
+    if missing:
+        audit["missing_cols"] = missing
+        return df, audit
+
+    snap = snap.copy()
+    snap["merge_key"] = [_merge_key(h, a, game_date) for h, a in zip(snap[home_team_col], snap[away_team_col])]
+
+    bet_mls = []
+    bet_books = []
+    bet_rules = []
+    bet_odds_dec = []
+    bet_snapfile = []
+
+    for _, r in df.iterrows():
+        mk = _merge_key(r["home_team"], r["away_team"], game_date)
+        rows = snap[snap["merge_key"] == mk]
+        if rows.empty:
+            bet_mls.append(np.nan)
+            bet_books.append(None)
+            bet_rules.append("no_match")
+            bet_odds_dec.append(np.nan)
+            bet_snapfile.append(snap_path.name)
+            continue
+
+        chosen, book_audit = _pick_book_row(rows, preferred_books)
+        audit["book_selection"] = book_audit
+
+        side = str(r.get("pick_side", "HOME")).upper()
+        if side == "AWAY":
+            am = chosen.iloc[0][away_ml_col]
+        else:
+            am = chosen.iloc[0][home_ml_col]
+
+        bet_mls.append(am)
+        bet_books.append(book_audit.get("selected_book"))
+        bet_rules.append(book_audit.get("rule"))
+        bet_odds_dec.append(_american_to_decimal(am))
+        bet_snapfile.append(snap_path.name)
+
+    df["bet_ml"] = bet_mls
+    df["bet_odds_decimal"] = bet_odds_dec
+    df["bet_book"] = bet_books
+    df["bet_book_rule"] = bet_rules
+    df["bet_snapshot_file"] = bet_snapfile
+
+    audit["attached_rows"] = int(df["bet_ml"].notna().sum())
+    return df, audit
+
+
+# -----------------------------
+# File discovery
 # -----------------------------
 
 def _list_prediction_files(pred_dir: Path) -> List[Tuple[str, Path]]:
@@ -197,6 +321,8 @@ def run_historical_picks(
     *,
     pred_dir: Path,
     out_dir: Path,
+    snapshot_dir: Path,
+    preferred_books: list[str],
     start: Optional[str],
     end: Optional[str],
     overwrite: bool,
@@ -210,7 +336,6 @@ def run_historical_picks(
     if not files:
         raise RuntimeError(f"[historical_picks] No prediction files found in {pred_dir} matching predictions_YYYY-MM-DD.csv")
 
-    # Filter by date range (lexicographic works for YYYY-MM-DD)
     if start:
         files = [(d, p) for (d, p) in files if d >= start]
     if end:
@@ -219,7 +344,6 @@ def run_historical_picks(
     if not files:
         raise RuntimeError("[historical_picks] No prediction files remain after date filtering.")
 
-    # Prefer existing conservative picks function if present
     commit3_fn = _try_import_commit3_picks()
 
     n_days = 0
@@ -228,6 +352,8 @@ def run_historical_picks(
     n_skipped_empty = 0
     n_errors = 0
     errors: List[Dict] = []
+    n_odds_attached = 0
+    n_missing_snapshot = 0
 
     for game_date, pred_path in files:
         n_days += 1
@@ -252,12 +378,10 @@ def run_historical_picks(
                 )
                 continue
 
-            # Ensure game_date exists inside preds for downstream join/backtest
             if config.date_col not in preds.columns:
                 preds[config.date_col] = game_date
 
             if commit3_fn is not None:
-                # Try calling your existing function with flexible signature
                 try:
                     picks, audit = commit3_fn(
                         preds,
@@ -268,18 +392,34 @@ def run_historical_picks(
                         max_abs_gap=config.max_abs_gap,
                     )
                 except TypeError:
-                    # Fallback if signature differs
                     picks, audit = commit3_fn(preds)
             else:
                 picks, audit = _fallback_generate_conservative_picks(preds, config=config)
 
-            # Write outputs (even if empty, for determinism and traceability)
+            # Ensure game_date on picks
+            if not picks.empty and "game_date" not in picks.columns:
+                picks["game_date"] = game_date
+
+            # NEW: annotate picks with bet_ml from close snapshot (additive)
+            odds_audit = {}
+            if not picks.empty:
+                picks, odds_audit = _attach_bet_ml_from_close_snapshot(
+                    picks,
+                    snapshot_dir=snapshot_dir,
+                    preferred_books=preferred_books,
+                )
+                n_odds_attached += int(odds_audit.get("attached_rows", 0))
+                if odds_audit.get("missing_snapshot"):
+                    n_missing_snapshot += 1
+
             picks.to_csv(picks_path, index=False)
+
             audit_out = {
                 "game_date": game_date,
                 "pred_file": pred_path.name,
                 "picks_file": picks_path.name,
                 **(audit if isinstance(audit, dict) else {"audit": str(audit)}),
+                "odds_annotation": odds_audit,
             }
             audit_path.write_text(json.dumps(audit_out, indent=2, sort_keys=True), encoding="utf-8")
             n_written += 1
@@ -291,12 +431,13 @@ def run_historical_picks(
             err = {"game_date": game_date, "pred_file": pred_path.name, "error": repr(e)}
             errors.append(err)
             logger.exception("[historical_picks] error for %s: %s", game_date, e)
-            # still write an audit stub so we don't silently drop
             audit_path.write_text(json.dumps({"game_date": game_date, "status": "error", **err}, indent=2, sort_keys=True), encoding="utf-8")
 
     runner_audit = {
         "pred_dir": str(pred_dir),
         "out_dir": str(out_dir),
+        "snapshot_dir": str(snapshot_dir),
+        "preferred_books": preferred_books,
         "start": start,
         "end": end,
         "overwrite": overwrite,
@@ -305,7 +446,11 @@ def run_historical_picks(
         "n_skipped_exists": n_skipped_exists,
         "n_skipped_empty_predictions": n_skipped_empty,
         "n_errors": n_errors,
-        "errors": errors[:50],  # cap
+        "errors": errors[:50],
+        "odds_annotation": {
+            "total_rows_with_bet_ml_attached": n_odds_attached,
+            "days_missing_snapshot": n_missing_snapshot,
+        },
         "policy": {
             "prob_floor": config.prob_floor,
             "max_picks_per_day": config.max_picks_per_day,
@@ -313,7 +458,7 @@ def run_historical_picks(
             "require_calibration_keep": config.require_calibration_keep,
             "max_abs_gap": config.max_abs_gap,
         },
-        "note": "Additive historical picks generation; does not modify prediction artifacts.",
+        "note": "Additive historical picks generation + bet_ml annotation; does not modify prediction artifacts.",
     }
 
     (out_dir / "historical_picks_runner_audit.json").write_text(
@@ -333,7 +478,15 @@ def main() -> int:
     ap.add_argument("--end", default=None, help="YYYY-MM-DD inclusive")
     ap.add_argument("--overwrite", action="store_true", default=False)
 
-    # Conservative policy knobs (Commit-3 defaults)
+    # NEW: snapshots
+    ap.add_argument("--snapshot-dir", default="data/_snapshots", help="Directory containing close_YYYYMMDD.csv")
+    ap.add_argument(
+        "--preferred-books",
+        default="DraftKings,FanDuel,BetMGM,Caesars",
+        help="Comma-separated list used for deterministic book selection if multiple rows exist",
+    )
+
+    # Conservative policy knobs
     ap.add_argument("--prob-floor", type=float, default=0.62)
     ap.add_argument("--max-picks-per-day", type=int, default=3)
     ap.add_argument("--min-games-for-picks", type=int, default=2)
@@ -342,9 +495,13 @@ def main() -> int:
 
     args = ap.parse_args()
 
+    preferred_books = [s.strip() for s in str(args.preferred_books).split(",") if s.strip()]
+
     audit = run_historical_picks(
         pred_dir=Path(args.pred_dir),
         out_dir=Path(args.out_dir),
+        snapshot_dir=Path(args.snapshot_dir),
+        preferred_books=preferred_books,
         start=args.start,
         end=args.end,
         overwrite=bool(args.overwrite),
