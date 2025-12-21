@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -297,7 +297,7 @@ def _attach_odds_from_snapshots(
 
 
 # ---------------------------------------------------------------------
-# History join helpers (NEW: build merge_key if missing)
+# History join helpers (build merge_key if missing)
 # ---------------------------------------------------------------------
 
 def _ensure_history_merge_key(history_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
@@ -342,17 +342,26 @@ def _find_score_cols(df: pd.DataFrame) -> Tuple[str, str]:
 
 
 def _join_history(picks_df: pd.DataFrame, history_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Elite-grade join hygiene:
+    - merge_key is the only shared contract.
+    - drop any overlapping non-key columns from history before merge to prevent suffix collisions.
+    """
     hist, mk_audit = _ensure_history_merge_key(history_df)
 
-    joined = picks_df.merge(hist, on="merge_key", how="left", validate="m:1")
-    match_rate = float(joined["merge_key"].notna().mean()) if len(joined) else 0.0
+    overlapping = set(picks_df.columns).intersection(set(hist.columns))
+    overlapping.discard("merge_key")  # merge_key is the only join contract
+
+    hist_safe = hist.drop(columns=list(overlapping), errors="ignore")
+
+    joined = picks_df.merge(hist_safe, on="merge_key", how="left", validate="m:1")
 
     audit = {
         "rows_in": int(len(picks_df)),
         "rows_out": int(len(joined)),
-        "history_match_rate": match_rate,
         "history_merge_key": mk_audit,
-        "unmatched_rows": int(joined.isna().all(axis=1).sum()) if len(joined) else 0,
+        "overlapping_columns_dropped_from_history": sorted(overlapping),
+        "history_match_rate": float(joined["merge_key"].notna().mean()) if len(joined) else 0.0,
     }
     return joined, audit
 
@@ -442,6 +451,9 @@ def backtest_picks(
         "unresolved_missing_odds": int(joined["pnl"].isna().sum()),
     }
 
+    # Truthful embedded execution odds flag
+    embedded_execution = bool(norm_audit.get("mode") == "embedded_odds")
+
     clv_available_rate = float(joined["clv_implied"].notna().mean()) if "clv_implied" in joined.columns else 0.0
     if "clv_positive" in joined.columns and joined["clv_implied"].notna().any():
         clv_positive_rate = float(joined.loc[joined["clv_implied"].notna(), "clv_positive"].mean())
@@ -451,9 +463,7 @@ def backtest_picks(
     audit["clv"] = {
         "clv_available_rate": clv_available_rate,
         "clv_positive_rate": clv_positive_rate,
-        "embedded_execution_odds_present": bool(joined["bet_odds_decimal"].notna().any())
-        if "bet_odds_decimal" in joined.columns
-        else False,
+        "embedded_execution_odds_present": embedded_execution,
     }
 
     # Write outputs
