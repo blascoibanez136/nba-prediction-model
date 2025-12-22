@@ -92,7 +92,6 @@ def _find_snapshot_file(snapshot_dir: Path, game_date: str, snapshot_type: str) 
             snapshot_dir / f"open_{ymd}.csv",
         ]
     else:
-        # close: keep legacy fallbacks
         candidates = [
             snapshot_dir / f"close_{ymd}.csv",
             snapshot_dir / f"{ymd}.csv",
@@ -177,7 +176,7 @@ def _normalize_picks(picks_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
     df["bet_side"] = df["bet_side"].astype(str).str.upper()
     df = df[df["bet_side"].isin(["HOME", "AWAY"])].copy()
 
-    # Commit-4 (additive): support embedded execution odds when present
+    # Embedded execution odds when present
     embedded_cols = [c for c in ["bet_ml", "odds_decimal", "odds", "american_odds", "price", "line"] if c in df.columns]
     if embedded_cols:
         src = embedded_cols[0]
@@ -293,7 +292,6 @@ def _attach_one_snapshot_type(
                 df.at[i, out_col] = float(dec)
                 filled += 1
 
-    # Write per-type audit fields (additive)
     audit_key = f"{snapshot_type}_attach"
     audit[audit_key] = {
         "snapshots_found": int(found_snaps),
@@ -315,15 +313,12 @@ def _attach_odds_from_snapshots(
     snapshot_dir: Optional[Path],
 ) -> Tuple[pd.DataFrame, Dict]:
     """
-    Attach CLOSE odds (existing behavior) and optionally OPEN odds (new additive behavior).
+    Attach CLOSE odds (existing behavior) and optionally OPEN odds (additive).
 
-    Existing behavior preserved:
     - close_odds_decimal is filled from CLOSE snapshots when possible
     - odds_decimal is filled from close when in snapshot_odds mode
-    - when embedded odds exist, we still fill close_odds_decimal for CLV
-
-    New additive behavior:
-    - open_odds_decimal is filled from OPEN snapshots when possible
+    - if embedded odds exist, we keep them as execution odds and still attach close/open for CLV
+    - open_odds_decimal is filled from OPEN snapshots when possible (diagnostics / CLV)
     """
     df = picks_df.copy()
     audit: Dict = {
@@ -343,13 +338,12 @@ def _attach_odds_from_snapshots(
     if embedded_present:
         audit["note"] = "embedded odds detected; attaching close+open odds for CLV diagnostics"
 
-    # Ensure columns exist (additive)
     if "close_odds_decimal" not in df.columns:
         df["close_odds_decimal"] = np.nan
     if "open_odds_decimal" not in df.columns:
         df["open_odds_decimal"] = np.nan
 
-    # Attach CLOSE (existing required behavior)
+    # CLOSE
     df, audit = _attach_one_snapshot_type(
         df=df,
         snapshot_dir=snapshot_dir,
@@ -358,7 +352,7 @@ def _attach_odds_from_snapshots(
         audit=audit,
     )
 
-    # Preserve legacy behavior: fill odds_decimal from CLOSE when no embedded execution price
+    # If snapshot mode, execution odds come from CLOSE
     if not embedded_present:
         df["odds_decimal"] = np.where(
             df["odds_decimal"].isna() & df["close_odds_decimal"].notna(),
@@ -366,7 +360,7 @@ def _attach_odds_from_snapshots(
             df["odds_decimal"],
         )
 
-    # Attach OPEN (new, additive)
+    # OPEN (additive)
     df, audit = _attach_one_snapshot_type(
         df=df,
         snapshot_dir=snapshot_dir,
@@ -375,7 +369,6 @@ def _attach_odds_from_snapshots(
         audit=audit,
     )
 
-    # Summary convenience fields (additive)
     audit["odds_decimal_missing_after"] = int(df["odds_decimal"].isna().sum())
     audit["close_odds_missing_after"] = int(df["close_odds_decimal"].isna().sum())
     audit["open_odds_missing_after"] = int(df["open_odds_decimal"].isna().sum())
@@ -388,8 +381,7 @@ def _attach_odds_from_snapshots(
 
 def _ensure_history_merge_key(history_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
     """
-    Commit-3 safe: if history has no merge_key column, we build it deterministically from:
-      home_team / away_team / game_date (or common variants).
+    If history has no merge_key column, build deterministically from common column names.
     """
     df = history_df.copy()
     audit: Dict = {"merge_key_built": False, "used_cols": None}
@@ -429,9 +421,11 @@ def _find_score_cols(df: pd.DataFrame) -> Tuple[str, str]:
 
 def _join_history(picks_df: pd.DataFrame, history_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
     """
-    Elite-grade join hygiene:
-    - merge_key is the only shared contract.
-    - drop any overlapping non-key columns from history before merge to prevent suffix collisions.
+    Join hygiene: merge_key is the only shared contract.
+
+    CRITICAL FIX:
+    - Drop overlapping columns from history before merge to avoid pandas suffix collisions
+      (the exact error you hit: duplicate columns like home_team_x, game_date_x, etc.).
     """
     hist, mk_audit = _ensure_history_merge_key(history_df)
 
@@ -489,7 +483,7 @@ def backtest_picks(
         np.nan,
     )
 
-    # Commit-4: Edge + CLV columns (additive)
+    # Execution odds
     if "bet_odds_decimal" not in joined.columns:
         joined["bet_odds_decimal"] = np.nan
     joined["bet_odds_decimal"] = np.where(
@@ -498,6 +492,7 @@ def backtest_picks(
         joined["odds_decimal"].astype(float),
     )
 
+    # Close odds
     if "close_odds_decimal" not in joined.columns:
         joined["close_odds_decimal"] = np.nan
     joined["close_odds_decimal"] = np.where(
@@ -506,7 +501,7 @@ def backtest_picks(
         joined["odds_decimal"].astype(float),
     )
 
-    # NEW (additive): OPEN odds presence (do not backfill anything; diagnostics only)
+    # Open odds (additive, diagnostics only if missing)
     if "open_odds_decimal" not in joined.columns:
         joined["open_odds_decimal"] = np.nan
 
@@ -533,12 +528,12 @@ def backtest_picks(
         joined["p_model"] = np.nan
         joined["edge_bet"] = np.nan
 
-    # Existing CLV (execution/bet vs close)
+    # CLV: execution vs close
     joined["clv_implied"] = joined["p_implied_bet"] - joined["p_implied_close"]
     joined["clv_positive"] = joined["clv_implied"].apply(lambda x: bool(x > 0) if pd.notna(x) else False)
 
-    # NEW CLV (OPEN → CLOSE)
-    # Positive means OPEN implied prob > CLOSE implied prob (market moved toward your side by close).
+    # CLV: OPEN → CLOSE (THIS IS THE NEW WIRING YOU WANT)
+    # Positive means market moved toward your side by close.
     joined["clv_implied_open_to_close"] = joined["p_implied_open"] - joined["p_implied_close"]
     joined["clv_open_positive"] = joined["clv_implied_open_to_close"].apply(lambda x: bool(x > 0) if pd.notna(x) else False)
 
@@ -552,17 +547,14 @@ def backtest_picks(
         "unresolved_missing_odds": int(joined["pnl"].isna().sum()),
     }
 
-    # Truthful embedded execution odds flag
     embedded_execution = bool(norm_audit.get("mode") == "embedded_odds")
 
-    # Execution-vs-close CLV
     clv_available_rate = float(joined["clv_implied"].notna().mean()) if "clv_implied" in joined.columns else 0.0
     if "clv_positive" in joined.columns and joined["clv_implied"].notna().any():
         clv_positive_rate = float(joined.loc[joined["clv_implied"].notna(), "clv_positive"].mean())
     else:
         clv_positive_rate = None
 
-    # Open-to-close CLV
     clv_open_available_rate = float(joined["clv_implied_open_to_close"].notna().mean())
     if joined["clv_implied_open_to_close"].notna().any():
         clv_open_positive_rate = float(joined.loc[joined["clv_implied_open_to_close"].notna(), "clv_open_positive"].mean())
@@ -581,7 +573,7 @@ def backtest_picks(
         },
     }
 
-    # Write outputs
+    # Outputs
     resolved.to_csv(out_dir / "picks_backtest.csv", index=False)
 
     total_pnl = float(resolved["pnl"].sum()) if not resolved.empty else 0.0
