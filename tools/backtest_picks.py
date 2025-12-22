@@ -166,7 +166,7 @@ def _normalize_picks(picks_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
     # Capture gate metadata if present (for E1.6 fail-closed)
     # We do NOT invent gating; we only propagate metadata if the generator includes it.
     gate_cols = [c for c in ["edge_buffer", "edge_gate_buffer", "gate_edge_buffer", "edge_gate"] if c in df.columns]
-    if “gate_applied” in df.columns:  # type: ignore  # (keeps lint noise away in some envs)
+    if "gate_applied" in df.columns:  # type: ignore  # (keeps lint noise away in some envs)
         pass
     if gate_cols:
         audit["inferred"]["edge_gate_buffer_col"] = gate_cols[0]
