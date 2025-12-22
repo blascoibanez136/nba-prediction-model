@@ -163,6 +163,20 @@ def _normalize_picks(picks_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
         ]
         audit["inferred"]["merge_key"] = "built from teams+date (normalized)"
 
+    # Capture gate metadata if present (for E1.6 fail-closed)
+    # We do NOT invent gating; we only propagate metadata if the generator includes it.
+    gate_cols = [c for c in ["edge_buffer", "edge_gate_buffer", "gate_edge_buffer", "edge_gate"] if c in df.columns]
+    if “gate_applied” in df.columns:  # type: ignore  # (keeps lint noise away in some envs)
+        pass
+    if gate_cols:
+        audit["inferred"]["edge_gate_buffer_col"] = gate_cols[0]
+        try:
+            # store a stable scalar if constant
+            vals = pd.to_numeric(df[gate_cols[0]], errors="coerce").dropna().unique().tolist()
+            audit["edge_gate_buffer_used"] = float(vals[0]) if len(vals) == 1 else vals
+        except Exception:
+            audit["edge_gate_buffer_used"] = None
+
     if "bet_side" not in df.columns:
         if "pick_side" in df.columns:
             df["bet_side"] = df["pick_side"].astype(str).str.upper()
@@ -174,7 +188,9 @@ def _normalize_picks(picks_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
             raise RuntimeError("[picks_backtest] Cannot infer bet_side (need bet_side/pick_side/side)")
 
     df["bet_side"] = df["bet_side"].astype(str).str.upper()
+    before_side_filter = int(len(df))
     df = df[df["bet_side"].isin(["HOME", "AWAY"])].copy()
+    audit["bet_side_filtered_out"] = int(before_side_filter - len(df))
 
     # Embedded execution odds when present
     embedded_cols = [c for c in ["bet_ml", "odds_decimal", "odds", "american_odds", "price", "line"] if c in df.columns]
@@ -424,8 +440,7 @@ def _join_history(picks_df: pd.DataFrame, history_df: pd.DataFrame) -> Tuple[pd.
     Join hygiene: merge_key is the only shared contract.
 
     CRITICAL FIX:
-    - Drop overlapping columns from history before merge to avoid pandas suffix collisions
-      (the exact error you hit: duplicate columns like home_team_x, game_date_x, etc.).
+    - Drop overlapping columns from history before merge to avoid pandas suffix collisions.
     """
     hist, mk_audit = _ensure_history_merge_key(history_df)
 
@@ -441,9 +456,169 @@ def _join_history(picks_df: pd.DataFrame, history_df: pd.DataFrame) -> Tuple[pd.
         "rows_out": int(len(joined)),
         "history_merge_key": mk_audit,
         "overlapping_columns_dropped_from_history": sorted(overlapping),
-        "history_match_rate": float(joined["merge_key"].notna().mean()) if len(joined) else 0.0,
     }
+
+    # "match rate" should be based on whether any outcome columns are present after join,
+    # but we keep it simple and stable: how many rows retained at all.
+    audit["history_rows_non_null_merge_key_rate"] = float(joined["merge_key"].notna().mean()) if len(joined) else 0.0
     return joined, audit
+
+
+# ---------------------------------------------------------------------
+# E1 fail-closed + baseline helpers
+# ---------------------------------------------------------------------
+
+_REQUIRED_OUTPUT_COLS = [
+    "game_date", "merge_key", "bet_side",
+    "p_model", "bet_odds_decimal", "edge_bet",
+    "open_odds_decimal", "close_odds_decimal",
+    "clv_implied_open_to_close", "clv_open_positive",
+    "pnl", "stake",
+]
+
+
+def _assert_required_columns(df: pd.DataFrame, cols: list[str], *, where: str) -> None:
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"[picks_backtest][FAIL_CLOSED] Missing required columns at {where}: {missing}")
+
+
+def _assert_ranges(resolved: pd.DataFrame) -> None:
+    # bet_odds_decimal strictly > 1.0 when present
+    bad_odds = resolved["bet_odds_decimal"].notna() & (resolved["bet_odds_decimal"].astype(float) <= 1.0)
+    if bool(bad_odds.any()):
+        ex = resolved.loc[bad_odds, ["game_date", "merge_key", "bet_side", "bet_odds_decimal"]].head(5).to_dict("records")
+        raise RuntimeError(f"[picks_backtest][FAIL_CLOSED] bet_odds_decimal <= 1.0 found. Examples: {ex}")
+
+    # p_model within [0,1] when present
+    pm = resolved["p_model"]
+    bad_pm = pm.notna() & ((pm.astype(float) < 0.0) | (pm.astype(float) > 1.0))
+    if bool(bad_pm.any()):
+        ex = resolved.loc[bad_pm, ["game_date", "merge_key", "bet_side", "p_model"]].head(5).to_dict("records")
+        raise RuntimeError(f"[picks_backtest][FAIL_CLOSED] p_model out of [0,1] found. Examples: {ex}")
+
+
+def _drawdown_stats(pnl_series: pd.Series) -> Dict[str, float]:
+    if pnl_series is None or len(pnl_series) == 0:
+        return {"max_drawdown": 0.0, "max_drawdown_length": 0.0}
+
+    cum = pnl_series.cumsum()
+    peak = cum.cummax()
+    dd = cum - peak
+
+    max_dd = float(dd.min())  # negative number (worst drawdown)
+    # drawdown length: longest consecutive period where dd < 0
+    in_dd = (dd < 0).astype(int)
+    # segments defined by "back to 0" events
+    seg = (dd >= 0).cumsum()
+    dd_len = int(in_dd.groupby(seg).sum().max()) if len(in_dd) else 0
+
+    return {"max_drawdown": max_dd, "max_drawdown_length": float(dd_len)}
+
+
+def _write_e1_baseline(out_dir: Path, *, resolved: pd.DataFrame, audit: Dict) -> Dict:
+    # Coverage (odds attach audit)
+    odds_attach = audit.get("odds_attach", {}) if isinstance(audit, dict) else {}
+    open_miss = odds_attach.get("open_odds_missing_after")
+    close_miss = odds_attach.get("close_odds_missing_after")
+
+    open_cov = None
+    close_cov = None
+    try:
+        if open_miss is not None:
+            open_cov = float(1.0 - (float(open_miss) / max(len(resolved), 1)))
+        if close_miss is not None:
+            close_cov = float(1.0 - (float(close_miss) / max(len(resolved), 1)))
+    except Exception:
+        open_cov, close_cov = None, None
+
+    # CLV metrics
+    clv = resolved["clv_implied_open_to_close"]
+    clv_avail = float(clv.notna().mean())
+    clv_pos = float((resolved.loc[clv.notna(), "clv_open_positive"]).mean()) if clv.notna().any() else None
+    clv_avg = float(clv.mean()) if clv.notna().any() else None
+
+    total_pnl = float(resolved["pnl"].sum()) if len(resolved) else 0.0
+    total_staked = float(resolved["stake"].sum()) if len(resolved) else 0.0
+    roi = float(total_pnl / total_staked) if total_staked > 0 else None
+
+    dd = _drawdown_stats(resolved.sort_values("game_date")["pnl"])
+
+    # Gate used (if present in audit)
+    gate_used = None
+    try:
+        gate_used = audit.get("normalize", {}).get("edge_gate_buffer_used")
+    except Exception:
+        gate_used = None
+
+    payload = {
+        "sample_size": int(len(resolved)),
+        "clv_open_available_rate": clv_avail,
+        "clv_open_positive_rate": clv_pos,
+        "avg_clv_implied_open_to_close": clv_avg,
+        "roi": roi,
+        "total_pnl": total_pnl,
+        "total_staked": total_staked,
+        "max_drawdown": dd["max_drawdown"],
+        "max_drawdown_length": dd["max_drawdown_length"],
+        "edge_gate_buffer_used": gate_used,
+        "open_odds_coverage_estimate": open_cov,
+        "close_odds_coverage_estimate": close_cov,
+    }
+
+    out_path = out_dir / "e1_baseline_metrics.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True, default=str)
+
+    return payload
+
+
+def _fail_closed_clv_presence(joined: pd.DataFrame, audit: Dict) -> None:
+    """
+    If OPEN and CLOSE snapshots exist in the run, CLV open->close must have
+    meaningful coverage wherever both odds are present.
+    """
+    odds_attach = audit.get("odds_attach", {}) if isinstance(audit, dict) else {}
+    open_snaps = int((odds_attach.get("open_attach") or {}).get("snapshots_found", 0))
+    close_snaps = int((odds_attach.get("close_attach") or {}).get("snapshots_found", 0))
+
+    # Columns must exist regardless (schema protection)
+    _assert_required_columns(joined, ["open_odds_decimal", "close_odds_decimal", "clv_implied_open_to_close", "clv_open_positive"], where="joined/clv")
+
+    if open_snaps > 0 and close_snaps > 0:
+        both = joined["open_odds_decimal"].notna() & joined["close_odds_decimal"].notna()
+        if bool(both.any()):
+            cov = float(joined.loc[both, "clv_implied_open_to_close"].notna().mean())
+            # Fail closed if we have both odds but CLV didn't compute for most rows
+            if cov < 0.80:
+                raise RuntimeError(
+                    f"[picks_backtest][FAIL_CLOSED] OPEN+CLOSE snapshots present but CLV coverage low "
+                    f"where both odds exist: {cov:.3f} (<0.80)."
+                )
+
+
+def _fail_closed_gate_audit(picks_df: pd.DataFrame, audit: Dict) -> None:
+    """
+    If gating is indicated in the picks input, ensure audit contains pre/post counts.
+    We do not impose a schema on the picks generator; we only enforce consistency when gating is present.
+    """
+    gating_indicators = [c for c in ["gate_applied", "edge_buffer", "edge_gate_buffer", "gate_edge_buffer", "edge_gate"] if c in picks_df.columns]
+    if not gating_indicators:
+        return
+
+    # If they have an explicit gate_applied column with any True, we require counts.
+    gate_applied = False
+    if "gate_applied" in picks_df.columns:
+        try:
+            gate_applied = bool(picks_df["gate_applied"].astype(bool).any())
+        except Exception:
+            gate_applied = True  # treat as applied if present but unparseable
+
+    if gate_applied:
+        # We expect the generator (or upstream) to provide these. If not, fail closed.
+        norm = audit.get("normalize", {}) if isinstance(audit, dict) else {}
+        if "rows_in" not in norm or "rows_out" not in norm:
+            raise RuntimeError("[picks_backtest][FAIL_CLOSED] gate_applied present but pre/post pick counts missing from audit.normalize")
 
 
 # ---------------------------------------------------------------------
@@ -501,7 +676,7 @@ def backtest_picks(
         joined["odds_decimal"].astype(float),
     )
 
-    # Open odds (additive, diagnostics only if missing)
+    # Open odds (additive)
     if "open_odds_decimal" not in joined.columns:
         joined["open_odds_decimal"] = np.nan
 
@@ -528,14 +703,15 @@ def backtest_picks(
         joined["p_model"] = np.nan
         joined["edge_bet"] = np.nan
 
-    # CLV: execution vs close
+    # CLV: execution vs close (kept for continuity)
     joined["clv_implied"] = joined["p_implied_bet"] - joined["p_implied_close"]
     joined["clv_positive"] = joined["clv_implied"].apply(lambda x: bool(x > 0) if pd.notna(x) else False)
 
-    # CLV: OPEN → CLOSE (THIS IS THE NEW WIRING YOU WANT)
-    # Positive means market moved toward your side by close.
+    # CLV: OPEN → CLOSE
     joined["clv_implied_open_to_close"] = joined["p_implied_open"] - joined["p_implied_close"]
-    joined["clv_open_positive"] = joined["clv_implied_open_to_close"].apply(lambda x: bool(x > 0) if pd.notna(x) else False)
+    joined["clv_open_positive"] = joined["clv_implied_open_to_close"].apply(
+        lambda x: bool(x > 0) if pd.notna(x) else False
+    )
 
     resolved = joined[joined["pnl"].notna()].copy()
 
@@ -547,38 +723,31 @@ def backtest_picks(
         "unresolved_missing_odds": int(joined["pnl"].isna().sum()),
     }
 
-    embedded_execution = bool(norm_audit.get("mode") == "embedded_odds")
+    # -----------------------------------------------------------------
+    # E1.6 FAIL-CLOSED assertions
+    # -----------------------------------------------------------------
+    _assert_required_columns(resolved, _REQUIRED_OUTPUT_COLS, where="resolved(picks_backtest.csv)")
+    _assert_ranges(resolved)
+    _fail_closed_clv_presence(joined, audit)
+    _fail_closed_gate_audit(picks_df, audit)
 
-    clv_available_rate = float(joined["clv_implied"].notna().mean()) if "clv_implied" in joined.columns else 0.0
-    if "clv_positive" in joined.columns and joined["clv_implied"].notna().any():
-        clv_positive_rate = float(joined.loc[joined["clv_implied"].notna(), "clv_positive"].mean())
-    else:
-        clv_positive_rate = None
-
-    clv_open_available_rate = float(joined["clv_implied_open_to_close"].notna().mean())
-    if joined["clv_implied_open_to_close"].notna().any():
-        clv_open_positive_rate = float(joined.loc[joined["clv_implied_open_to_close"].notna(), "clv_open_positive"].mean())
-    else:
-        clv_open_positive_rate = None
-
-    audit["clv"] = {
-        "clv_available_rate": clv_available_rate,
-        "clv_positive_rate": clv_positive_rate,
-        "clv_open_available_rate": clv_open_available_rate,
-        "clv_open_positive_rate": clv_open_positive_rate,
-        "embedded_execution_odds_present": embedded_execution,
-        "definitions": {
-            "clv_implied": "p_implied_bet - p_implied_close",
-            "clv_implied_open_to_close": "p_implied_open - p_implied_close",
-        },
-    }
-
-    # Outputs
+    # -----------------------------------------------------------------
+    # Write outputs (must happen before post-checks that depend on files)
+    # -----------------------------------------------------------------
     resolved.to_csv(out_dir / "picks_backtest.csv", index=False)
 
     total_pnl = float(resolved["pnl"].sum()) if not resolved.empty else 0.0
     total_staked = float(resolved["stake"].sum()) if not resolved.empty else 0.0
     roi = float(total_pnl / total_staked) if total_staked > 0 else np.nan
+
+    # E1.7 baseline artifact
+    baseline = _write_e1_baseline(out_dir, resolved=resolved, audit=audit)
+    audit["e1_baseline_metrics"] = baseline
+
+    # Summary (existing artifact, plus CLV open->close stats)
+    clv = resolved["clv_implied_open_to_close"]
+    clv_open_available_rate = float(clv.notna().mean())
+    clv_open_positive_rate = float((resolved.loc[clv.notna(), "clv_open_positive"]).mean()) if clv.notna().any() else None
 
     summary = pd.DataFrame(
         [{
@@ -590,6 +759,7 @@ def backtest_picks(
             "roi": roi,
             "clv_open_available_rate": clv_open_available_rate,
             "clv_open_positive_rate": clv_open_positive_rate,
+            "avg_clv_implied_open_to_close": float(clv.mean()) if clv.notna().any() else None,
         }]
     )
     summary.to_csv(out_dir / "picks_backtest_summary.csv", index=False)
