@@ -146,12 +146,14 @@ def main() -> None:
     ])
 
     # 3) Generate E2 policy metrics (artifact) then validate
+    # IMPORTANT: certify produces backtest_joined.csv, not backtest_per_game.csv.
+    # The E2 runner can compute CLV from snapshots, so it should consume backtest_joined.csv.
     _run([
         os.environ.get("PYTHON", "python"),
         "-m",
         "src.eval.e2_policy_runner",
         "--per-game",
-        os.path.join(args.pred_dir, "backtest_per_game.csv"),
+        str(Path(args.pred_dir) / "backtest_joined.csv"),
         "--snapshot-dir",
         args.snapshot_dir,
         "--start",
@@ -159,12 +161,10 @@ def main() -> None:
         "--end",
         args.end,
         "--out",
-        os.path.join(args.pred_dir, "e2_policy_metrics.json"),
+        str(Path(args.pred_dir) / "e2_policy_metrics.json"),
     ])
 
     _validate_e2_policy(Path(args.pred_dir))
-
-    
 
     print("[certify] ✅ All checks passed")
 
