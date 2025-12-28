@@ -145,8 +145,26 @@ def main() -> None:
         args.total_col,
     ])
 
-    # 3) E2 policy validation
+    # 3) Generate E2 policy metrics (artifact) then validate
+    _run([
+        os.environ.get("PYTHON", "python"),
+        "-m",
+        "src.eval.e2_policy_runner",
+        "--per-game",
+        os.path.join(args.pred_dir, "backtest_per_game.csv"),
+        "--snapshot-dir",
+        args.snapshot_dir,
+        "--start",
+        args.start,
+        "--end",
+        args.end,
+        "--out",
+        os.path.join(args.pred_dir, "e2_policy_metrics.json"),
+    ])
+
     _validate_e2_policy(Path(args.pred_dir))
+
+    
 
     print("[certify] ✅ All checks passed")
 
