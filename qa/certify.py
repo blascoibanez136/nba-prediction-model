@@ -5,7 +5,8 @@ QA certify script (Commit 2 + E2 policy guard).
 Runs:
   1) historical_prediction_runner
   2) backtest join + metrics
-  3) E2 policy regression validation (CLV / ROI / risk)
+  3) generate E2 policy metrics (e2_policy_runner)
+  4) validate E2 policy metrics (CLV / ROI / risk)
 
 Any regression fails hard.
 """
@@ -33,13 +34,19 @@ def _fail(msg: str) -> None:
 def _validate_e2_policy(outputs_dir: Path) -> None:
     """
     Hard regression checks for Phase E2.
+    Eligibility-aware:
+
+    - Real-world snapshots can have partial ML coverage.
+    - e2_policy_runner computes metrics ONLY on eligible rows (full open+close ML availability).
+    - Coverage must be 100% on the eligible universe.
+    - Eligible universe must be large enough (eligible_pct guard).
     """
     metrics_path = outputs_dir / "e2_policy_metrics.json"
 
     if not metrics_path.exists():
         _fail("Missing outputs/e2_policy_metrics.json")
 
-    with open(metrics_path) as f:
+    with open(metrics_path, "r", encoding="utf-8") as f:
         m = json.load(f)
 
     # --- Required fields ---
@@ -63,29 +70,50 @@ def _validate_e2_policy(outputs_dir: Path) -> None:
     open_cov = m["clv_coverage"].get("open_snapshot_coverage_pct")
     close_cov = m["clv_coverage"].get("close_snapshot_coverage_pct")
 
+    # Eligibility transparency (new)
+    eligibility = m.get("eligibility", {}) if isinstance(m.get("eligibility", {}), dict) else {}
+    eligible_pct = eligibility.get("eligible_pct", None)
+
     # --- Hard guards (tuneable later) ---
-    if bets is None or bets < 60:
+    if bets is None or int(bets) < 60:
         _fail(f"Bet count regression: bets={bets}")
 
-    if avg_clv is None or avg_clv <= 0:
+    # Ensure we didn't silently pass on a tiny eligible subset
+    if eligible_pct is None:
+        _fail("Missing eligibility.eligible_pct (required for eligibility-aware certification).")
+    try:
+        eligible_pct_f = float(eligible_pct)
+    except Exception:
+        _fail(f"Invalid eligibility.eligible_pct: {eligible_pct}")
+    if eligible_pct_f < 0.85:
+        _fail(f"Eligibility regression: eligible_pct={eligible_pct_f:.3f} (<0.85)")
+
+    if avg_clv is None or float(avg_clv) <= 0:
         _fail(f"CLV regression: avg_clv={avg_clv}")
 
-    if clv_pos_rate is None or clv_pos_rate < 0.55:
+    if clv_pos_rate is None or float(clv_pos_rate) < 0.55:
         _fail(f"CLV+ rate regression: {clv_pos_rate}")
 
-    if roi is None or roi < 0:
+    if roi is None or float(roi) < 0:
         _fail(f"ROI regression: roi={roi}")
 
-    if max_dd is None or max_dd < -7:
+    if max_dd is None or float(max_dd) < -7:
         _fail(f"Drawdown regression: max_drawdown_units={max_dd}")
 
-    if open_cov != 100 or close_cov != 100:
+    # Coverage must be 100% ON ELIGIBLE UNIVERSE (not all games)
+    if open_cov is None or close_cov is None:
+        _fail(f"Snapshot coverage missing: open={open_cov} close={close_cov}")
+    if int(open_cov) < 100 or int(close_cov) < 100:
         _fail(
-            f"Snapshot coverage regression: "
+            f"Snapshot coverage regression (eligible universe): "
             f"open={open_cov} close={close_cov}"
         )
 
     print("[certify:E2] ✅ E2 policy metrics validated")
+    print(
+        f"[certify:E2] bets={bets} roi={float(roi):.4f} avg_clv={float(avg_clv):.6f} "
+        f"clv_pos_rate={float(clv_pos_rate):.3f} max_dd={float(max_dd):.3f} eligible_pct={eligible_pct_f:.3f}"
+    )
 
 
 def main() -> None:
@@ -122,7 +150,7 @@ def main() -> None:
         *(["--overwrite"] if args.overwrite else []),
     ])
 
-    # 2) Backtest
+    # 2) Backtest (writes outputs/backtest_joined.csv)
     _run([
         os.environ.get("PYTHON", "python"),
         "-m",
@@ -143,11 +171,12 @@ def main() -> None:
         args.spread_col,
         "--total-col",
         args.total_col,
+        "--out-dir",
+        args.pred_dir,
     ])
 
-    # 3) Generate E2 policy metrics (artifact) then validate
-    # IMPORTANT: certify produces backtest_joined.csv, not backtest_per_game.csv.
-    # The E2 runner can compute CLV from snapshots, so it should consume backtest_joined.csv.
+    # 3) Generate E2 policy metrics
+    # IMPORTANT: certify produces backtest_joined.csv by default.
     _run([
         os.environ.get("PYTHON", "python"),
         "-m",
@@ -164,6 +193,7 @@ def main() -> None:
         str(Path(args.pred_dir) / "e2_policy_metrics.json"),
     ])
 
+    # 4) Validate E2 policy metrics
     _validate_e2_policy(Path(args.pred_dir))
 
     print("[certify] ✅ All checks passed")
