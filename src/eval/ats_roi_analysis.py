@@ -546,12 +546,27 @@ def main() -> None:
         print(f"[ats] wrote: outputs/ats_roi_bets.csv")
         return
 
-    # Add EV units for each bet so that downstream staking logic (e.g. E3) can size bets.
-    # Under fixed -110 pricing, expected value per unit (ev_units) equals the ev_used value
-    # computed above.  Bets without ev_used (NaN) will be dropped by side gating already.
-    # We also explicitly set a price column to -110 for compatibility with downstream code
-    # that may expect a price field.
-    bets["ev_units"] = bets["ev_used"].astype(float)
+    # --- Add expected value per unit (ev_units) ---
+    #
+    # The EV computed above (ev_used) represents the expected return on a *$1* stake at
+    # fixed -110 pricing.  Downstream staking logic (E3) expresses stakes in units (1u = $10)
+    # and uses Kelly sizing multiplied by `ev_units` to determine fractional stakes.
+    # If we pass through a raw per-dollar EV here, the resulting Kelly stake will be
+    # extremely small (e.g. 0.15 * 0.03 = 0.0045) and, after rounding to 0.05u increments,
+    # will round to 0.0.  That leads to zero-sized bets and an ROI of None in E3.
+    #
+    # To remedy this, we convert the per-dollar EV into a per-unit EV by multiplying
+    # by 10 (since 1 unit = $10).  A 5% edge (ev_used ≈ 0.05) becomes ev_units ≈ 0.5.
+    # Kelly stakes computed as `kelly_fraction * ev_units` (0.15 * 0.5 = 0.075u) will
+    # round up to the nearest 0.05u increment (0.1u) and produce non-zero stakes.
+    # This scaling aligns the EV units with the unit-based bankroll management used
+    # throughout the project.
+    bets["ev_units"] = bets["ev_used"].astype(float) * 10.0
+
+    # Explicitly set a price and stake column for downstream compatibility.  The price
+    # remains fixed at -110 for ATS bets, and the stake column defaults to 1u (meaning
+    # "one notional bet") so that ROI metrics can be computed.  E3 staking logic will
+    # override the stake on a per-bet basis.
     bets["price"] = -110
     bets["stake"] = 1.0
 
