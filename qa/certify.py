@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-QA certify script (Commit 2 + E2 + E3 guards).
+QA certify script (Commit 2 + E2 + E3 guards) with dispersion and OOS window fixes.
 
-Runs:
+This version adds a pre‑processing step to build a per‑game file with market
+consensus and dispersion for ATS ROI analysis, and enforces the locked
+out‑of‑sample evaluation window (2024‑03‑11..2024‑04‑14).
+
+It runs:
   1) historical_prediction_runner
   2) backtest join + metrics (outputs/backtest_joined.csv)
   3) E2 policy metrics (src.eval.e2_policy_runner) + validation
-  4) ATS ROI bets (src.eval.ats_roi_analysis) -> outputs/ats_roi_bets.csv
-  5) E3 staking metrics (src.eval.e3_policy_runner) + validation
+  4) Build ATS ROI input (src.eval.build_ats_roi_input) using snapshots
+  5) ATS ROI bets (src.eval.ats_roi_analysis) on the OOS window
+  6) E3 staking metrics (src.eval.e3_policy_runner) + validation
 
 Any regression fails hard.
 """
@@ -88,7 +93,8 @@ def _validate_e2_policy(outputs_dir: Path) -> dict:
         _fail(f"E2 Snapshot coverage regression (eligible universe): open={open_cov} close={close_cov}")
 
     print("[certify:E2] ✅ E2 validated")
-    print(f"[certify:E2] bets={int(bets)} roi={float(roi):.4f} avg_clv={float(avg_clv):.6f} clv_pos_rate={float(clv_pos_rate):.3f} max_dd={float(max_dd):.3f} eligible_pct={eligible_pct_f:.3f}")
+    print(f"[certify:E2] bets={int(bets)} roi={float(roi):.4f} avg_clv={float(avg_clv):.6f} "
+          f"clv_pos_rate={float(clv_pos_rate):.3f} max_dd={float(max_dd):.3f} eligible_pct={eligible_pct_f:.3f}")
     return m
 
 
@@ -122,7 +128,7 @@ def _validate_e3_policy(outputs_dir: Path, *, e2_metrics: dict, policy_json: Pat
 
     # Risk improvement vs E2
     e2_dd = float(e2_metrics["risk_metrics"]["max_drawdown_units"])
-    e3_dd = float(m["risk_metrics"]["max_drawdown_units"])
+    e3_dd = float(m["risk_metrics"].get("max_drawdown_units"))
 
     # E2 DD is negative. "Improve" means E3 is less negative (>=).
     if e3_dd < e2_dd:
@@ -139,7 +145,8 @@ def _validate_e3_policy(outputs_dir: Path, *, e2_metrics: dict, policy_json: Pat
         _fail(f"E3 CLV regression: avg_clv={e3_avg_clv}")
 
     print("[certify:E3] ✅ E3 validated")
-    print(f"[certify:E3] roi={float(e3_roi):.4f} max_dd={e3_dd:.3f} max_daily={max_daily_seen:.2f} max_per_bet={max_per_bet_seen:.2f}")
+    print(f"[certify:E3] roi={float(e3_roi):.4f} max_dd={e3_dd:.3f} "
+          f"max_daily={max_daily_seen:.2f} max_per_bet={max_per_bet_seen:.2f}")
 
 
 def main() -> None:
@@ -170,8 +177,8 @@ def main() -> None:
         "--end", args.end,
         "--out-dir", args.pred_dir,
         "--snapshot-dir", args.snapshot_dir,
-        *(["--apply-market"] if args.apply_market else []),
-        *(["--overwrite"] if args.overwrite else []),
+        *( ["--apply-market"] if args.apply_market else [] ),
+        *( ["--overwrite"] if args.overwrite else [] ),
     ])
 
     # 2) Backtest
@@ -209,27 +216,38 @@ def main() -> None:
 
     e2_metrics = _validate_e2_policy(out_dir)
 
-    # 4) Produce ATS ROI bets (input to E3 staking)
-    # NOTE: This uses your already-locked ATS policy file.
+    # 4) Produce ATS ROI input and bets (input to E3 staking)
     policy_path = Path("configs/ats_policy_v1.yaml")
     if not policy_path.exists():
         _fail("Missing configs/ats_policy_v1.yaml")
 
-    # ats_roi_analysis expects per_game with home_spread_consensus + fair_spread_model.
-    # You already build this for calibrator training as outputs/backtest_spread_cal_input.csv.
-    per_game_for_ats = Path("outputs/backtest_spread_cal_input.csv")
-    if not per_game_for_ats.exists():
-        _fail("Missing outputs/backtest_spread_cal_input.csv (build it before certify).")
+    # Build per-game file with consensus and dispersion from snapshots
+    build_ats_out = out_dir / "backtest_joined_market.csv"
+    _run([
+        os.environ.get("PYTHON", "python"),
+        "-m",
+        "src.eval.build_ats_roi_input",
+        "--backtest-joined", str(out_dir / "backtest_joined.csv"),
+        "--snapshot-dir", args.snapshot_dir,
+        "--start", args.start,
+        "--end", args.end,
+        "--out", str(build_ats_out),
+    ])
 
+    # Locked OOS evaluation window for ATS ROI
+    ats_eval_start = "2024-03-11"
+    ats_eval_end = args.end
+
+    # Run ATS ROI analysis on market-merged file
     _run([
         os.environ.get("PYTHON", "python"),
         "-m",
         "src.eval.ats_roi_analysis",
-        "--per_game", str(per_game_for_ats),
+        "--per_game", str(build_ats_out),
         "--calibrator", str(calibrator_path),
         "--policy", str(policy_path),
-        "--eval-start", args.start,
-        "--eval-end", args.end,
+        "--eval-start", ats_eval_start,
+        "--eval-end", ats_eval_end,
         "--strict",
         "--max-bet-rate", "0.30",
     ])
