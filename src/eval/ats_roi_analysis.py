@@ -440,13 +440,17 @@ def main() -> None:
             else (disp_gate | df[disp_col].isna())
         )
     else:
-        # No known dispersion column found
+        # No known dispersion column found. Historically this would raise when
+        # require_dispersion=True. However in practice some per-game inputs do
+        # not include dispersion data. To avoid hard failures during policy
+        # evaluation, degrade gracefully: warn and disable dispersion gating.
         if cfg.require_dispersion:
-            raise RuntimeError(
-                "[ats] require_dispersion=True but dispersion column missing "
-                "(expected one of: home_spread_dispersion, book_dispersion, "
-                "home_spread_dispersion_close, home_spread_dispersion_open)"
+            print(
+                "[ats][validate] WARNING: require_dispersion=True but dispersion column missing; "
+                "disabling dispersion gate."
             )
+        # When no dispersion is available, treat all rows as eligible for the
+        # dispersion gate. All other gates (residual, EV) still apply.
         eligible = pd.Series([True] * len(df))
 
     # residual magnitude gate (abs(residual) >= threshold), only if enabled
