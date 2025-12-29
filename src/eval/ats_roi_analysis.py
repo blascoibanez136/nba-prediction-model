@@ -2,28 +2,28 @@
 ATS (spread) ROI analysis with fixed -110 pricing.
 
 Adds:
-- --eval-start / --eval-end date window filtering
-- overlap warning if calibrator train window overlaps eval window (metadata-driven)
-- --side selection (both/home_only/away_only) for policy testing (default: both)
-- --min-abs-residual: residual magnitude gating (default: 0.0 => disabled)
+ - --eval-start / --eval-end date window filtering
+ - overlap warning if calibrator train window overlaps eval window (metadata-driven)
+ - --side selection (both/home_only/away_only) for policy testing (default: both)
+ - --min-abs-residual: residual magnitude gating (default: 0.0 => disabled)
 
 PACKET 1 ADDITIONS (Elite Hardening):
-- --policy: load ATS policy YAML (opt-in; preserves legacy CLI behavior if omitted)
-- --require-policy-hash: fail-fast if policy hash doesn't match (regression protection)
-- policy hash + policy object written into outputs/ats_roi_metrics.json
-- best-effort git commit captured for reproducibility
+ - --policy: load ATS policy YAML (opt-in; preserves legacy CLI behavior if omitted)
+ - --require-policy-hash: fail-fast if policy hash doesn't match (regression protection)
+ - policy hash + policy object written into outputs/ats_roi_metrics.json
+ - best-effort git commit captured for reproducibility
 
 PACKET 2 ADDITIONS (Regression Tripwires):
-- --strict: promote selected validation warnings to errors
-- Early per_game validation summary block after eval-window filtering
-- Degeneracy guards (nunique thresholds) for key columns (warn by default; fail in --strict)
-- Coverage stats logging (nonnull rates)
-- Bet-rate warn band (warn only; does not change selection logic)
+ - --strict: promote selected validation warnings to errors
+ - Early per_game validation summary block after eval-window filtering
+ - Degeneracy guards (nunique thresholds) for key columns (warn by default; fail in --strict)
+ - Coverage stats logging (nonnull rates)
+ - Bet-rate warn band (warn only; does not change selection logic)
 
 Assumptions:
-- pricing is fixed -110 (ppu=0.9090909)
-- residual = fair_spread_model - home_spread_consensus (or spread_error fallback)
-- calibrator maps residual -> P(home_covers)
+ - pricing is fixed -110 (ppu=0.9090909)
+ - residual = fair_spread_model - home_spread_consensus (or spread_error fallback)
+ - calibrator maps residual -> P(home_covers)
 """
 
 from __future__ import annotations
@@ -103,6 +103,7 @@ def expected_value_ats(p_win: Optional[float]) -> Optional[float]:
 # --------------------------
 # PACKET 2: validation helpers
 # --------------------------
+
 def _nunique_nonnull(s: pd.Series) -> int:
     return int(s.dropna().nunique())
 
@@ -417,18 +418,35 @@ def main() -> None:
     df["home_spread_consensus"] = pd.to_numeric(df["home_spread_consensus"], errors="coerce")
     df["spread_residual"] = _get_residual(df)
 
-    # dispersion gate
-    if "home_spread_dispersion" in df.columns:
-        df["home_spread_dispersion"] = pd.to_numeric(df["home_spread_dispersion"], errors="coerce")
-        disp_gate = df["home_spread_dispersion"].le(cfg.max_dispersion)
+    # dispersion gate (supports alias columns)
+    # Determine which dispersion column to use. Prefer the canonical name,
+    # but fall back to common aliases if present.
+    disp_col = None
+    for c in [
+        "home_spread_dispersion",
+        "book_dispersion",
+        "home_spread_dispersion_close",
+        "home_spread_dispersion_open",
+    ]:
+        if c in df.columns:
+            disp_col = c
+            break
+    if disp_col is not None:
+        df[disp_col] = pd.to_numeric(df[disp_col], errors="coerce")
+        disp_gate = df[disp_col].le(cfg.max_dispersion)
         eligible = (
-            disp_gate & df["home_spread_dispersion"].notna()
+            disp_gate & df[disp_col].notna()
             if cfg.require_dispersion
-            else (disp_gate | df["home_spread_dispersion"].isna())
+            else (disp_gate | df[disp_col].isna())
         )
     else:
+        # No known dispersion column found
         if cfg.require_dispersion:
-            raise RuntimeError("[ats] require_dispersion=True but home_spread_dispersion column missing")
+            raise RuntimeError(
+                "[ats] require_dispersion=True but dispersion column missing "
+                "(expected one of: home_spread_dispersion, book_dispersion, "
+                "home_spread_dispersion_close, home_spread_dispersion_open)"
+            )
         eligible = pd.Series([True] * len(df))
 
     # residual magnitude gate (abs(residual) >= threshold), only if enabled
