@@ -380,6 +380,9 @@ def main() -> None:
         raise FileNotFoundError(f"[ats] calibrator not found: {cfg.calibrator_path}")
 
     df = pd.read_csv(cfg.per_game_path)
+    # Accept consensus_close as alias for home_spread_consensus
+    if "home_spread_consensus" not in df.columns and "consensus_close" in df.columns:
+        df["home_spread_consensus"] = df["consensus_close"]
     if df.empty:
         raise RuntimeError("[ats] per_game is empty")
 
