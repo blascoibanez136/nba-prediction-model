@@ -1,145 +1,203 @@
 """
-Utility script to build the per‑game input for ATS ROI analysis with market features.
+Utility script to build the per-game input for ATS ROI analysis with market features.
 
 This script merges the backtest joined file (model predictions and game results)
-with consensus spread and dispersion statistics computed from the odds snapshots.
+with consensus spread and dispersion computed from per-book odds snapshots.
 
-The resulting CSV contains the original per‑game columns plus two new columns:
+It supports BOTH:
+  - normalized CSV snapshots: close_YYYYMMDD.csv (recommended / what you have)
+  - raw JSON snapshots: close_YYYYMMDD*.json (legacy support)
 
-    home_spread_consensus: average of spread_home_point across books (close snapshot)
-    home_spread_dispersion: standard deviation of spread_home_point across books
+Output adds:
+  - home_spread_consensus: mean(spread_home_point) across books
+  - home_spread_dispersion: std(spread_home_point) across books
 
-If a game has no snapshot data, the consensus/dispersion fields will be null.
-
-Usage:
-
-    python -m src.eval.build_ats_roi_input \
-        --backtest-joined outputs/backtest_joined.csv \
-        --snapshot-dir data/_snapshots \
-        --start 2023-10-24 \
-        --end 2024-04-14 \
-        --out outputs/backtest_joined_market.csv
-
-The start and end dates bound the snapshot search.  The script looks for
-files in snapshot_dir matching pattern "close_YYYYMMDD*.json" for each date
-between start and end (inclusive).  It loads the first matching JSON file per
-day, computes dispersion via src.ingest.odds_snapshots.compute_dispersion,
-and concatenates the results.
-
-Determinism: file order and merge keys are sorted by merge_key for stable
-output.  Missing consensus or dispersion values propagate as NaN.
+Example:
+python -m src.eval.build_ats_roi_input \
+    --backtest-joined outputs/backtest_joined.csv \
+    --snapshot-dir data/_snapshots \
+    --start 2023-10-24 \
+    --end 2024-04-14 \
+    --out outputs/backtest_joined_market.csv
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import os
 from pathlib import Path
-from typing import Optional, Iterable
+from typing import Iterable, Optional
 
 import pandas as pd
 
 from src.ingest.odds_snapshots import compute_dispersion, _norm
 
 
-def _iter_snapshot_files(snapshot_dir: Path, start: str, end: str) -> Iterable[Path]:
-    """Yield close snapshot JSON paths between start and end (inclusive).
+# -----------------------
+# Snapshot discovery
+# -----------------------
 
-    For each date in the range, looks for files matching 'close_YYYYMMDD*.json'.
-    Picks the lexicographically first file if multiple exist.
+def _iter_close_snapshot_files(snapshot_dir: Path, start: str, end: str) -> Iterable[Path]:
+    """
+    Yield a close snapshot path per date in [start, end], preferring CSV.
+
+    Preferred:
+      close_YYYYMMDD.csv
+
+    Fallback:
+      close_YYYYMMDD*.json  (if present)
     """
     start_date = pd.to_datetime(start).date()
     end_date = pd.to_datetime(end).date()
-    for date in pd.date_range(start_date, end_date, freq="D"):
-        date_str = date.strftime("%Y%m%d")
-        pattern = f"close_{date_str}"
-        candidates = sorted(
-            [p for p in snapshot_dir.glob(f"{pattern}*.json") if p.is_file()]
-        )
-        if candidates:
-            yield candidates[0]
+
+    for d in pd.date_range(start_date, end_date, freq="D"):
+        ymd = d.strftime("%Y%m%d")
+
+        # 1) Prefer normalized CSV snapshots (what you have)
+        csv_path = snapshot_dir / f"close_{ymd}.csv"
+        if csv_path.exists():
+            yield csv_path
+            continue
+
+        # 2) Fallback to JSON snapshots (if any)
+        json_candidates = sorted([p for p in snapshot_dir.glob(f"close_{ymd}*.json") if p.is_file()])
+        if json_candidates:
+            yield json_candidates[0]
+            continue
+
+        # else: no snapshot for that day
+
+
+# -----------------------
+# Market feature builder
+# -----------------------
+
+def _market_from_close_csv(path: Path) -> pd.DataFrame:
+    """
+    Compute consensus + dispersion from a normalized close CSV snapshot.
+    Requires columns: merge_key, spread_home_point (book optional but typical).
+    """
+    df = pd.read_csv(path)
+    if df.empty or "merge_key" not in df.columns or "spread_home_point" not in df.columns:
+        return pd.DataFrame(columns=["merge_key", "home_spread_consensus", "home_spread_dispersion"])
+
+    df = df.copy()
+    df["merge_key"] = df["merge_key"].astype(str).str.strip().str.lower()
+    df["spread_home_point"] = pd.to_numeric(df["spread_home_point"], errors="coerce")
+    df = df.dropna(subset=["merge_key", "spread_home_point"]).copy()
+    if df.empty:
+        return pd.DataFrame(columns=["merge_key", "home_spread_consensus", "home_spread_dispersion"])
+
+    out = (
+        df.groupby("merge_key")["spread_home_point"]
+        .agg(["mean", "std"])
+        .rename(columns={"mean": "home_spread_consensus", "std": "home_spread_dispersion"})
+        .reset_index()
+    )
+    return out
 
 
 def build_market_df(snapshot_dir: Path, start: str, end: str) -> pd.DataFrame:
-    """Compute consensus and dispersion stats for the date range.
+    """
+    Build a per-merge_key market feature table over the date range.
 
-    Returns a DataFrame with columns [merge_key, home_spread_consensus, home_spread_dispersion].
+    Output columns:
+      merge_key, home_spread_consensus, home_spread_dispersion
     """
     frames = []
-    for path in _iter_snapshot_files(snapshot_dir, start, end):
+
+    for path in _iter_close_snapshot_files(snapshot_dir, start, end):
         try:
-            df = compute_dispersion(path)
+            if path.suffix.lower() == ".csv":
+                m = _market_from_close_csv(path)
+            else:
+                # JSON fallback via existing helper (returns consensus_close + book_dispersion)
+                m = compute_dispersion(path).rename(
+                    columns={
+                        "consensus_close": "home_spread_consensus",
+                        "book_dispersion": "home_spread_dispersion",
+                    }
+                )[["merge_key", "home_spread_consensus", "home_spread_dispersion"]]
+            frames.append(m)
         except Exception as e:
-            print(f"[build_ats_roi_input] WARNING: failed to compute dispersion for {path}: {e}")
-            continue
-        # compute_dispersion returns columns: merge_key, consensus_close, book_dispersion
-        # We rename them to match ats_roi_analysis expectations.
-        df = df.rename(
-            columns={
-                "consensus_close": "home_spread_consensus",
-                "book_dispersion": "home_spread_dispersion",
-            }
-        )[["merge_key", "home_spread_consensus", "home_spread_dispersion"]]
-        frames.append(df)
+            print(f"[build_ats_roi_input] WARNING: failed on {path.name}: {e}")
+
     if not frames:
         return pd.DataFrame(columns=["merge_key", "home_spread_consensus", "home_spread_dispersion"])
+
     market_df = pd.concat(frames, ignore_index=True)
-    # drop duplicates: keep last (latest date) per merge_key
+    market_df["merge_key"] = market_df["merge_key"].astype(str).str.strip().str.lower()
     market_df = market_df.sort_values("merge_key").drop_duplicates("merge_key", keep="last")
     return market_df
 
 
-def attach_market_features(backtest_path: Path, market_df: pd.DataFrame) -> pd.DataFrame:
-    """Attach consensus and dispersion to the backtest per‑game DataFrame.
+# -----------------------
+# Merge into backtest_joined
+# -----------------------
 
-    Computes merge_key from home_team, away_team, and the date column (game_date/date/gamedate)
-    and left‑joins the market_df on merge_key.  If none of the expected date columns are
-    present, raises a RuntimeError.
-    """
-    df = pd.read_csv(backtest_path)
-    # Find the date column (match ats_roi_analysis logic)
-    date_col = None
+def _detect_date_col(df: pd.DataFrame) -> str:
     for c in ["game_date", "date", "gamedate"]:
         if c in df.columns:
-            date_col = c
-            break
-    if date_col is None:
-        raise RuntimeError(
-            "[build_ats_roi_input] Missing game date column (expected one of game_date, date, gamedate)"
-        )
-    # Normalize team names to canonical form and build merge_key
-    def build_key(row) -> str:
-        return f"{_norm(row['home_team'])}__{_norm(row['away_team'])}__{row[date_col]}"
+            return c
+    raise RuntimeError("[build_ats_roi_input] No date column found (expected game_date/date/gamedate).")
 
-    df["merge_key"] = df.apply(build_key, axis=1)
-    # Left join market features
+
+def attach_market_features(backtest_path: Path, market_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Attach consensus and dispersion to backtest_joined, keyed by:
+      merge_key = home__away__YYYY-MM-DD   (lowercase)
+    """
+    df = pd.read_csv(backtest_path)
+    if df.empty:
+        raise RuntimeError("[build_ats_roi_input] backtest_joined is empty")
+
+    for c in ["home_team", "away_team"]:
+        if c not in df.columns:
+            raise RuntimeError(f"[build_ats_roi_input] Missing required column: {c}")
+
+    date_col = _detect_date_col(df)
+    # normalize date to YYYY-MM-DD string
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    if df[date_col].isna().any():
+        raise RuntimeError("[build_ats_roi_input] Found NaT in date column; cannot build merge_key safely.")
+    df["_game_date_str"] = df[date_col].dt.strftime("%Y-%m-%d")
+
+    def mk(row) -> str:
+        return f"{_norm(row['home_team'])}__{_norm(row['away_team'])}__{row['_game_date_str']}"
+
+    df["merge_key"] = df.apply(mk, axis=1)
+    df["merge_key"] = df["merge_key"].astype(str).str.strip().str.lower()
+
     merged = df.merge(market_df, on="merge_key", how="left")
+    merged = merged.drop(columns=["_game_date_str"], errors="ignore")
     return merged
 
 
+# -----------------------
+# CLI
+# -----------------------
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backtest-joined", type=str, required=True, help="Path to backtest_joined.csv")
-    ap.add_argument("--snapshot-dir", type=str, required=True, help="Directory containing odds snapshots")
-    ap.add_argument("--start", type=str, required=True, help="Start date (YYYY-MM-DD)")
-    ap.add_argument("--end", type=str, required=True, help="End date (YYYY-MM-DD)")
-    ap.add_argument("--out", type=str, required=True, help="Output CSV path")
+    ap.add_argument("--backtest-joined", required=True)
+    ap.add_argument("--snapshot-dir", required=True)
+    ap.add_argument("--start", required=True)
+    ap.add_argument("--end", required=True)
+    ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    backtest_path = Path(args.backtest_joined)
     snapshot_dir = Path(args.snapshot_dir)
+    backtest_path = Path(args.backtest_joined)
     out_path = Path(args.out)
 
     market_df = build_market_df(snapshot_dir, args.start, args.end)
-    merged_df = attach_market_features(backtest_path, market_df)
-    merged_df.to_csv(out_path, index=False)
-    # Print coverage metrics for logging
-    consensus_cov = merged_df["home_spread_consensus"].notna().mean() * 100
-    disp_cov = merged_df["home_spread_dispersion"].notna().mean() * 100
-    print(
-        f"[build_ats_roi_input] wrote: {out_path} (consensus_cov={consensus_cov:.1f}% dispersion_cov={disp_cov:.1f}%)"
-    )
+    merged = attach_market_features(backtest_path, market_df)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_csv(out_path, index=False)
+
+    cov_consensus = float(merged["home_spread_consensus"].notna().mean() * 100.0) if "home_spread_consensus" in merged.columns else 0.0
+    cov_disp = float(merged["home_spread_dispersion"].notna().mean() * 100.0) if "home_spread_dispersion" in merged.columns else 0.0
+    print(f"[build_ats_roi_input] wrote: {out_path} (consensus_cov={cov_consensus:.1f}% dispersion_cov={cov_disp:.1f}%)")
 
 
 if __name__ == "__main__":
