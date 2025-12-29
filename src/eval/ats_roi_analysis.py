@@ -546,6 +546,13 @@ def main() -> None:
         print(f"[ats] wrote: outputs/ats_roi_bets.csv")
         return
 
+    # Add EV units for each bet so that downstream staking logic (e.g. E3) can size bets.
+    # Under fixed -110 pricing, expected value per unit (ev_units) equals the ev_used value
+    # computed above.  Bets without ev_used (NaN) will be dropped by side gating already.
+    # We also explicitly set a price column to -110 for compatibility with downstream code
+    # that may expect a price field.
+    bets["ev_units"] = bets["ev_used"].astype(float)
+    bets["price"] = -110
     bets["stake"] = 1.0
 
     def ats_result(r) -> str:
