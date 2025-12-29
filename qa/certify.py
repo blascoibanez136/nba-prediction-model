@@ -234,11 +234,9 @@ def main() -> None:
         "--out", str(build_ats_out),
     ])
 
-    # Locked OOS evaluation window for ATS ROI
-    ats_eval_start = "2024-03-11"
-    ats_eval_end = args.end
-
-    # Run ATS ROI analysis on market-merged file
+    # Run ATS ROI analysis on the full evaluation window to produce bets for E3
+    # We intentionally use args.start and args.end rather than an OOS window here,
+    # because E3 staking overlay applies to the entire season's ATS bets.
     _run([
         os.environ.get("PYTHON", "python"),
         "-m",
@@ -246,8 +244,8 @@ def main() -> None:
         "--per_game", str(build_ats_out),
         "--calibrator", str(calibrator_path),
         "--policy", str(policy_path),
-        "--eval-start", ats_eval_start,
-        "--eval-end", ats_eval_end,
+        "--eval-start", args.start,
+        "--eval-end", args.end,
         "--strict",
         "--max-bet-rate", "0.30",
     ])
