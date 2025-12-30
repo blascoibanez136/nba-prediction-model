@@ -1,147 +1,128 @@
-def _execution_spread_for_mode(
-    df: pd.DataFrame,
-    mode: str,
-) -> np.ndarray:
-    """Return executed home spread (home line) per row for the given mode.
-
-    IMPORTANT SIGN CONVENTION:
-      - We represent the market line as the *home spread* (home perspective), matching the repo.
-      - For an AWAY ATS bet, a WORSE fill is the home spread moving *up* (toward zero / more positive),
-        because that reduces the points the away side receives.
-
-    Therefore, slippage modeled as +0.25 / +0.50 is implemented as:
-        executed = close_consensus + slip
-    """
-    mode = str(mode).strip().upper()
-
-    close_consensus = pd.to_numeric(df["home_spread_consensus_close"], errors="coerce").to_numpy(dtype=float)
-    open_consensus = pd.to_numeric(df["home_spread_consensus_open"], errors="coerce").to_numpy(dtype=float)
-
-    # dispersion columns are optional
-    close_disp = None
-    if "close_dispersion" in df.columns:
-        close_disp = pd.to_numeric(df["close_dispersion"], errors="coerce").to_numpy(dtype=float)
-    elif "home_spread_dispersion_close" in df.columns:
-        close_disp = pd.to_numeric(df["home_spread_dispersion_close"], errors="coerce").to_numpy(dtype=float)
-    elif "home_spread_dispersion" in df.columns:
-        # if only one dispersion exists in the ROI input, treat as close dispersion
-        close_disp = pd.to_numeric(df["home_spread_dispersion"], errors="coerce").to_numpy(dtype=float)
-
-    if mode == "CONSENSUS_CLOSE":
-        executed = close_consensus
-    elif mode == "CONSENSUS_OPEN":
-        executed = open_consensus
-    elif mode == "CONSENSUS_CLOSE_PLUS_0.25":
-        executed = close_consensus + 0.25
-    elif mode == "CONSENSUS_CLOSE_PLUS_0.5":
-        executed = close_consensus + 0.50
-    elif mode == "WORST_BOOK_CLOSE":
-        # Approximate the worst (highest) home line among books using dispersion as a proxy:
-        # worst ≈ mean + |std|
-        if close_disp is None:
-            executed = close_consensus
-        else:
-            executed = close_consensus + np.abs(close_disp)
-    else:
-        raise ValueError(f"Unknown execution mode: {mode}")
-
-    return executed
-
-
 """
-ATS Execution Stress Test
-========================
+ATS Execution Stress Test (E4.1)
+================================
 
-This module provides a simple backtesting harness to quantify how
-much the NBA ATS model's edge degrades under various execution
-assumptions.  In production the model computes expected value (EV)
-using consensus closing spreads and -110 pricing.  However, in
-practice bets can be filled at worse prices if lines move or if
-liquidity is limited.  E4 introduces a number of stress‐test
-scenarios to quantify the sensitivity of historical ROI, closing
-line value (CLV) and drawdown to pessimistic execution prices.
+Purpose
+-------
+Quantify how ATS edge holds up under more realistic execution assumptions by
+recomputing ROI/CLV/drawdown under multiple execution-price modes.
 
-Five execution modes are supported:
+This script is deliberately *selection-locked*: it assumes the input CSV already
+contains the set of bets you want to stress test (same games), and it only varies
+the execution spread used to settle those bets.
 
-``CONSENSUS_CLOSE``
-    Use the consensus closing spread.  This reproduces the current
-    baseline ROI numbers and serves as a point of comparison.
+Inputs
+------
+CSV passed as positional arg (e.g., outputs/ats_roi_input.csv) must contain:
+- home_final_score (numeric)
+- away_final_score (numeric)
+- home_spread_consensus_open (numeric)
+- home_spread_consensus_close (numeric)
 
-``CONSENSUS_OPEN``
-    Use the consensus opening spread.  This tests the impact of
-    executing bets earlier in the day.  CLV is measured against the
-    closing consensus.
+Optional (improves WORST_BOOK_CLOSE approximation):
+- close_dispersion OR home_spread_dispersion_close OR home_spread_dispersion
 
-``WORST_BOOK_CLOSE``
-    Use a worst‐case spread among all books in the closing snapshot.
-    For an away bet this is approximated by adding the measured
-    dispersion at close to the consensus close spread.  If you have
-    per‐book snapshots available you can replace this approximation
-    with the true worst price.
+Outputs
+-------
+- Prints a table to stdout
+- Writes a CSV (default outputs/ats_execution_stress_test.csv)
 
-``CONSENSUS_CLOSE_PLUS_0.25`` and ``CONSENSUS_CLOSE_PLUS_0.5``
-    Shift the consensus closing spread against the bettor by 0.25 or
-    0.50 points.  This represents modest and severe slippage,
-    respectively.
+Conventions
+-----------
+- Spread is represented as the *home spread* (home perspective).
+- We assume the bet side is AWAY (ATS v1 away_only). Away covers if:
+      home_score + home_spread < away_score
+  i.e., away margin is better than the home line.
 
-The script expects that you have already generated the ATS ROI input
-via ``build_ats_roi_input.py``.  That CSV must contain at least
-the following columns:
+- Profit at -110 for 1u stake:
+      win  -> +100/110
+      loss -> -1
+      push -> 0
 
-* ``game_date``
-* ``home_team`` and ``away_team``
-* ``away_final_score`` and ``home_final_score``
-* ``home_spread_consensus_open`` and ``home_spread_consensus_close``
-* ``home_spread_dispersion_close`` (for the worst‐book approximation)
-
-If these fields are unavailable the script will raise an error.  The
-module computes profit per unit at -110 pricing (1 unit stake per
-bet), cumulative ROI, average CLV (difference between executed and
-closing spreads) and maximum drawdown for each execution mode.  All
-metrics are returned in a single DataFrame for easy comparison.
+Execution Modes
+---------------
+CONSENSUS_CLOSE
+CONSENSUS_OPEN
+WORST_BOOK_CLOSE            (approx: close_consensus + abs(dispersion))
+CONSENSUS_CLOSE_PLUS_0.25   (worse for away)
+CONSENSUS_CLOSE_PLUS_0.5    (worse for away)
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
 
+PPU_ATS_MINUS_110 = 100.0 / 110.0  # profit per 1u stake at -110
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def _to_float_series(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce")
+
+
+def _get_close_dispersion_row(row: pd.Series) -> float:
+    """
+    Try multiple column names for close dispersion.
+    Returns 0.0 if not available.
+    """
+    for c in ("close_dispersion", "home_spread_dispersion_close", "home_spread_dispersion"):
+        if c in row and pd.notna(row[c]):
+            try:
+                return float(row[c])
+            except Exception:
+                return 0.0
+    return 0.0
+
+
+def _settle_away(home_score: float, away_score: float, home_spread: float) -> str:
+    """
+    Settle an AWAY ATS bet using home spread (home perspective).
+    Away covers if adjusted home score is strictly less than away score.
+    """
+    adj_home = home_score + home_spread
+    if adj_home == away_score:
+        return "push"
+    return "win" if adj_home < away_score else "loss"
+
+
 # -----------------------------------------------------------------------------
 # Execution price selectors
+# (Return executed HOME spread line.)
 #
-# These functions take a row of the ROI input DataFrame and return the
-# executed spread for the away team.  Positive values imply the home team
-# is favoured; negative values imply the away team is favoured.  For an
-# away bet we want the line to move in our favour, so slippage is modelled
-# by increasing the spread (making it harder for the away team to cover).
+# NOTE ON SLIPPAGE DIRECTION:
+# For an AWAY bet, a worse fill means the home spread moves UP (toward zero / more positive),
+# reducing the points the away side receives.
 # -----------------------------------------------------------------------------
-
 def consensus_close(row: pd.Series) -> float:
-    return row["home_spread_consensus_close"]
+    return float(row["home_spread_consensus_close"])
 
 
 def consensus_open(row: pd.Series) -> float:
-    return row["home_spread_consensus_open"]
+    return float(row["home_spread_consensus_open"])
 
 
 def worst_book_close(row: pd.Series) -> float:
-    # Approximate the worst available price by adding the close dispersion to the
-    # consensus close spread.  In practice you can replace this with the
-    # maximum per‑book spread if raw per‑book snapshots are available.
-    return row["home_spread_consensus_close"] + abs(row.get("home_spread_dispersion_close", 0.0))
+    # Approximate worst/highest home line among books:
+    # worst ≈ mean + |std|
+    base = float(row["home_spread_consensus_close"])
+    disp = abs(_get_close_dispersion_row(row))
+    return base + disp
 
 
 def consensus_close_plus_025(row: pd.Series) -> float:
-    return row["home_spread_consensus_close"] + 0.25
+    return float(row["home_spread_consensus_close"]) + 0.25
 
 
 def consensus_close_plus_050(row: pd.Series) -> float:
-    return row["home_spread_consensus_close"] + 0.50
+    return float(row["home_spread_consensus_close"]) + 0.50
 
 
 EXECUTION_SELECTORS: Dict[str, Callable[[pd.Series], float]] = {
@@ -153,7 +134,7 @@ EXECUTION_SELECTORS: Dict[str, Callable[[pd.Series], float]] = {
 }
 
 
-@dataclass
+@dataclass(frozen=True)
 class ExecutionMetrics:
     mode: str
     bets: int
@@ -164,57 +145,57 @@ class ExecutionMetrics:
 
 
 def compute_metrics_for_mode(df: pd.DataFrame, selector_name: str) -> ExecutionMetrics:
-    """Compute ROI/CLV/drawdown for a given execution mode.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        ROI input containing consensus spreads, final scores and dispersion.
-    selector_name : str
-        One of the keys in EXECUTION_SELECTORS specifying which execution
-        price to apply.
-
-    Returns
-    -------
-    ExecutionMetrics
-        Dataclass summarising bets placed, ROI, CLV, win rate and
-        maximum drawdown measured in units.
-    """
     if selector_name not in EXECUTION_SELECTORS:
         raise ValueError(f"Unknown execution mode: {selector_name}")
+
     selector = EXECUTION_SELECTORS[selector_name]
 
-    # Determine executed spreads and closing spreads for CLV
-        executed_spreads = _execution_spread_for_mode(df, mode)
-    closing_spreads = df["home_spread_consensus_close"]
+    # Executed spreads (home line) for this mode
+    executed_spreads = df.apply(selector, axis=1).astype(float)
 
-    # Compute actual margin: positive if home covers, negative if away covers
-    actual_margin = df["home_final_score"] - df["away_final_score"]
+    # Closing spreads for CLV (close - executed)
+    closing_spreads = _to_float_series(df["home_spread_consensus_close"]).astype(float)
 
-    # Determine if away bet wins under executed spread (i.e., away covers)
-    away_covers = actual_margin < executed_spreads
-    win_rate = away_covers.mean()
+    # Scores
+    home_score = _to_float_series(df["home_final_score"]).astype(float)
+    away_score = _to_float_series(df["away_final_score"]).astype(float)
 
-    # Profit per unit at -110 pricing: +0.9091 for a win, -1.0 for a loss
-    profit_per_bet = np.where(away_covers, 1.0, -1.0) * 1.0  # stake = 1u; vig omitted for simplicity
-    # If you wish to include vig, multiply wins by 0.9091 instead of 1.0
+    # Settle each bet (AWAY ATS)
+    results = []
+    profits = []
+    for hs, aw, line in zip(home_score, away_score, executed_spreads):
+        if pd.isna(hs) or pd.isna(aw) or pd.isna(line):
+            # should not happen if inputs are clean; treat as no-action
+            results.append("no_bet")
+            profits.append(0.0)
+            continue
 
-    # Profit per unit at -110 pricing (ppu = 100/110). Stake is 1u per bet.
-    ppu = 100.0 / 110.0  # 0.9090909
-    profit_per_bet = np.where(away_covers, ppu, -1.0).astype(float)
+        r = _settle_away(float(hs), float(aw), float(line))
+        results.append(r)
+        if r == "win":
+            profits.append(PPU_ATS_MINUS_110)
+        elif r == "loss":
+            profits.append(-1.0)
+        else:
+            profits.append(0.0)
 
-    cumulative_profit = np.cumsum(profit_per_bet)
-    bets = int(len(profit_per_bet))
-    roi = float(cumulative_profit[-1] / bets) if bets else 0.0
+    profits_arr = np.array(profits, dtype=float)
+    bets = int(len(profits_arr))
 
-    # CLV = closing consensus spread - executed spread (negative if we paid a worse price)
+    # ROI per bet (units)
+    cum = np.cumsum(profits_arr) if bets else np.array([0.0])
+    roi = float(cum[-1] / bets) if bets else 0.0
+
+    # Win rate (exclude pushes from numerator by definition? keep simple: wins / bets)
+    win_rate = float(np.mean(np.array(results) == "win")) if bets else 0.0
+
+    # CLV: close - executed (negative if you paid worse than close)
     clv = float(np.nanmean(closing_spreads - executed_spreads))
 
-    # Maximum drawdown: min(cum_profit - running_peak)
-    running_max = np.maximum.accumulate(cumulative_profit) if bets else np.array([0.0])
-
-    drawdown_series = cumulative_profit - running_max
-    max_drawdown = drawdown_series.min()
+    # Max drawdown
+    running_max = np.maximum.accumulate(cum) if bets else np.array([0.0])
+    dd = cum - running_max
+    max_drawdown = float(np.min(dd)) if bets else 0.0
 
     return ExecutionMetrics(
         mode=selector_name,
@@ -227,7 +208,6 @@ def compute_metrics_for_mode(df: pd.DataFrame, selector_name: str) -> ExecutionM
 
 
 def run_stress_test(roi_input_path: str) -> pd.DataFrame:
-    """Run the stress test across all execution modes and return a DataFrame."""
     df = pd.read_csv(roi_input_path)
 
     required_cols = {
@@ -240,33 +220,39 @@ def run_stress_test(roi_input_path: str) -> pd.DataFrame:
     if missing:
         raise RuntimeError(f"ROI input is missing required columns: {missing}")
 
+    # Coerce key numeric columns once (keeps selectors stable)
+    for c in list(required_cols):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
     metrics: List[ExecutionMetrics] = []
     for mode in EXECUTION_SELECTORS.keys():
         metrics.append(compute_metrics_for_mode(df, mode))
 
-    result_df = pd.DataFrame([
-        {
-            "execution_mode": m.mode,
-            "bets": m.bets,
-            "roi": m.roi,
-            "clv": m.clv,
-            "win_rate": m.win_rate,
-            "max_drawdown": m.max_drawdown,
-        }
-        for m in metrics
-    ])
+    result_df = pd.DataFrame(
+        [
+            {
+                "execution_mode": m.mode,
+                "bets": m.bets,
+                "roi": m.roi,
+                "clv": m.clv,
+                "win_rate": m.win_rate,
+                "max_drawdown": m.max_drawdown,
+            }
+            for m in metrics
+        ]
+    )
 
     return result_df
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Stress test ATS ROI under various execution price assumptions."
+        description="Stress test ATS ROI under various execution price assumptions (E4.1)."
     )
     parser.add_argument(
         "roi_input",
         type=str,
-        help="Path to the ATS ROI input CSV generated by build_ats_roi_input.py",
+        help="Path to the ATS ROI input CSV (e.g., outputs/ats_roi_input.csv).",
     )
     parser.add_argument(
         "--output",
