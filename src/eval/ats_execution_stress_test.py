@@ -149,15 +149,20 @@ def compute_metrics_for_mode(df: pd.DataFrame, selector_name: str) -> ExecutionM
     profit_per_bet = np.where(away_covers, 1.0, -1.0) * 1.0  # stake = 1u; vig omitted for simplicity
     # If you wish to include vig, multiply wins by 0.9091 instead of 1.0
 
-    cumulative_profit = profit_per_bet.cumsum()
-    bets = len(profit_per_bet)
-    roi = cumulative_profit.iloc[-1] / bets if bets else 0.0
+    # Profit per unit at -110 pricing (ppu = 100/110). Stake is 1u per bet.
+    ppu = 100.0 / 110.0  # 0.9090909
+    profit_per_bet = np.where(away_covers, ppu, -1.0).astype(float)
+
+    cumulative_profit = np.cumsum(profit_per_bet)
+    bets = int(len(profit_per_bet))
+    roi = float(cumulative_profit[-1] / bets) if bets else 0.0
 
     # CLV = closing consensus spread - executed spread (negative if we paid a worse price)
-    clv = (closing_spreads - executed_spreads).mean()
+    clv = float(np.nanmean(closing_spreads - executed_spreads))
 
-    # Maximum drawdown: the minimum difference between cumulative profit and all previous peaks
-    running_max = cumulative_profit.cummax()
+    # Maximum drawdown: min(cum_profit - running_peak)
+    running_max = np.maximum.accumulate(cumulative_profit) if bets else np.array([0.0])
+
     drawdown_series = cumulative_profit - running_max
     max_drawdown = drawdown_series.min()
 
