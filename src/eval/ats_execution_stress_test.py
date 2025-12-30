@@ -1,3 +1,53 @@
+def _execution_spread_for_mode(
+    df: pd.DataFrame,
+    mode: str,
+) -> np.ndarray:
+    """Return executed home spread (home line) per row for the given mode.
+
+    IMPORTANT SIGN CONVENTION:
+      - We represent the market line as the *home spread* (home perspective), matching the repo.
+      - For an AWAY ATS bet, a WORSE fill is the home spread moving *up* (toward zero / more positive),
+        because that reduces the points the away side receives.
+
+    Therefore, slippage modeled as +0.25 / +0.50 is implemented as:
+        executed = close_consensus + slip
+    """
+    mode = str(mode).strip().upper()
+
+    close_consensus = pd.to_numeric(df["home_spread_consensus_close"], errors="coerce").to_numpy(dtype=float)
+    open_consensus = pd.to_numeric(df["home_spread_consensus_open"], errors="coerce").to_numpy(dtype=float)
+
+    # dispersion columns are optional
+    close_disp = None
+    if "close_dispersion" in df.columns:
+        close_disp = pd.to_numeric(df["close_dispersion"], errors="coerce").to_numpy(dtype=float)
+    elif "home_spread_dispersion_close" in df.columns:
+        close_disp = pd.to_numeric(df["home_spread_dispersion_close"], errors="coerce").to_numpy(dtype=float)
+    elif "home_spread_dispersion" in df.columns:
+        # if only one dispersion exists in the ROI input, treat as close dispersion
+        close_disp = pd.to_numeric(df["home_spread_dispersion"], errors="coerce").to_numpy(dtype=float)
+
+    if mode == "CONSENSUS_CLOSE":
+        executed = close_consensus
+    elif mode == "CONSENSUS_OPEN":
+        executed = open_consensus
+    elif mode == "CONSENSUS_CLOSE_PLUS_0.25":
+        executed = close_consensus + 0.25
+    elif mode == "CONSENSUS_CLOSE_PLUS_0.5":
+        executed = close_consensus + 0.50
+    elif mode == "WORST_BOOK_CLOSE":
+        # Approximate the worst (highest) home line among books using dispersion as a proxy:
+        # worst ≈ mean + |std|
+        if close_disp is None:
+            executed = close_consensus
+        else:
+            executed = close_consensus + np.abs(close_disp)
+    else:
+        raise ValueError(f"Unknown execution mode: {mode}")
+
+    return executed
+
+
 """
 ATS Execution Stress Test
 ========================
@@ -135,7 +185,7 @@ def compute_metrics_for_mode(df: pd.DataFrame, selector_name: str) -> ExecutionM
     selector = EXECUTION_SELECTORS[selector_name]
 
     # Determine executed spreads and closing spreads for CLV
-    executed_spreads = df.apply(selector, axis=1)
+        executed_spreads = _execution_spread_for_mode(df, mode)
     closing_spreads = df["home_spread_consensus_close"]
 
     # Compute actual margin: positive if home covers, negative if away covers
