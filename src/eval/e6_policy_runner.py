@@ -83,7 +83,7 @@ def main():
         'selected': selected_count,
         'rejected': rejected_count,
         'reasons': reason_counts,
-        'note': 'E6 overlay with caps and kill-switch applied'
+        'note': 'E6 overlay with caps, drawdown brakes and kill-switch applied'
     }
     with open(audit_path, 'w', encoding='utf-8') as f:
         json.dump(audit, f, indent=2)
