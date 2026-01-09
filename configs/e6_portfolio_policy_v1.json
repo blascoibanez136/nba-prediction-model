@@ -2,18 +2,72 @@
   "policy_name": "e6_portfolio_policy_v1",
   "version": "2026-01-09",
   "scope": {
-    "markets": {
+    "markets_enabled": {
       "ATS": true,
       "Totals": false,
       "Moneyline": false
     },
+    "side_policy": {
+      "ATS": "away_only"
+    },
     "bankroll_usd": 1000.0,
-    "unit_usd": 10.0
+    "unit_convention": {
+      "unit_name": "u",
+      "unit_usd": 10.0,
+      "units_per_bankroll": 100
+    },
+    "pricing_assumptions": {
+      "ATS_default_price": -110,
+      "american_odds_only": true
+    }
   },
-  "unit_convention": {
-    "unit_name": "u",
-    "unit_usd": 10.0,
-    "units_per_bankroll": 100
+  "interfaces": {
+    "candidate_input": {
+      "source_preference": [
+        "outputs/ats_e3_staked_bets.csv",
+        "outputs/ats_roi_bets.csv"
+      ],
+      "required_columns_any_of": {
+        "date": [
+          "game_date",
+          "date"
+        ],
+        "keys": [
+          "merge_key"
+        ],
+        "market": [
+          "market"
+        ],
+        "side": [
+          "bet_side"
+        ],
+        "ev": [
+          "ev_units"
+        ]
+      },
+      "optional_columns": [
+        "home_team",
+        "away_team",
+        "clv_aligned",
+        "clv",
+        "price",
+        "stake_u",
+        "stake",
+        "result",
+        "profit",
+        "e3_reason"
+      ],
+      "hard_assertions": {
+        "american_odds_contract": "abs(price) >= 100 or price is null (ATS may default to -110)",
+        "ats_only_market": "market must be 'spread' when markets_enabled.ATS=true and others=false",
+        "ats_side_policy": "bet_side must be 'away' when scope.side_policy.ATS='away_only'"
+      }
+    },
+    "outputs": {
+      "bets_csv": "outputs/e6_portfolio_bets.csv",
+      "metrics_json": "outputs/e6_portfolio_metrics.json",
+      "audit_json": "outputs/e6_portfolio_audit.json"
+    }
   },
   "stake_model": {
     "mode": "kelly_lite_with_caps",
@@ -26,48 +80,111 @@
   },
   "risk_caps": {
     "max_daily_stake_u": 12.0,
-    "max_bet_rate": 0.30,
+    "max_bet_rate": 0.3,
     "max_per_bet_stake_u": 1.0,
-    "max_team_exposure_u": 2.0,
     "max_market_exposure_u": {
       "ATS": 12.0,
       "Totals": 0.0,
       "Moneyline": 0.0
-    }
+    },
+    "max_team_exposure_u": 2.0,
+    "team_exposure_key": "team_appearance_any_side",
+    "team_exposure_notes": "Counts exposure if a team appears in either home_team or away_team in the bet row."
   },
   "loss_streak_dampening": {
     "enabled": true,
     "schedule": [
-      { "losses": 0, "multiplier": 1.0 },
-      { "losses": 1, "multiplier": 0.85 },
-      { "losses": 2, "multiplier": 0.70 },
-      { "losses": 3, "multiplier": 0.55 },
-      { "losses": 4, "multiplier": 0.40 },
-      { "losses": 5, "multiplier": 0.25 }
+      {
+        "losses": 0,
+        "multiplier": 1.0
+      },
+      {
+        "losses": 1,
+        "multiplier": 0.85
+      },
+      {
+        "losses": 2,
+        "multiplier": 0.7
+      },
+      {
+        "losses": 3,
+        "multiplier": 0.55
+      },
+      {
+        "losses": 4,
+        "multiplier": 0.4
+      },
+      {
+        "losses": 5,
+        "multiplier": 0.25
+      }
     ],
     "floor_multiplier": 0.25
   },
   "drawdown_brakes": {
     "enabled": true,
     "stages": [
-      { "drawdown_u": 5.0, "action": "reduce_kelly", "new_kelly": 0.10 },
-      { "drawdown_u": 7.0, "action": "cap_max_stake", "new_max_per_bet_stake_u": 0.60 },
-      { "drawdown_u": 9.0, "action": "halt", "cooldown_days": 3 }
+      {
+        "drawdown_u": 5.0,
+        "action": "reduce_kelly",
+        "new_kelly": 0.1
+      },
+      {
+        "drawdown_u": 7.0,
+        "action": "cap_max_stake",
+        "new_max_per_bet_stake_u": 0.6
+      },
+      {
+        "drawdown_u": 9.0,
+        "action": "halt",
+        "cooldown_days": 3
+      }
     ]
+  },
+  "kill_switch": {
+    "enabled": true,
+    "source_artifacts": [
+      "outputs/e5_kill_switch_diagnostics.json"
+    ],
+    "supported_reasons": [
+      "rolling_clv_below_-0.10",
+      "rolling_roi_below_-0.05"
+    ],
+    "behavior": {
+      "mode": "halt_day",
+      "cooldown_days": 1,
+      "notes": "If the run_date is flagged by E5 kill-switch diagnostics, E6 must output zero bets for that date."
+    }
   },
   "ordering": {
     "primary": "ev_units_desc",
-    "secondary": "clv_desc"
+    "secondary": "clv_desc",
+    "stable_tiebreakers": [
+      "game_date_asc",
+      "merge_key_asc"
+    ]
   },
   "no_bet_day_rules": {
     "enabled": true,
     "conditions": [
       "no_bets_after_caps",
-      "halt_active"
+      "halt_active",
+      "kill_switch_active"
     ]
   },
   "audit": {
     "write_portfolio_audit": true,
+    "reason_codes": [
+      "accepted",
+      "rejected_market_disabled",
+      "rejected_side_policy",
+      "rejected_missing_required_fields",
+      "rejected_team_cap",
+      "rejected_market_cap",
+      "rejected_daily_cap",
+      "halt_drawdown",
+      "halt_kill_switch"
+    ],
     "fields": [
       "bankroll_usd",
       "kelly_effective",
@@ -75,7 +192,8 @@
       "loss_streak",
       "total_stake_u",
       "selected_bets",
-      "rejected_due_to_caps"
+      "rejected_due_to_caps",
+      "kill_switch_active"
     ]
   }
 }
