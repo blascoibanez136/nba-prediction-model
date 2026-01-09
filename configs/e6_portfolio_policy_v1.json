@@ -1,0 +1,81 @@
+{
+  "policy_name": "e6_portfolio_policy_v1",
+  "version": "2026-01-09",
+  "scope": {
+    "markets": {
+      "ATS": true,
+      "Totals": false,
+      "Moneyline": false
+    },
+    "bankroll_usd": 1000.0,
+    "unit_usd": 10.0
+  },
+  "unit_convention": {
+    "unit_name": "u",
+    "unit_usd": 10.0,
+    "units_per_bankroll": 100
+  },
+  "stake_model": {
+    "mode": "kelly_lite_with_caps",
+    "kelly_fraction": 0.15,
+    "kelly_fraction_hard_cap": 0.25,
+    "rounding": {
+      "mode": "nearest",
+      "increment_u": 0.05
+    }
+  },
+  "risk_caps": {
+    "max_daily_stake_u": 12.0,
+    "max_bet_rate": 0.30,
+    "max_per_bet_stake_u": 1.0,
+    "max_team_exposure_u": 2.0,
+    "max_market_exposure_u": {
+      "ATS": 12.0,
+      "Totals": 0.0,
+      "Moneyline": 0.0
+    }
+  },
+  "loss_streak_dampening": {
+    "enabled": true,
+    "schedule": [
+      { "losses": 0, "multiplier": 1.0 },
+      { "losses": 1, "multiplier": 0.85 },
+      { "losses": 2, "multiplier": 0.70 },
+      { "losses": 3, "multiplier": 0.55 },
+      { "losses": 4, "multiplier": 0.40 },
+      { "losses": 5, "multiplier": 0.25 }
+    ],
+    "floor_multiplier": 0.25
+  },
+  "drawdown_brakes": {
+    "enabled": true,
+    "stages": [
+      { "drawdown_u": 5.0, "action": "reduce_kelly", "new_kelly": 0.10 },
+      { "drawdown_u": 7.0, "action": "cap_max_stake", "new_max_per_bet_stake_u": 0.60 },
+      { "drawdown_u": 9.0, "action": "halt", "cooldown_days": 3 }
+    ]
+  },
+  "ordering": {
+    "primary": "ev_units_desc",
+    "secondary": "clv_desc"
+  },
+  "no_bet_day_rules": {
+    "enabled": true,
+    "conditions": [
+      "no_bets_after_caps",
+      "halt_active"
+    ]
+  },
+  "audit": {
+    "write_portfolio_audit": true,
+    "fields": [
+      "bankroll_usd",
+      "kelly_effective",
+      "drawdown_u",
+      "loss_streak",
+      "total_stake_u",
+      "selected_bets",
+      "rejected_due_to_caps"
+    ]
+  }
+}
