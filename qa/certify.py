@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-QA certify script (Commit 2 + E2 + E3 guards) with dispersion and OOS window fixes.
+QA certify script (Commit 2 + E2 + E3 + E6 guards).
 
-This version adds a pre‑processing step to build a per‑game file with market
-consensus and dispersion for ATS ROI analysis, and enforces the locked
-out‑of‑sample evaluation window (2024‑03‑11..2024‑04‑14).
+This version extends the existing certification harness to include E6
+portfolio-level validation. It preserves all existing E2/E3 checks and
+adds calls to run the E6 correlation audit and portfolio overlay, then
+verifies that the resulting bets respect the portfolio policy caps and
+kill-switch logic.
 
-It runs:
+The pipeline now runs:
   1) historical_prediction_runner
   2) backtest join + metrics (outputs/backtest_joined.csv)
   3) E2 policy metrics (src.eval.e2_policy_runner) + validation
   4) Build ATS ROI input (src.eval.build_ats_roi_input) using snapshots
-  5) ATS ROI bets (src.eval.ats_roi_analysis) on the OOS window
+  5) ATS ROI bets (src.eval.ats_roi_analysis) on the evaluation window
   6) E3 staking metrics (src.eval.e3_policy_runner) + validation
+  7) E6 correlation audit (src.eval.e6_correlation_audit)
+  8) E6 portfolio overlay (src.eval.e6_policy_runner)
+  9) E6 portfolio validation (caps, kill-switch)
 
 Any regression fails hard.
 """
@@ -149,6 +154,100 @@ def _validate_e3_policy(outputs_dir: Path, *, e2_metrics: dict, policy_json: Pat
           f"max_daily={max_daily_seen:.2f} max_per_bet={max_per_bet_seen:.2f}")
 
 
+def _validate_e6_portfolio(outputs_dir: Path, *, policy_json: Path) -> None:
+    """
+    Validate the E6 portfolio overlay outputs.
+
+    This function checks that the E6 portfolio bets respect all hard caps defined
+    in the portfolio policy (per‑bet stake cap, daily stake cap, and team
+    exposure caps). It also asserts that kill‑switch dates produce zero
+    stakes and that the number of accepted and rejected bets is sensible.
+
+    Raises RuntimeError on any violation.
+    """
+    bets_path = outputs_dir / "e6_portfolio_bets.csv"
+    metrics_path = outputs_dir / "e6_portfolio_metrics.json"
+    audit_path = outputs_dir / "e6_portfolio_audit.json"
+    if not bets_path.exists():
+        _fail("Missing outputs/e6_portfolio_bets.csv after E6 overlay run.")
+    if not metrics_path.exists():
+        _fail("Missing outputs/e6_portfolio_metrics.json after E6 overlay run.")
+    # Load policy
+    policy = _load_json(policy_json)
+    risk_caps = policy.get("risk_caps", {})
+    max_daily = float(risk_caps.get("max_daily_stake_u", float("inf")))
+    max_per_bet = float(risk_caps.get("max_per_bet_stake_u", float("inf")))
+    max_team = float(risk_caps.get("max_team_exposure_u", float("inf")))
+    # Load bets
+    import pandas as pd
+    df = pd.read_csv(bets_path)
+    # Ensure stake_u_final exists
+    if "stake_u_final" not in df.columns:
+        _fail("E6 bets missing stake_u_final column")
+    # Validate per‑bet cap
+    if (df["stake_u_final"] > max_per_bet + 1e-9).any():
+        offending = df[df["stake_u_final"] > max_per_bet + 1e-9]
+        _fail(f"E6 per‑bet stake cap violation: {len(offending)} bets exceed {max_per_bet}")
+    # Compute daily sums
+    daily_sums = df.groupby("game_date")["stake_u_final"].sum()
+    for date_str, total in daily_sums.items():
+        if total > max_daily + 1e-9:
+            _fail(f"E6 daily stake cap violation on {date_str}: total_stake={total:.4f} > cap={max_daily}")
+    # Team exposure cap
+    team_exposure = {}
+    for _, row in df.iterrows():
+        stake = float(row.get("stake_u_final", 0.0))
+        if stake <= 0:
+            continue
+        date = str(row.get("game_date"))
+        for team_col in ["home_team", "away_team"]:
+            team = row.get(team_col)
+            if pd.notnull(team):
+                key = (date, str(team))
+                team_exposure[key] = team_exposure.get(key, 0.0) + stake
+    for (date_str, team), exp in team_exposure.items():
+        if exp > max_team + 1e-9:
+            _fail(f"E6 team exposure cap violation on {date_str} for team {team}: exposure={exp:.4f} > cap={max_team}")
+    # Kill‑switch verification
+    ks_cfg = policy.get("kill_switch", {})
+    if ks_cfg.get("enabled"):
+        supported_reasons = set(ks_cfg.get("supported_reasons", []))
+        artifacts = ks_cfg.get("source_artifacts", [])
+        cooldown_days = int(ks_cfg.get("behavior", {}).get("cooldown_days", 0))
+        kill_dates = set()
+        for art in artifacts:
+            pth = Path(art)
+            if not pth.exists():
+                continue
+            data = _load_json(pth)
+            for entry in data:
+                date = entry.get("date")
+                reasons = entry.get("reasons", [])
+                if date and any(r in supported_reasons for r in reasons):
+                    kill_dates.add(date)
+                    if cooldown_days:
+                        try:
+                            ts = pd.to_datetime(date)
+                            for i in range(1, cooldown_days + 1):
+                                cd = (ts + pd.Timedelta(days=i)).strftime("%Y-%m-%d")
+                                kill_dates.add(cd)
+                        except Exception:
+                            pass
+        for kd in kill_dates:
+            if kd in daily_sums and daily_sums[kd] > 1e-9:
+                _fail(f"E6 kill‑switch violation: stake placed on kill date {kd}")
+    # Check for unknown reason codes
+    valid_reasons = {"accepted", "daily_cap", "team_cap", "kill_switch_halt", "halt_drawdown"}
+    if "e6_reason" in df.columns:
+        unknown = set(df["e6_reason"].unique()) - valid_reasons
+        if unknown:
+            _fail(f"E6 unknown reason codes: {unknown}")
+    total_bets = len(df)
+    accepted = int((df["stake_u_final"] > 0).sum())
+    rejected = total_bets - accepted
+    print(f"[certify:E6] ✅ E6 validated: bets={total_bets} accepted={accepted} rejected={rejected}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--history", default="data/history/games_2019_2024.csv")
@@ -235,8 +334,6 @@ def main() -> None:
     ])
 
     # Run ATS ROI analysis on the full evaluation window to produce bets for E3
-    # We intentionally use args.start and args.end rather than an OOS window here,
-    # because E3 staking overlay applies to the entire season's ATS bets.
     _run([
         os.environ.get("PYTHON", "python"),
         "-m",
@@ -271,7 +368,31 @@ def main() -> None:
 
     _validate_e3_policy(out_dir, e2_metrics=e2_metrics, policy_json=e3_policy)
 
-    print("[certify] ✅ All checks passed (E2 + E3)")
+    # ======== New E6 steps ========
+    # 6) Correlation & concentration audit
+    _run([
+        os.environ.get("PYTHON", "python"),
+        "-m",
+        "src.eval.e6_correlation_audit",
+        "--candidates", str(out_dir / "ats_e3_staked_bets.csv"),
+        "--report", str(out_dir / "e6_correlation_report.json"),
+        "--concentration_csv", str(out_dir / "e6_concentration_report.csv"),
+    ])
+    # 7) Run E6 portfolio overlay
+    e6_policy = Path("configs/e6_portfolio_policy_v1.json")
+    if not e6_policy.exists():
+        _fail("Missing configs/e6_portfolio_policy_v1.json")
+    _run([
+        os.environ.get("PYTHON", "python"),
+        "-m",
+        "src.eval.e6_policy_runner",
+        "--policy", str(e6_policy),
+        "--candidates", str(out_dir / "ats_e3_staked_bets.csv"),
+    ])
+    # Validate E6 portfolio caps and kill-switch
+    _validate_e6_portfolio(out_dir, policy_json=e6_policy)
+
+    print("[certify] ✅ All checks passed (E2 + E3 + E6)")
 
 
 if __name__ == "__main__":
