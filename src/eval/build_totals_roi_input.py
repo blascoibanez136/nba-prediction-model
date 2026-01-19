@@ -9,6 +9,10 @@ from typing import Iterable, List, Optional
 import pandas as pd
 
 
+def _norm(s: object) -> str:
+    return str(s).strip().lower()
+
+
 def _candidate_snapshot_dirs(snapshot_dir: Path) -> List[Path]:
     dirs = [snapshot_dir]
     raw = snapshot_dir / "raw"
@@ -33,7 +37,6 @@ def _iter_close_snapshot_files(snapshot_dir: Path, start: str, end: str) -> Iter
         ymd = d.strftime("%Y%m%d")
         ymd_dash = d.strftime("%Y-%m-%d")
 
-        # Prefer normalized CSV close snapshots
         csv_candidates: List[Path] = []
         for base in dirs:
             csv_candidates.append(base / f"close_{ymd}.csv")
@@ -42,7 +45,6 @@ def _iter_close_snapshot_files(snapshot_dir: Path, start: str, end: str) -> Iter
             yield p
             continue
 
-        # JSON close snapshots
         json_candidates: List[Path] = []
         for base in dirs:
             json_candidates.extend(list(base.glob(f"close_{ymd}*.json")))
@@ -51,7 +53,6 @@ def _iter_close_snapshot_files(snapshot_dir: Path, start: str, end: str) -> Iter
             yield p
             continue
 
-        # raw json patterns (fallback)
         raw_candidates: List[Path] = []
         for base in dirs:
             raw_candidates.extend(list(base.glob(f"raw_{ymd_dash}*.json")))
@@ -63,15 +64,6 @@ def _iter_close_snapshot_files(snapshot_dir: Path, start: str, end: str) -> Iter
 
 
 def _market_from_close_csv(path: Path) -> pd.DataFrame:
-    """
-    Normalized snapshot CSV is expected to contain totals per book.
-
-    We try common column names:
-      - total_point
-      - total
-      - total_points
-      - points_total
-    """
     df = pd.read_csv(path)
     if df.empty or "merge_key" not in df.columns:
         return pd.DataFrame(columns=["merge_key", "total_consensus", "total_dispersion"])
@@ -101,10 +93,6 @@ def _market_from_close_csv(path: Path) -> pd.DataFrame:
 
 
 def _market_from_oddsapi_json(path: Path) -> pd.DataFrame:
-    """
-    Parse raw OddsAPI JSON to extract totals points across books.
-    We look for market key like 'totals' with outcomes that include a 'point'.
-    """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
@@ -115,26 +103,20 @@ def _market_from_oddsapi_json(path: Path) -> pd.DataFrame:
         return pd.DataFrame(columns=["merge_key", "total_consensus", "total_dispersion"])
 
     for game in data:
-        # best-effort merge_key (Odds snapshots in this repo usually already include merge_key somewhere;
-        # if not, we skip)
-        merge_key = game.get("merge_key") or game.get("id") or None
-        # We only accept already-normalized merge_key if present
-        if not merge_key:
+        mk = game.get("merge_key")
+        if not mk:
             continue
-
         books = game.get("bookmakers", [])
         for b in books:
-            markets = b.get("markets", [])
-            for m in markets:
+            for m in b.get("markets", []):
                 key = m.get("key") or m.get("market_key")
                 if str(key).lower() != "totals":
                     continue
                 for o in m.get("outcomes", []):
-                    # totals markets usually have Over/Under outcomes with "point"
                     pt = o.get("point")
                     if pt is None:
                         continue
-                    rows.append({"merge_key": str(merge_key).strip().lower(), "total_point": float(pt)})
+                    rows.append({"merge_key": _norm(mk), "total_point": float(pt)})
 
     if not rows:
         return pd.DataFrame(columns=["merge_key", "total_consensus", "total_dispersion"])
@@ -169,6 +151,39 @@ def build_market_df(snapshot_dir: Path, start: str, end: str) -> pd.DataFrame:
     return market
 
 
+def _ensure_merge_key(back: pd.DataFrame) -> pd.DataFrame:
+    # If already present, normalize it.
+    if "merge_key" in back.columns:
+        back = back.copy()
+        back["merge_key"] = back["merge_key"].astype(str).str.strip().str.lower()
+        return back
+
+    # Otherwise construct from home_team / away_team / game_date|date
+    if not {"home_team", "away_team"}.issubset(back.columns):
+        raise RuntimeError("[build_totals_roi_input] missing merge_key and missing home_team/away_team")
+
+    date_col = None
+    for c in ["game_date", "date", "gamedate"]:
+        if c in back.columns:
+            date_col = c
+            break
+    if date_col is None:
+        raise RuntimeError("[build_totals_roi_input] missing merge_key and missing date column")
+
+    dt = pd.to_datetime(back[date_col], errors="coerce")
+    if dt.isna().any():
+        raise RuntimeError("[build_totals_roi_input] Found NaT in date column; cannot build merge_key safely.")
+    date_str = dt.dt.strftime("%Y-%m-%d")
+
+    back = back.copy()
+    back["merge_key"] = [
+        f"{_norm(h)}__{_norm(a)}__{d}"
+        for h, a, d in zip(back["home_team"], back["away_team"], date_str)
+    ]
+    back["merge_key"] = back["merge_key"].astype(str).str.strip().str.lower()
+    return back
+
+
 def main() -> None:
     ap = argparse.ArgumentParser("build_totals_roi_input")
     ap.add_argument("--backtest-joined", required=True)
@@ -182,11 +197,7 @@ def main() -> None:
     if back.empty:
         raise RuntimeError("[build_totals_roi_input] backtest_joined is empty")
 
-    # Ensure merge_key exists (backtest_joined should already have it)
-    if "merge_key" not in back.columns:
-        raise RuntimeError("[build_totals_roi_input] missing merge_key in backtest_joined")
-
-    back["merge_key"] = back["merge_key"].astype(str).str.strip().str.lower()
+    back = _ensure_merge_key(back)
 
     # Rename fair_total -> fair_total_model if needed
     if "fair_total_model" not in back.columns and "fair_total" in back.columns:
