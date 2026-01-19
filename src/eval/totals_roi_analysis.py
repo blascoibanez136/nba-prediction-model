@@ -147,7 +147,7 @@ def main() -> None:
         default=3.5,
         help="Minimum absolute residual for UNDER bets (default 3.5).",
     )
-ap.add_argument("--max-dispersion", type=float, default=8.0)
+    ap.add_argument("--max-dispersion", type=float, default=8.0)
     ap.add_argument("--require-dispersion", action="store_true")
 
     ap.add_argument("--side", default="both", choices=["both", "over", "under"])
