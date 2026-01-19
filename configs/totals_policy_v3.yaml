@@ -1,0 +1,27 @@
+policy_name: totals_policy_v3_shadow
+version_tag: 2026-01-19_shadow
+
+# Base EV threshold for the funnel (script applies slight relax at larger residuals)
+ev_threshold: 0.04
+
+# Residual gate
+min_abs_residual: 2.5
+
+# Optional dispersion gating
+require_dispersion: false
+max_dispersion: 8.0
+
+side_policy: both  # over | under | both
+
+# Volume & sanity guards
+guards:
+  max_bet_rate: 0.12
+  max_profit_abs: 10.0
+
+# Sizing mode (shadow default)
+stake_mode: flat
+flat_stake: 1.0
+bucket_stakes: "A=1.0,B=0.6,C=0.3"
+kelly_fraction: 0.25
+kelly_max_unit: 1.0
+kelly_min_unit: 0.0
