@@ -383,8 +383,8 @@ def main() -> None:
     bets_pre_cap = int(len(bets))
 
     if not args.disable_bet_cap and not bets.empty:
-    cap_applied = True
-    cap_max_bets = max(1, int(math.floor(args.max_bet_rate * total_games)))
+        cap_applied = True
+        cap_max_bets = max(1, int(math.floor(args.max_bet_rate * total_games)))
 
     if len(bets) > cap_max_bets:
         print(f"[totals] Bet-rate capped: trimming {len(bets)} → {cap_max_bets} (cap={args.max_bet_rate:.2f})")
