@@ -140,7 +140,14 @@ def main() -> None:
     ap.add_argument("--ev", type=float, default=0.04)
     ap.add_argument("--min-abs-residual", type=float, default=2.5)
 
-    ap.add_argument("--max-dispersion", type=float, default=8.0)
+    
+    ap.add_argument(
+        "--min-abs-residual-under",
+        type=float,
+        default=3.5,
+        help="Minimum absolute residual for UNDER bets (default 3.5).",
+    )
+ap.add_argument("--max-dispersion", type=float, default=8.0)
     ap.add_argument("--require-dispersion", action="store_true")
 
     ap.add_argument("--side", default="both", choices=["both", "over", "under"])
@@ -211,6 +218,7 @@ def main() -> None:
         "params": {
             "base_ev": args.ev,
             "min_abs_residual": args.min_abs_residual,
+            "min_abs_residual_under": args.min_abs_residual_under,
             "max_dispersion": args.max_dispersion,
             "require_dispersion": bool(args.require_dispersion),
             "max_bet_rate": args.max_bet_rate,
@@ -332,20 +340,28 @@ def main() -> None:
             return max(0.035, args.ev - 0.01)
         return args.ev
 
-    def choose_side(r) -> Tuple[bool, Optional[str], Optional[float]]:
-        if not bool(r["eligible"]):
+        def choose_side(r) -> Tuple[bool, Optional[str], Optional[float]]:
+            if not bool(r["eligible"]):
+                return False, None, None
+
+            abs_res = float(r["abs_residual"])
+
+            # Asymmetric residual gates:
+            # - Over uses --min-abs-residual
+            # - Under uses --min-abs-residual-under (default higher)
+            res_ok_over = abs_res >= float(args.min_abs_residual)
+            res_ok_under = abs_res >= float(args.min_abs_residual_under)
+
+            req_ev = ev_required(abs_res)
+            oe, ue = r["over_ev"], r["under_ev"]
+
+            if res_ok_over and pd.notna(oe) and float(oe) >= req_ev and (pd.isna(ue) or float(oe) > float(ue)):
+                return True, "over", float(oe)
+            if res_ok_under and pd.notna(ue) and float(ue) >= req_ev and (pd.isna(oe) or float(ue) > float(oe)):
+                return True, "under", float(ue)
             return False, None, None
 
-        req_ev = ev_required(float(r["abs_residual"]))
-        oe, ue = r["over_ev"], r["under_ev"]
-
-        if pd.notna(oe) and float(oe) >= req_ev and (pd.isna(ue) or float(oe) > float(ue)):
-            return True, "over", float(oe)
-        if pd.notna(ue) and float(ue) >= req_ev and (pd.isna(oe) or float(ue) > float(oe)):
-            return True, "under", float(ue)
-        return False, None, None
-
-    chosen = df.apply(choose_side, axis=1, result_type="expand")
+chosen = df.apply(choose_side, axis=1, result_type="expand")
     df["bet"] = chosen[0]
     df["bet_side"] = chosen[1]
     df["ev_used"] = chosen[2]
