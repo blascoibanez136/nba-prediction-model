@@ -332,39 +332,41 @@ def main() -> None:
     df["under_ev"] = df["p_under"].apply(expected_value_total)
 
     # ---------- EV × residual funnel ----------
-    def ev_required(abs_res: float) -> float:
-        # Larger residual → lower EV requirement (slight)
-        if abs_res >= 6.0:
-            return max(0.03, args.ev - 0.02)
-        if abs_res >= 4.0:
-            return max(0.035, args.ev - 0.01)
-        return args.ev
+def ev_required(abs_res: float) -> float:
+    # Larger residual → lower EV requirement (slight)
+    if abs_res >= 6.0:
+        return max(0.03, args.ev - 0.02)
+    if abs_res >= 4.0:
+        return max(0.035, args.ev - 0.01)
+    return args.ev
 
-        def choose_side(r) -> Tuple[bool, Optional[str], Optional[float]]:
-            if not bool(r["eligible"]):
-                return False, None, None
 
-            abs_res = float(r["abs_residual"])
+def choose_side(r) -> Tuple[bool, Optional[str], Optional[float]]:
+    if not bool(r["eligible"]):
+        return False, None, None
 
-            # Asymmetric residual gates:
-            # - Over uses --min-abs-residual
-            # - Under uses --min-abs-residual-under (default higher)
-            res_ok_over = abs_res >= float(args.min_abs_residual)
-            res_ok_under = abs_res >= float(args.min_abs_residual_under)
+    abs_res = float(r["abs_residual"])
 
-            req_ev = ev_required(abs_res)
-            oe, ue = r["over_ev"], r["under_ev"]
+    # Asymmetric residual gates:
+    # - Over uses --min-abs-residual
+    # - Under uses --min-abs-residual-under (default higher)
+    res_ok_over = abs_res >= float(args.min_abs_residual)
+    res_ok_under = abs_res >= float(args.min_abs_residual_under)
 
-            if res_ok_over and pd.notna(oe) and float(oe) >= req_ev and (pd.isna(ue) or float(oe) > float(ue)):
-                return True, "over", float(oe)
-            if res_ok_under and pd.notna(ue) and float(ue) >= req_ev and (pd.isna(oe) or float(ue) > float(oe)):
-                return True, "under", float(ue)
-            return False, None, None
+    req_ev = ev_required(abs_res)
+    oe, ue = r["over_ev"], r["under_ev"]
+
+    if res_ok_over and pd.notna(oe) and float(oe) >= req_ev and (pd.isna(ue) or float(oe) > float(ue)):
+        return True, "over", float(oe)
+    if res_ok_under and pd.notna(ue) and float(ue) >= req_ev and (pd.isna(oe) or float(ue) > float(oe)):
+        return True, "under", float(ue)
+    return False, None, None
+
 
 chosen = df.apply(choose_side, axis=1, result_type="expand")
-    df["bet"] = chosen[0]
-    df["bet_side"] = chosen[1]
-    df["ev_used"] = chosen[2]
+df["bet"] = chosen[0]
+df["bet_side"] = chosen[1]
+df["ev_used"] = chosen[2]
 
     bets = df[df["bet"]].copy()
     metrics["counts"]["bets_pre_side_policy"] = int(len(bets))
