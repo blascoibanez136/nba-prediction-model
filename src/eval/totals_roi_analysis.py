@@ -381,13 +381,40 @@ def main() -> None:
     cap_applied = False
     cap_max_bets = None
     bets_pre_cap = int(len(bets))
+
     if not args.disable_bet_cap and not bets.empty:
-        cap_applied = True
-        cap_max_bets = max(1, int(math.floor(args.max_bet_rate * total_games)))
-        bets = bets.sort_values("ev_used", ascending=False)
-        if len(bets) > cap_max_bets:
-            print(f"[totals] Bet-rate capped: trimming {len(bets)} → {cap_max_bets} (cap={args.max_bet_rate:.2f})")
-            bets = bets.head(cap_max_bets)
+    cap_applied = True
+    cap_max_bets = max(1, int(math.floor(args.max_bet_rate * total_games)))
+
+    if len(bets) > cap_max_bets:
+        print(f"[totals] Bet-rate capped: trimming {len(bets)} → {cap_max_bets} (cap={args.max_bet_rate:.2f})")
+
+        # --- side-balanced trimming to avoid pathological one-sided exposure ---
+        if "bet_side" in bets.columns and bets["bet_side"].nunique(dropna=True) >= 2:
+            cap_each = max(1, cap_max_bets // 2)
+
+            over_bets = bets[bets["bet_side"] == "over"].sort_values("ev_used", ascending=False)
+            under_bets = bets[bets["bet_side"] == "under"].sort_values("ev_used", ascending=False)
+
+            kept = pd.concat(
+                [over_bets.head(cap_each), under_bets.head(cap_each)],
+                ignore_index=True,
+            )
+
+            # If one side has fewer than cap_each, backfill remaining slots by EV (regardless of side)
+            if len(kept) < cap_max_bets:
+                remainder = cap_max_bets - len(kept)
+                spill = (
+                    bets.sort_values("ev_used", ascending=False)
+                    .loc[~bets.index.isin(kept.index)]
+                    .head(remainder)
+                )
+                kept = pd.concat([kept, spill], ignore_index=True)
+
+            bets = kept.sort_values("ev_used", ascending=False).head(cap_max_bets).copy()
+        else:
+            # Fallback: single-side universe, keep original behavior
+            bets = bets.sort_values("ev_used", ascending=False).head(cap_max_bets).copy()
 
     metrics["diagnostics"]["bet_cap_applied"] = bool(cap_applied)
     metrics["diagnostics"]["cap_max_bets"] = int(cap_max_bets) if cap_max_bets is not None else None
